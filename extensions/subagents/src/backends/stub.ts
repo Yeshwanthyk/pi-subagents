@@ -82,6 +82,7 @@ const makeStubSession = (
       meta: {
         backend: profile.backend,
         modelLabel: task.model ?? profile.defaultModelLabel,
+        reasoningEffort: task.reasoningEffort,
         contextWindow: profile.contextWindow,
         sessionFilePath: sessionFile,
         nativeSessionId: sessionId,

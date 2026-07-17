@@ -102,6 +102,21 @@ test("stub subagent completes and delivers a final result", async () => {
   });
 });
 
+test("backend metadata propagates effective reasoning effort", async () => {
+  await withManager(async (manager, runtime) => {
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", {
+        ...task("Reason about metadata"),
+        reasoningEffort: "high",
+      }),
+    );
+
+    assert.equal(snap.meta.reasoningEffort, "high");
+    assert.equal(manager.view.get(snap.id)?.meta.reasoningEffort, "high");
+  });
+});
+
 test("FAIL: prompts settle as errors; unconsumed settles are delivered", async () => {
   await withManager(async (manager, runtime) => {
     const settled: Array<{ id: string; consumed: boolean }> = [];

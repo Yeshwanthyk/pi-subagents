@@ -36,6 +36,27 @@ function statusGlyph(snap: SubagentSnapshot, theme: Theme): string {
   }
 }
 
+export function subagentThinkingLabel(snap: SubagentSnapshot) {
+  return snap.meta.reasoningEffort
+    ? `think:${snap.meta.reasoningEffort}`
+    : undefined;
+}
+
+export function dashboardMetaLabels(snap: SubagentSnapshot) {
+  return [
+    snap.backend,
+    snap.meta.modelLabel ?? "?",
+    subagentThinkingLabel(snap),
+  ].filter((label): label is string => label !== undefined);
+}
+
+export function takeoverMetaLabels(snap: SubagentSnapshot) {
+  return [
+    `${snap.backend}: ${snap.meta.modelLabel ?? "?"}`,
+    subagentThinkingLabel(snap),
+  ].filter((label): label is string => label !== undefined);
+}
+
 function statusWord(snap: SubagentSnapshot, theme: Theme): string {
   switch (snap.status) {
     case "running":
@@ -45,6 +66,49 @@ function statusWord(snap: SubagentSnapshot, theme: Theme): string {
     case "error":
       return theme.fg("error", "failed");
   }
+}
+
+export function renderDashboardRow(
+  snap: SubagentSnapshot,
+  width: number,
+  isSelected: boolean,
+  theme: Theme,
+) {
+  const marker = isSelected ? theme.fg("accent", "❯") : " ";
+  const title = isSelected
+    ? theme.fg("accent", snap.title)
+    : theme.fg("text", snap.title);
+  const left = ` ${marker} ${statusGlyph(snap, theme)} ${title} ${theme.fg("dim", snap.id)}`;
+
+  const utilization = formatContextUtilization(snap.usage);
+  const dot = theme.fg("dim", " · ");
+  const rightParts = [
+    ...dashboardMetaLabels(snap).map((label) => theme.fg("muted", label)),
+    ...(utilization ? [theme.fg("muted", utilization)] : []),
+    theme.fg("muted", formatElapsed(snap)),
+    statusWord(snap, theme),
+  ];
+  const right = `${rightParts.join(dot)} `;
+  const rightWidth = visibleWidth(right);
+  const leftMax = Math.max(0, width - rightWidth - 2);
+  const leftTruncated = truncateToWidth(left, leftMax);
+  const gap = Math.max(2, width - visibleWidth(leftTruncated) - rightWidth);
+  return truncateToWidth(leftTruncated + " ".repeat(gap) + right, width);
+}
+
+export function renderTakeoverHeader(
+  snap: SubagentSnapshot,
+  width: number,
+  theme: Theme,
+) {
+  const utilization = formatContextUtilization(snap.usage);
+  const header =
+    `${statusGlyph(snap, theme)} ` +
+    theme.fg("accent", theme.bold(`${snap.id} · ${snap.title}`)) +
+    theme.fg("muted", ` · ${snap.status} · ${formatElapsed(snap)}`) +
+    theme.fg("dim", ` · ${takeoverMetaLabels(snap).join(" · ")}`) +
+    (utilization ? theme.fg("dim", ` · ${utilization}`) : "");
+  return truncateToWidth(header, width);
 }
 
 // --- Entry point ---------------------------------------------------------------
@@ -302,30 +366,7 @@ class SubagentDashboard implements Component {
       const index = start + i;
       const isSelected = index === this.selection.index;
 
-      // Left: marker, status square, title, dim id
-      const marker = isSelected ? theme.fg("accent", "❯") : " ";
-      const title = isSelected
-        ? theme.fg("accent", snap.title)
-        : theme.fg("text", snap.title);
-      const left = ` ${marker} ${statusGlyph(snap, theme)} ${title} ${theme.fg("dim", snap.id)}`;
-
-      // Right: backend · model · context utilization · elapsed · status
-      const utilization = formatContextUtilization(snap.usage);
-      const dot = theme.fg("dim", " · ");
-      const rightParts = [
-        theme.fg("muted", snap.backend),
-        theme.fg("muted", snap.meta.modelLabel ?? "?"),
-        ...(utilization ? [theme.fg("muted", utilization)] : []),
-        theme.fg("muted", formatElapsed(snap)),
-        statusWord(snap, theme),
-      ];
-      const right = `${rightParts.join(dot)} `;
-
-      const rightWidth = visibleWidth(right);
-      const leftMax = Math.max(0, width - rightWidth - 2);
-      const leftTruncated = truncateToWidth(left, leftMax);
-      const gap = Math.max(2, width - visibleWidth(leftTruncated) - rightWidth);
-      out.push(truncateToWidth(leftTruncated + " ".repeat(gap) + right, width));
+      out.push(renderDashboardRow(snap, width, isSelected, theme));
     }
 
     if (start > 0) {
@@ -495,14 +536,7 @@ class TakeoverView implements Component, Focusable {
     }
 
     lines.push(border);
-    const utilization = formatContextUtilization(snap.usage);
-    const header =
-      `${statusGlyph(snap, theme)} ` +
-      theme.fg("accent", theme.bold(`${snap.id} · ${snap.title}`)) +
-      theme.fg("muted", ` · ${snap.status} · ${formatElapsed(snap)}`) +
-      theme.fg("dim", ` · ${snap.backend}: ${snap.meta.modelLabel ?? "?"}`) +
-      (utilization ? theme.fg("dim", ` · ${utilization}`) : "");
-    lines.push(truncateToWidth(header, width));
+    lines.push(renderTakeoverHeader(snap, width, theme));
     lines.push(border);
 
     // Fixed-height transcript viewport. Error and scroll status consume rows

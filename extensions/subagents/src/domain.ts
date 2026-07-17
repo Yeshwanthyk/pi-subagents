@@ -30,6 +30,13 @@ export const REASONING_EFFORTS = [
 ] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
+export function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return (
+    typeof value === "string" &&
+    REASONING_EFFORTS.some((effort) => effort === value)
+  );
+}
+
 export type SubagentStatus = "running" | "done" | "error";
 
 /** Parent-session context resolved by the tool layer and passed opaquely. */
@@ -62,6 +69,8 @@ export interface SubagentMeta {
   readonly backend: BackendName;
   /** Display label, e.g. "anthropic/claude-opus-4-5" or "gpt-5-codex". */
   readonly modelLabel?: string;
+  /** Normalized effective reasoning effort used by the backend. */
+  readonly reasoningEffort?: ReasoningEffort;
   /** Context window capacity for utilization display, when known. */
   readonly contextWindow?: number;
   /** pi session file / Claude projects JSONL / Codex rollout path. */

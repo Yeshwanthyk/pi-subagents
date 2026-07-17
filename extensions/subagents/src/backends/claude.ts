@@ -137,21 +137,33 @@ class ClaudeInput implements AsyncIterable<SDKUserMessage> {
 
 // --- Model, effort, and transcript helpers ----------------------------------
 
-/**
- * Claude's deprecated-but-supported maxThinkingTokens is the closest match to
- * the shared numeric scale requested by this extension. Zero explicitly
- * disables extended thinking in SDK 0.3.207; an omitted effort leaves the CLI
- * default untouched.
- */
-const THINKING_BUDGETS = {
-  off: 0,
-  minimal: 1_024,
-  low: 4_096,
-  medium: 10_000,
-  high: 16_000,
-  xhigh: 32_000,
-  max: 63_999,
-} satisfies Record<ReasoningEffort, number>;
+/** Claude's adaptive-thinking effort scale has no distinct minimal level. */
+const CLAUDE_EFFORTS = {
+  minimal: "low",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  max: "max",
+} as const satisfies Record<Exclude<ReasoningEffort, "off">, string>;
+
+export function claudeThinkingConfig(
+  reasoningEffort: ReasoningEffort | undefined,
+) {
+  if (reasoningEffort === undefined) return {};
+  if (reasoningEffort === "off") {
+    return {
+      reasoningEffort: "off" as const,
+      thinking: { type: "disabled" as const },
+    };
+  }
+  const effort = CLAUDE_EFFORTS[reasoningEffort];
+  return {
+    reasoningEffort: effort,
+    thinking: { type: "adaptive" as const },
+    effort,
+  };
+}
 
 function boundedError(error: unknown) {
   return (error instanceof Error ? error.message : String(error)).slice(
@@ -295,6 +307,7 @@ const makeClaudeSession = (
       Queue.offerUnsafe(events, event);
     };
 
+    const thinking = claudeThinkingConfig(task.reasoningEffort);
     const state = {
       closed: false,
       activeRun: false,
@@ -311,15 +324,15 @@ const makeClaudeSession = (
       meta: {
         backend: "claude",
         modelLabel: task.model,
+        ...(thinking.reasoningEffort
+          ? { reasoningEffort: thinking.reasoningEffort }
+          : {}),
         // Claude models used by this backend currently expose 200k context;
         // result.modelUsage replaces this fallback when the CLI knows better.
         contextWindow: CLAUDE_CONTEXT_WINDOW,
       } satisfies SubagentMeta as SubagentMeta,
     };
 
-    const thinkingBudget = task.reasoningEffort
-      ? THINKING_BUDGETS[task.reasoningEffort]
-      : undefined;
     const claudeBinary = resolveClaudeBinary();
     const nativeQuery = yield* Effect.try({
       try: () =>
@@ -343,9 +356,8 @@ const makeClaudeSession = (
               ? { pathToClaudeCodeExecutable: claudeBinary }
               : {}),
             ...(task.model ? { model: task.model } : {}),
-            ...(thinkingBudget !== undefined
-              ? { maxThinkingTokens: thinkingBudget }
-              : {}),
+            ...(thinking.thinking ? { thinking: thinking.thinking } : {}),
+            ...(thinking.effort ? { effort: thinking.effort } : {}),
           },
         }),
       catch: (error) => new SpawnError({ message: boundedError(error) }),

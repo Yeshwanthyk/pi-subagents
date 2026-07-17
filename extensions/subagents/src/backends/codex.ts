@@ -23,7 +23,7 @@ import type {
   SubagentMeta,
   TranscriptPart,
 } from "../domain.ts";
-import { SendError, SpawnError } from "../domain.ts";
+import { isReasoningEffort, SendError, SpawnError } from "../domain.ts";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const MODEL_LIST_TIMEOUT_MS = 5_000;
@@ -140,8 +140,27 @@ function protocolError(value: unknown) {
   );
 }
 
+const CODEX_REASONING_EFFORTS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+] as const;
+type CodexReasoningEffort = (typeof CODEX_REASONING_EFFORTS)[number];
+
+function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
+  return (
+    typeof value === "string" &&
+    CODEX_REASONING_EFFORTS.some((effort) => effort === value)
+  );
+}
+
 /** 0.144.3 accepts these effort slugs; individual models expose a subset. */
-function preferredCodexEffort(effort: ReasoningEffort | undefined) {
+function preferredCodexEffort(
+  effort: ReasoningEffort | undefined,
+): CodexReasoningEffort | undefined {
   switch (effort) {
     case "off":
     case "minimal":
@@ -158,33 +177,45 @@ function preferredCodexEffort(effort: ReasoningEffort | undefined) {
   }
 }
 
+function codexCatalogModel(
+  modelLabel: string | undefined,
+  modelList: JsonRecord | undefined,
+) {
+  const models = records(modelList?.data);
+  const exact = models.find(
+    (candidate) =>
+      stringValue(candidate.id) === modelLabel ||
+      stringValue(candidate.model) === modelLabel,
+  );
+  return modelLabel === undefined
+    ? (exact ?? models.find((candidate) => candidate.isDefault === true))
+    : exact;
+}
+
+function modelSupportedCodexEfforts(model: JsonRecord | undefined) {
+  return records(model?.supportedReasoningEfforts)
+    .map((option) => option.reasoningEffort)
+    .filter(isCodexReasoningEffort);
+}
+
 /** Clamp against model/list because, for example, some models use none instead of minimal. */
 function supportedCodexEffort(
   effort: ReasoningEffort | undefined,
   modelLabel: string | undefined,
   modelList: JsonRecord | undefined,
-) {
+): CodexReasoningEffort | undefined {
   const preferred = preferredCodexEffort(effort);
   if (!preferred) return undefined;
-  const models = records(modelList?.data);
-  const model =
-    models.find(
-      (candidate) =>
-        stringValue(candidate.id) === modelLabel ||
-        stringValue(candidate.model) === modelLabel,
-    ) ?? models.find((candidate) => candidate.isDefault === true);
+  const model = codexCatalogModel(modelLabel, modelList);
   if (!model) return preferred;
-  const supported = records(model.supportedReasoningEfforts)
-    .map((option) => stringValue(option.reasoningEffort))
-    .filter((value): value is string => value !== undefined);
+  const supported = modelSupportedCodexEfforts(model);
   if (supported.includes(preferred)) return preferred;
 
-  const scale = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
-  const target = scale.indexOf(preferred);
+  const target = CODEX_REASONING_EFFORTS.indexOf(preferred);
   const candidates = supported
     .map((value) => ({
       value,
-      index: scale.indexOf(value as (typeof scale)[number]),
+      index: CODEX_REASONING_EFFORTS.indexOf(value),
     }))
     .filter((candidate) => candidate.index >= 0)
     .sort((a, b) => {
@@ -194,6 +225,87 @@ function supportedCodexEffort(
       return effort === "off" ? a.index - b.index : b.index - a.index;
     });
   return candidates[0]?.value ?? preferred;
+}
+
+function normalizeCodexEffort(
+  effort: CodexReasoningEffort | undefined,
+): ReasoningEffort | undefined {
+  return effort === "none" ? "off" : effort;
+}
+
+export function negotiateCodexReasoningEffort(
+  effort: ReasoningEffort | undefined,
+  modelLabel: string | undefined,
+  modelList: unknown,
+) {
+  const parsedModelList = record(modelList);
+  const model = codexCatalogModel(modelLabel, parsedModelList);
+  const nativeEffort = supportedCodexEffort(
+    effort,
+    modelLabel,
+    parsedModelList,
+  );
+  return {
+    nativeEffort,
+    // Without exact catalog capabilities this is only a preferred request, not
+    // a negotiated effective value. A later settings notification is authoritative.
+    reasoningEffort:
+      modelSupportedCodexEfforts(model).length > 0
+        ? normalizeCodexEffort(nativeEffort)
+        : undefined,
+  };
+}
+
+export function applyCodexMetadataNotification(
+  current: SubagentMeta,
+  currentEffort: CodexReasoningEffort | undefined,
+  method: "thread/settings/updated" | "model/rerouted",
+  params: unknown,
+  requestedEffort: ReasoningEffort | undefined,
+  modelList: unknown,
+) {
+  const parsedParams = record(params) ?? {};
+  if (method === "thread/settings/updated") {
+    const settings = record(parsedParams.threadSettings);
+    const modelLabel = stringValue(settings?.model);
+    const hasEffort = settings !== undefined && "effort" in settings;
+    const nativeEffort = isCodexReasoningEffort(settings?.effort)
+      ? settings.effort
+      : undefined;
+    const patch: Partial<SubagentMeta> = {
+      ...(modelLabel ? { modelLabel } : {}),
+      ...(hasEffort
+        ? { reasoningEffort: normalizeCodexEffort(nativeEffort) }
+        : {}),
+    };
+    return {
+      meta: { ...current, ...patch },
+      effort: hasEffort ? nativeEffort : currentEffort,
+      patch,
+    };
+  }
+
+  const modelLabel = stringValue(parsedParams.toModel);
+  if (!modelLabel) return undefined;
+  const negotiated = negotiateCodexReasoningEffort(
+    requestedEffort ??
+      (isReasoningEffort(current.reasoningEffort)
+        ? current.reasoningEffort
+        : undefined),
+    modelLabel,
+    modelList,
+  );
+  // Always include the key: an unmatched reroute must clear stale metadata
+  // until thread/settings/updated reports the authoritative effective value.
+  const patch: Partial<SubagentMeta> = {
+    modelLabel,
+    reasoningEffort: negotiated.reasoningEffort,
+  };
+  return {
+    meta: { ...current, ...patch },
+    effort: negotiated.nativeEffort,
+    patch,
+  };
 }
 
 function textInput(text: string) {
@@ -331,6 +443,7 @@ const makeCodexSession = (
       catch: (error) => new SpawnError({ message: boundedError(error) }),
     });
 
+    let modelList: JsonRecord | undefined;
     const state = {
       closed: false,
       closing: false,
@@ -613,20 +726,22 @@ const makeCodexSession = (
           emit({ _tag: "MetaChanged", meta: state.meta });
           break;
         }
-        case "thread/settings/updated": {
-          const settings = record(params.threadSettings);
-          const modelLabel = stringValue(settings?.model);
-          if (modelLabel) {
-            state.meta = { ...state.meta, modelLabel };
-            emit({ _tag: "MetaChanged", meta: { modelLabel } });
-          }
-          break;
-        }
+        case "thread/settings/updated":
         case "model/rerouted": {
-          const modelLabel = stringValue(params.toModel);
-          if (modelLabel) {
-            state.meta = { ...state.meta, modelLabel };
-            emit({ _tag: "MetaChanged", meta: { modelLabel } });
+          const update = applyCodexMetadataNotification(
+            state.meta,
+            state.effort,
+            method,
+            params,
+            task.reasoningEffort,
+            modelList,
+          );
+          if (update) {
+            state.meta = update.meta;
+            state.effort = update.effort;
+            if (Object.keys(update.patch).length > 0) {
+              emit({ _tag: "MetaChanged", meta: update.patch });
+            }
           }
           break;
         }
@@ -909,6 +1024,11 @@ const makeCodexSession = (
     state.meta = {
       backend: "codex",
       modelLabel: stringValue(threadResult.model) ?? task.model,
+      reasoningEffort: normalizeCodexEffort(
+        isCodexReasoningEffort(threadResult.reasoningEffort)
+          ? threadResult.reasoningEffort
+          : undefined,
+      ),
       sessionFilePath: stringValue(thread?.path),
       nativeSessionId,
     };
@@ -916,14 +1036,19 @@ const makeCodexSession = (
       // Optional capability probe: never let a slow/unsupported model/list
       // hold up the spawn (and its concurrency reservation) for the full
       // request timeout; the unclamped preferred effort is a fine fallback.
-      const modelList = yield* Effect.tryPromise(() =>
+      modelList = yield* Effect.tryPromise(() =>
         request("model/list", { includeHidden: true }, MODEL_LIST_TIMEOUT_MS),
       ).pipe(Effect.orElseSucceed(() => undefined));
-      state.effort = supportedCodexEffort(
+      const negotiated = negotiateCodexReasoningEffort(
         task.reasoningEffort,
         state.meta.modelLabel,
         modelList,
       );
+      state.effort = negotiated.nativeEffort;
+      state.meta = {
+        ...state.meta,
+        reasoningEffort: negotiated.reasoningEffort,
+      };
     }
     emit({ _tag: "MetaChanged", meta: state.meta });
     startRun(task.prompt);

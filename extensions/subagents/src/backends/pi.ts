@@ -29,12 +29,13 @@ import type { Cause, Scope } from "effect";
 import { Effect, Queue, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
 import type {
+  ReasoningEffort,
   SpawnTask,
   SubagentEvent,
   SubagentMeta,
   TranscriptPart,
 } from "../domain.ts";
-import { SendError, SpawnError } from "../domain.ts";
+import { isReasoningEffort, SendError, SpawnError } from "../domain.ts";
 
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 const CHILD_TOOL_CALL_TIMEOUT_MS = 3 * 60 * 1_000;
@@ -55,6 +56,26 @@ const CHILD_EXCLUDED_TOOL_NAMES = [
 type ThinkingLevel = NonNullable<
   NonNullable<Parameters<typeof createAgentSession>[0]>["thinkingLevel"]
 >;
+
+export function resolvePiReasoningEffort(
+  requested: ReasoningEffort | undefined,
+  inherited: unknown,
+): ReasoningEffort | undefined {
+  return requested ?? (isReasoningEffort(inherited) ? inherited : undefined);
+}
+
+export function piRuntimeMeta(
+  session: Pick<AgentSession, "thinkingLevel" | "sessionFile">,
+  model: Pick<Model<any>, "provider" | "id" | "contextWindow"> | undefined,
+): SubagentMeta {
+  return {
+    backend: "pi",
+    modelLabel: model ? `${model.provider}/${model.id}` : undefined,
+    reasoningEffort: session.thinkingLevel,
+    contextWindow: model?.contextWindow,
+    sessionFilePath: session.sessionFile,
+  };
+}
 
 /**
  * Resolve the generic model hint against the parent registry (v1 semantics):
@@ -334,8 +355,10 @@ const makePiSession = (
       catch: (error) => new SpawnError({ message: boundedError(error) }),
     });
     // pi's thinking levels ARE the shared reasoning-effort scale.
-    const thinkingLevel = (task.reasoningEffort ??
-      task.parent.inheritedThinkingLevel) as ThinkingLevel | undefined;
+    const thinkingLevel: ThinkingLevel | undefined = resolvePiReasoningEffort(
+      task.reasoningEffort,
+      task.parent.inheritedThinkingLevel,
+    );
 
     const session = yield* Effect.tryPromise({
       try: async () => {
@@ -402,15 +425,8 @@ const makePiSession = (
       );
     };
 
-    const currentMeta = (): SubagentMeta => {
-      const m = activeModel();
-      return {
-        backend: "pi",
-        modelLabel: m ? `${m.provider}/${m.id}` : undefined,
-        contextWindow: m?.contextWindow,
-        sessionFilePath: session.sessionFile,
-      };
-    };
+    const currentMeta = (): SubagentMeta =>
+      piRuntimeMeta(session, activeModel());
 
     const emitUsage = () => {
       const usage = session.getContextUsage();
@@ -463,6 +479,9 @@ const makePiSession = (
           toolTimeout.apply(session);
           state.settled = false;
           emit({ _tag: "RunStarted" });
+          break;
+        case "thinking_level_changed":
+          emit({ _tag: "MetaChanged", meta: currentMeta() });
           break;
         case "message_update": {
           const streamEvent = event.assistantMessageEvent;
