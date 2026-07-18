@@ -50,7 +50,11 @@ import {
   formatActivityStatus,
   formatContextUtilization,
 } from "./src/format.ts";
-import { SubagentManager, type SubagentManagerShape } from "./src/manager.ts";
+import {
+  SubagentManager,
+  type SubagentManagerShape,
+  type SubagentReadModel,
+} from "./src/manager.ts";
 import {
   buildSubagentResultMessage,
   buildSubagentSpawnResult,
@@ -77,6 +81,162 @@ import { openSubagentPicker } from "./src/ui/takeover.ts";
 const SUBAGENT_OUTPUT_MAX_BYTES = 24 * 1024;
 const WAIT_OUTPUT_MAX_BYTES = 48 * 1024;
 const WAIT_PER_AGENT_MAX_BYTES = 16 * 1024;
+const HEADLESS_LABEL_MAX_LENGTH = 80;
+const HEADLESS_OUTPUT_MAX_LENGTH = 2_000;
+const HEADLESS_NOTIFY_MAX_LENGTH = 300;
+const CLOSE_CHOICE = "Close";
+const STEER_CHOICE = "Steer…";
+const ABORT_CHOICE = "Abort";
+const SHOW_OUTPUT_CHOICE = "Show output";
+const BACK_CHOICE = "Back";
+
+export interface HeadlessSubagentsUI {
+  select(title: string, options: string[]): Promise<string | undefined>;
+  input(title: string, placeholder?: string): Promise<string | undefined>;
+  confirm(title: string, message: string): Promise<boolean>;
+  notify(message: string, type?: "info" | "warning" | "error"): void;
+  editor?(title: string, prefill?: string): Promise<string | undefined>;
+}
+
+type HeadlessSubagentView = Pick<
+  SubagentReadModel,
+  "list" | "get" | "requestSend" | "requestAbort"
+>;
+
+function singleLine(text: string) {
+  return text
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function truncateCharacters(text: string, maxLength: number) {
+  const characters = Array.from(text);
+  if (characters.length <= maxLength) return text;
+  if (maxLength <= 1) return characters.slice(0, maxLength).join("");
+  return `${characters.slice(0, maxLength - 1).join("")}…`;
+}
+
+function headlessSnapshotLabel(snap: SubagentSnapshot) {
+  const prefix = `${singleLine(snap.id)} [${snap.status}] `;
+  const suffix = ` (${snap.backend})`;
+  const titleLength = Math.max(
+    1,
+    HEADLESS_LABEL_MAX_LENGTH -
+      Array.from(prefix).length -
+      Array.from(suffix).length,
+  );
+  return truncateCharacters(
+    `${prefix}${truncateCharacters(singleLine(snap.title), titleLength)}${suffix}`,
+    HEADLESS_LABEL_MAX_LENGTH,
+  );
+}
+
+function transcriptTail(snap: SubagentSnapshot) {
+  return snap.transcript
+    .map((item) => {
+      switch (item.kind) {
+        case "user":
+          return `User: ${item.text}`;
+        case "assistant":
+          return item.parts
+            .map((part) => {
+              switch (part.type) {
+                case "text":
+                  return part.text;
+                case "thinking":
+                  return part.text;
+                case "toolCall":
+                  return `[Tool: ${part.name}${part.argsPreview ? ` ${part.argsPreview}` : ""}]`;
+              }
+            })
+            .join("\n");
+        case "toolResult":
+          return `[${item.isError ? "Tool error" : "Tool result"}: ${item.name}${item.outputPreview ? ` ${item.outputPreview}` : ""}]`;
+      }
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function headlessOutput(snap: SubagentSnapshot) {
+  const preferred =
+    snap.status === "running"
+      ? snap.liveAssistant?.text.trim()
+      : snap.finalText.trim();
+  const output = preferred || transcriptTail(snap).trim() || "(no output yet)";
+  return output.slice(-HEADLESS_OUTPUT_MAX_LENGTH);
+}
+
+/** Standard-dialog fallback for RPC/web clients where custom TUI views are unavailable. */
+export async function runHeadlessSubagentsDialog(
+  ui: HeadlessSubagentsUI,
+  view: HeadlessSubagentView,
+): Promise<void> {
+  while (true) {
+    const snapshots = view.list();
+    if (snapshots.length === 0) {
+      ui.notify(
+        "No subagents yet. The agent spawns them with subagent_spawn.",
+        "info",
+      );
+      return;
+    }
+
+    const choices = snapshots.map(headlessSnapshotLabel);
+    const selected = await ui.select("Subagents", [...choices, CLOSE_CHOICE]);
+    if (selected === undefined || selected === CLOSE_CHOICE) return;
+
+    const selectedIndex = choices.indexOf(selected);
+    const selectedSnapshot = snapshots[selectedIndex];
+    if (selectedSnapshot === undefined) continue;
+    const id = selectedSnapshot.id;
+
+    while (true) {
+      const snap = view.get(id);
+      if (snap === undefined) break;
+      const actions = [
+        ...(snap.status === "running" ? [STEER_CHOICE, ABORT_CHOICE] : []),
+        SHOW_OUTPUT_CHOICE,
+        BACK_CHOICE,
+      ];
+      const action = await ui.select(
+        `${snap.id} — ${singleLine(snap.title)}`,
+        actions,
+      );
+      if (action === undefined || action === BACK_CHOICE) break;
+
+      if (action === STEER_CHOICE && snap.status === "running") {
+        const text = await ui.input(
+          `Steer ${snap.id}`,
+          "Message to the subagent",
+        );
+        if (text !== undefined && text.trim().length > 0) {
+          view.requestSend(id, text);
+          ui.notify(`Sent to ${id}`, "info");
+        }
+        continue;
+      }
+
+      if (action === ABORT_CHOICE && snap.status === "running") {
+        if (await ui.confirm(`Abort ${snap.id}?`, snap.title)) {
+          view.requestAbort(id);
+          ui.notify(`Abort requested for ${id}`, "info");
+        }
+        continue;
+      }
+
+      if (action === SHOW_OUTPUT_CHOICE) {
+        const output = headlessOutput(snap);
+        if (typeof ui.editor === "function") {
+          await ui.editor(`${snap.id} output`, output);
+        } else {
+          ui.notify(output.slice(-HEADLESS_NOTIFY_MAX_LENGTH), "info");
+        }
+      }
+    }
+  }
+}
 
 function describeSubagent(snap: SubagentSnapshot) {
   const details = [
@@ -566,11 +726,20 @@ export default function (pi: ExtensionAPI) {
     description: "List, inspect, and take over subagents",
     handler: async (_args, ctx) => {
       if (ctx.mode !== "tui") {
-        if (ctx.hasUI)
-          ctx.ui.notify(
-            "Subagent takeover is only available in the TUI",
-            "error",
-          );
+        if (
+          !ctx.hasUI ||
+          typeof ctx.ui.select !== "function" ||
+          typeof ctx.ui.input !== "function"
+        ) {
+          if (ctx.hasUI)
+            ctx.ui.notify(
+              "Subagent takeover is only available in the TUI",
+              "error",
+            );
+          return;
+        }
+        const manager = await getManager();
+        await runHeadlessSubagentsDialog(ctx.ui, manager.view);
         return;
       }
       const manager = await getManager();
