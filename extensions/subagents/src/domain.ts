@@ -50,10 +50,26 @@ export interface ParentContext {
   readonly modelRegistry?: ModelRegistry;
 }
 
+export type SessionSeed =
+  | { readonly kind: "fresh"; readonly parentSession?: string }
+  | {
+      readonly kind: "fork";
+      readonly parentSessionFile: string;
+      readonly parentLeafId: string;
+    };
+
 export interface SpawnTask {
   readonly prompt: string;
   readonly title: string;
   readonly cwd: string;
+  /** Logical owner used to keep extension-managed sessions out of /subagents. */
+  readonly owner?: string;
+  /** Isolated sessions never deliver completion messages into the parent. */
+  readonly resultDelivery?: "parent" | "isolated";
+  /** Explicit active-tool allowlist for Pi children. Omitted keeps normal defaults. */
+  readonly tools?: ReadonlyArray<string>;
+  /** Initial persisted-session source for Pi children. */
+  readonly sessionSeed?: SessionSeed;
   /**
    * Generic model hint, interpreted per backend:
    * pi: "provider/model-id" or bare model id; claude: model alias;
@@ -196,6 +212,9 @@ export type SubagentEvent =
 export interface SubagentSnapshot {
   readonly id: string;
   readonly backend: BackendName;
+  readonly owner: string;
+  readonly resultDelivery: "parent" | "isolated";
+  readonly tools?: ReadonlyArray<string>;
   readonly title: string;
   readonly prompt: string;
   readonly cwd: string;

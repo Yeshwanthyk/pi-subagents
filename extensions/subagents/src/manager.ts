@@ -56,6 +56,9 @@ function bounded(text: string) {
 interface MutableSnapshot {
   id: string;
   backend: BackendName;
+  owner: string;
+  resultDelivery: "parent" | "isolated";
+  tools?: ReadonlyArray<string>;
   title: string;
   prompt: string;
   cwd: string;
@@ -82,6 +85,8 @@ interface Entry {
   /** Idle restart dispatched but RunStarted not folded yet; counts as running
    * so concurrent restarts cannot race past the cap. */
   restarting?: boolean;
+  /** Ownership transfer has begun; no further sends or closes may race it. */
+  transferring?: boolean;
 }
 
 // --- Read model ----------------------------------------------------------------
@@ -107,6 +112,32 @@ export interface SubagentReadModel {
   setOnSettled(
     hook: ((snap: SubagentSnapshot, consumed: boolean) => void) | undefined,
   ): void;
+}
+
+/** Namespace-filtered view used by extension-specific dashboards. */
+export function scopedSubagentView(
+  view: SubagentReadModel,
+  owner: string,
+): SubagentReadModel {
+  const owns = (snapshot: SubagentSnapshot | undefined) =>
+    snapshot?.owner === owner ? snapshot : undefined;
+  return {
+    list: () => view.list().filter((snapshot) => snapshot.owner === owner),
+    get: (id) => owns(view.get(id)),
+    size: () =>
+      view.list().filter((snapshot) => snapshot.owner === owner).length,
+    subscribe: (listener) => view.subscribe(listener),
+    subscribeTo: (id, listener) => view.subscribeTo(id, listener),
+    requestSend: (id, text) => {
+      if (owns(view.get(id))) view.requestSend(id, text);
+    },
+    requestAbort: (id) => {
+      if (owns(view.get(id))) view.requestAbort(id);
+    },
+    setOnSettled: () => {
+      throw new Error("Scoped views cannot replace the manager settle hook.");
+    },
+  };
 }
 
 // --- Service --------------------------------------------------------------------
@@ -140,6 +171,10 @@ export interface SubagentManagerShape {
   cancel(
     ids: ReadonlyArray<string>,
   ): Effect.Effect<ReadonlyArray<CancelResult>>;
+  /** Remove and dispose a session while preserving its persisted session file. */
+  close(id: string): Effect.Effect<SubagentSnapshot | undefined>;
+  /** Release an already-settled session for transfer to another process. */
+  release(id: string): Effect.Effect<SubagentSnapshot | undefined, SendError>;
   send(id: string, text: string): Effect.Effect<void, SendError>;
   get(id: string): Effect.Effect<SubagentSnapshot | undefined>;
   readonly list: Effect.Effect<ReadonlyArray<SubagentSnapshot>>;
@@ -413,6 +448,12 @@ const makeManager = Effect.gen(function* () {
           snapshot: {
             id,
             backend: backendName,
+            owner: task.owner ?? "subagents",
+            resultDelivery:
+              (task.owner ?? "subagents") === "subagents"
+                ? (task.resultDelivery ?? "parent")
+                : "isolated",
+            tools: task.tools ? [...task.tools] : undefined,
             title: task.title,
             prompt: task.prompt,
             cwd: task.cwd,
@@ -560,10 +601,48 @@ const makeManager = Effect.gen(function* () {
       );
     });
 
+  const close = (id: string) =>
+    Effect.gen(function* () {
+      const entry = entries.get(id);
+      if (!entry) return undefined;
+      if (entry.snapshot.status === "running") yield* abortEntry(entry);
+      entries.delete(id);
+      yield* closeEntryScope(entry).pipe(
+        Effect.timeout(STOP_TIMEOUT_MS),
+        Effect.ignore,
+      );
+      notify(id);
+      return entry.snapshot as SubagentSnapshot;
+    });
+
+  const release = (id: string) =>
+    Effect.gen(function* () {
+      const entry = entries.get(id);
+      if (!entry) return undefined;
+      if (entry.transferring) {
+        return yield* new SendError({
+          message: `Subagent "${id}" is already being transferred.`,
+        });
+      }
+      if (entry.snapshot.status === "running" || entry.restarting) {
+        return yield* new SendError({
+          message: `Subagent "${id}" must settle before it can be released.`,
+        });
+      }
+      entry.transferring = true;
+      entries.delete(id);
+      yield* closeEntryScope(entry).pipe(
+        Effect.timeout(STOP_TIMEOUT_MS),
+        Effect.ignore,
+      );
+      notify(id);
+      return entry.snapshot as SubagentSnapshot;
+    });
+
   const send = (id: string, text: string) =>
     Effect.suspend((): Effect.Effect<void, SendError> => {
       const entry = entries.get(id);
-      if (!entry || disposed) {
+      if (!entry || disposed || entry.transferring) {
         return new SendError({
           message: `Subagent "${id}" is no longer tracked.`,
         });
@@ -660,6 +739,8 @@ const makeManager = Effect.gen(function* () {
     spawn,
     waitFor,
     cancel,
+    close,
+    release,
     send,
     get: (id) => Effect.sync(() => entries.get(id)?.snapshot),
     list: Effect.sync(() => [...entries.values()].map((e) => e.snapshot)),

@@ -14,6 +14,8 @@ function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
   return {
     id: "sa-1",
     backend: "pi",
+    owner: "subagents",
+    resultDelivery: "parent",
     title: "Test agent",
     prompt: "test",
     cwd: process.cwd(),
@@ -97,6 +99,7 @@ test("RPC command without dialogs keeps the TUI-only notification fallback", asy
     | undefined;
   const pi = {
     on() {},
+    events: { on() {}, emit() {} },
     registerTool() {},
     registerMessageRenderer() {},
     registerCommand(name: string, command: { handler: typeof commandHandler }) {

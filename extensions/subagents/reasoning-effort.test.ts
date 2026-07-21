@@ -126,6 +126,8 @@ test("dashboard and takeover metadata render the exact thinking label", () => {
   const snap: SubagentSnapshot = {
     id: "sa-1",
     backend: "pi",
+    owner: "subagents",
+    resultDelivery: "parent",
     title: "fixture",
     prompt: "test",
     cwd: process.cwd(),
@@ -177,6 +179,8 @@ test("dashboard rows and takeover headers stay within constrained widths", () =>
   const snap: SubagentSnapshot = {
     id: "sa-long-id",
     backend: "codex",
+    owner: "subagents",
+    resultDelivery: "parent",
     title: "A deliberately long subagent title",
     prompt: "test",
     cwd: process.cwd(),

@@ -7,7 +7,7 @@
  */
 
 import type {
-  ExtensionCommandContext,
+  ExtensionContext,
   KeybindingsManager,
   Theme,
 } from "@earendil-works/pi-coding-agent";
@@ -113,9 +113,41 @@ export function renderTakeoverHeader(
 
 // --- Entry point ---------------------------------------------------------------
 
-export async function openSubagentPicker(
-  ctx: ExtensionCommandContext,
+type TakeoverContext = Pick<ExtensionContext, "mode" | "ui">;
+
+export interface TakeoverOptions {
+  title?: string;
+  onPopOut?: (id: string) => Promise<boolean>;
+  onCloseSession?: (id: string) => Promise<void>;
+}
+
+export async function openSubagent(
+  ctx: TakeoverContext,
   view: SubagentReadModel,
+  id: string,
+  options: TakeoverOptions = {},
+): Promise<void> {
+  if (!view.get(id)) return;
+  await ctx.ui.custom<null>(
+    (tui, theme, keybindings, done) =>
+      new TakeoverView(tui, theme, keybindings, id, view, done, options),
+    {
+      overlay: true,
+      overlayOptions: {
+        anchor: "right-center",
+        width: "78%",
+        minWidth: 72,
+        maxHeight: "100%",
+        margin: 1,
+      },
+    },
+  );
+}
+
+export async function openSubagentPicker(
+  ctx: TakeoverContext,
+  view: SubagentReadModel,
+  options: TakeoverOptions = {},
 ) {
   const selection: DashboardSelection = { index: 0 };
 
@@ -127,24 +159,31 @@ export async function openSubagentPicker(
 
     const picked = await ctx.ui.custom<string | null>(
       (tui, theme, keybindings, done) =>
-        new SubagentDashboard(tui, theme, keybindings, view, selection, done),
+        new SubagentDashboard(
+          tui,
+          theme,
+          keybindings,
+          view,
+          selection,
+          done,
+          options,
+        ),
       {
         overlay: true,
-        overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%" },
+        overlayOptions: {
+          anchor: "right-center",
+          width: "78%",
+          minWidth: 72,
+          maxHeight: "100%",
+          margin: 1,
+        },
       },
     );
 
     if (!picked) return;
     if (!view.get(picked)) continue;
 
-    await ctx.ui.custom<null>(
-      (tui, theme, keybindings, done) =>
-        new TakeoverView(tui, theme, keybindings, picked, view, done),
-      {
-        overlay: true,
-        overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%" },
-      },
-    );
+    await openSubagent(ctx, view, picked, options);
     // After leaving the takeover view, fall back to the dashboard.
   }
 }
@@ -177,6 +216,7 @@ class SubagentDashboard implements Component {
   private view: SubagentReadModel;
   private selection: DashboardSelection;
   private done: (value: string | null) => void;
+  private options: TakeoverOptions;
 
   private closed = false;
   private ticker: ReturnType<typeof setInterval>;
@@ -189,6 +229,7 @@ class SubagentDashboard implements Component {
     view: SubagentReadModel,
     selection: DashboardSelection,
     done: (value: string | null) => void,
+    options: TakeoverOptions,
   ) {
     this.tui = tui;
     this.theme = theme;
@@ -196,6 +237,7 @@ class SubagentDashboard implements Component {
     this.view = view;
     this.selection = selection;
     this.done = done;
+    this.options = options;
     // Elapsed times, token counts, and statuses tick along at 1Hz.
     this.ticker = setInterval(() => this.tui.requestRender(), 1000);
     this.unsubChange = view.subscribe(() => this.tui.requestRender());
@@ -251,9 +293,17 @@ class SubagentDashboard implements Component {
       }
       return;
     }
+    if (data === "o" && this.options.onPopOut) {
+      const snap = subs[this.selection.index];
+      if (snap) void this.options.onPopOut(snap.id);
+      return;
+    }
     if (data === "x") {
       const snap = subs[this.selection.index];
-      if (snap && snap.status === "running") this.view.requestAbort(snap.id);
+      if (!snap) return;
+      if (this.options.onCloseSession)
+        void this.options.onCloseSession(snap.id);
+      else if (snap.status === "running") this.view.requestAbort(snap.id);
       return;
     }
   }
@@ -291,7 +341,10 @@ class SubagentDashboard implements Component {
     const lines: string[] = [];
 
     // Header: title left, count right
-    const headerLeft = theme.fg("accent", theme.bold("Subagents"));
+    const headerLeft = theme.fg(
+      "accent",
+      theme.bold(this.options.title ?? "Subagents"),
+    );
     const headerRight = theme.fg(
       "muted",
       `${subs.length} agent${subs.length === 1 ? "" : "s"}`,
@@ -334,7 +387,7 @@ class SubagentDashboard implements Component {
       truncateToWidth(
         theme.fg(
           "dim",
-          `  ${configuredKeys(this.keybindings, "tui.select.up")}/${configuredKeys(this.keybindings, "tui.select.down")}/jk select · ${configuredKeys(this.keybindings, "tui.select.confirm")} take over · x abort · ${configuredKeys(this.keybindings, "tui.select.cancel")} close`,
+          `  ${configuredKeys(this.keybindings, "tui.select.up")}/${configuredKeys(this.keybindings, "tui.select.down")}/jk select · ${configuredKeys(this.keybindings, "tui.select.confirm")} open${this.options.onPopOut ? " · o shell" : ""} · x ${this.options.onCloseSession ? "close" : "abort"} · ${configuredKeys(this.keybindings, "tui.select.cancel")} back`,
         ),
         width,
       ),
@@ -395,8 +448,10 @@ class TakeoverView implements Component, Focusable {
   private id: string;
   private view: SubagentReadModel;
   private done: (value: null) => void;
+  private options: TakeoverOptions;
 
   private input = new Input();
+  private poppingOut = false;
   /** Scroll offset in lines from the bottom of the transcript. 0 = pinned to bottom. */
   private scrollOffset = 0;
   private unsubscribe: () => void;
@@ -420,6 +475,7 @@ class TakeoverView implements Component, Focusable {
     id: string,
     view: SubagentReadModel,
     done: (value: null) => void,
+    options: TakeoverOptions,
   ) {
     this.tui = tui;
     this.theme = theme;
@@ -427,6 +483,7 @@ class TakeoverView implements Component, Focusable {
     this.id = id;
     this.view = view;
     this.done = done;
+    this.options = options;
     this.unsubscribe = view.subscribeTo(id, () => this.scheduleRender());
     // Elapsed time in the header ticks along at 1Hz.
     this.ticker = setInterval(() => this.tui.requestRender(), 1000);
@@ -473,6 +530,18 @@ class TakeoverView implements Component, Focusable {
   }
 
   handleInput(data: string): void {
+    if (data === "o" && this.options.onPopOut && !this.poppingOut) {
+      this.poppingOut = true;
+      this.tui.requestRender();
+      void this.options.onPopOut(this.id).then((opened) => {
+        if (opened) this.close();
+        else {
+          this.poppingOut = false;
+          this.tui.requestRender();
+        }
+      });
+      return;
+    }
     if (this.keybindings.matches(data, "app.clear")) {
       const snap = this.snap();
       if (snap?.status === "running") this.view.requestAbort(this.id);
@@ -582,7 +651,7 @@ class TakeoverView implements Component, Focusable {
       truncateToWidth(
         theme.fg(
           "dim",
-          `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page`,
+          `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back${this.options.onPopOut ? ` · o ${this.poppingOut ? "opening…" : "shell"}` : ""} · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll`,
         ),
         width,
       ),

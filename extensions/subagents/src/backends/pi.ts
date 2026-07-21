@@ -11,6 +11,7 @@
  *   the child session_shutdown hook and disposes the session.
  */
 
+import { unlinkSync } from "node:fs";
 import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
 import type {
   AgentSession,
@@ -125,6 +126,43 @@ async function createChildResources(cwd: string, projectTrusted: boolean) {
   const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
   await loader.reload();
   return { loader, settingsManager };
+}
+
+export function createChildSessionManager(
+  task: SpawnTask,
+  sessionDir?: string,
+): SessionManager {
+  const seed = task.sessionSeed;
+  if (!seed || seed.kind === "fresh") {
+    return SessionManager.create(task.cwd, sessionDir, {
+      parentSession: seed?.parentSession,
+    });
+  }
+  const target = SessionManager.create(task.cwd, sessionDir);
+  const targetFile = target.getSessionFile();
+  const targetDir = target.getSessionDir();
+  const parent = SessionManager.open(
+    seed.parentSessionFile,
+    targetDir,
+    task.cwd,
+  );
+  const forkedPath = parent.createBranchedSession(seed.parentLeafId);
+  if (targetFile && targetFile !== forkedPath) {
+    try {
+      unlinkSync(targetFile);
+    } catch {
+      // The empty allocation file is best-effort cleanup only.
+    }
+  }
+  if (!forkedPath) {
+    throw new Error(
+      "Failed to create a persisted fork for the interactive child session.",
+    );
+  }
+  // createBranchedSession mutates `parent` to own the new target file. Return
+  // that live manager rather than reopening: Pi intentionally defers writing
+  // user-only branches until the first assistant response.
+  return parent;
 }
 
 function waitBounded(operation: Promise<unknown>, timeoutMs: number) {
@@ -368,12 +406,13 @@ const makePiSession = (
         );
         const { session } = await createAgentSession({
           cwd: task.cwd,
-          sessionManager: SessionManager.create(task.cwd),
+          sessionManager: createChildSessionManager(task),
           settingsManager,
           resourceLoader: loader,
           modelRegistry: registry,
           model,
           thinkingLevel,
+          tools: task.tools ? [...task.tools] : undefined,
           excludeTools: [...CHILD_EXCLUDED_TOOL_NAMES],
         });
         // Start child extension session hooks/resources in headless mode.
@@ -381,6 +420,21 @@ const makePiSession = (
         // the scope finalizer that owns cleanup is only registered later.
         try {
           await session.bindExtensions({ mode: "print" });
+          if (task.tools) {
+            const active = session.getActiveToolNames();
+            const requested = new Set(task.tools);
+            const unexpected = active.filter((name) => !requested.has(name));
+            if (unexpected.length > 0) {
+              throw new Error(
+                `Pi child activated tools outside its allowlist: ${unexpected.join(", ")}`,
+              );
+            }
+            if (requested.has("read") && !active.includes("read")) {
+              throw new Error(
+                "Pi child could not activate the required read tool.",
+              );
+            }
+          }
         } catch (error) {
           await shutdownAndDisposeChildSession(session);
           throw error;
@@ -592,7 +646,9 @@ const makePiSession = (
 
     // Session naming is best-effort.
     yield* Effect.try(() =>
-      session.sessionManager.appendSessionInfo(`subagent: ${task.title}`),
+      session.sessionManager.appendSessionInfo(
+        `${task.owner ?? "subagents"}: ${task.title}`,
+      ),
     ).pipe(Effect.ignore);
 
     emit({ _tag: "MetaChanged", meta: currentMeta() });

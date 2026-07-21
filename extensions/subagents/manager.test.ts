@@ -14,6 +14,7 @@ import { piBackend } from "./src/backends/pi.ts";
 import { makeStubBackend } from "./src/backends/stub.ts";
 import type { BackendName, ParentContext, SpawnTask } from "./src/domain.ts";
 import {
+  scopedSubagentView,
   SubagentManager,
   SubagentManagerLive,
   type SubagentManagerShape,
@@ -205,6 +206,51 @@ test("idle restarts respect the concurrency cap", async () => {
       /Max 4 subagents/,
     );
     assert.equal(manager.view.get(settled.id)?.status, "done");
+  });
+});
+
+test("isolated owners stay out of the standard view and can be released", async () => {
+  await withManager(async (manager, runtime) => {
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", {
+        ...task("Side question"),
+        owner: "btw",
+        resultDelivery: "isolated",
+        tools: ["read"],
+      }),
+    );
+
+    assert.equal(scopedSubagentView(manager.view, "subagents").size(), 0);
+    assert.equal(
+      scopedSubagentView(manager.view, "btw").get(snap.id)?.owner,
+      "btw",
+    );
+    assert.deepEqual(
+      scopedSubagentView(manager.view, "btw").get(snap.id)?.tools,
+      ["read"],
+    );
+
+    await runTool(runtime, manager.waitFor([snap.id]));
+    const released = await runTool(runtime, manager.release(snap.id));
+    assert.equal(released?.id, snap.id);
+    assert.equal(manager.view.get(snap.id), undefined);
+  });
+});
+
+test("only one concurrent release wins session ownership", async () => {
+  await withManager(async (manager, runtime) => {
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", task("Transfer me")),
+    );
+    await runTool(runtime, manager.waitFor([snap.id]));
+    const [first, second] = await Promise.all([
+      runTool(runtime, manager.release(snap.id)),
+      runTool(runtime, manager.release(snap.id)),
+    ]);
+    assert.equal([first, second].filter(Boolean).length, 1);
+    assert.equal(manager.view.get(snap.id), undefined);
   });
 });
 

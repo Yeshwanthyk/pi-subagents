@@ -51,6 +51,7 @@ import {
   formatContextUtilization,
 } from "./src/format.ts";
 import {
+  scopedSubagentView,
   SubagentManager,
   type SubagentManagerShape,
   type SubagentReadModel,
@@ -76,7 +77,11 @@ import {
   runTool,
   type SubagentRuntime,
 } from "./src/runtime.ts";
-import { openSubagentPicker } from "./src/ui/takeover.ts";
+import {
+  currentExternalHost,
+  launchInCurrentHost,
+} from "./src/external-shell.ts";
+import { openSubagent, openSubagentPicker } from "./src/ui/takeover.ts";
 
 const SUBAGENT_OUTPUT_MAX_BYTES = 24 * 1024;
 const WAIT_OUTPUT_MAX_BYTES = 48 * 1024;
@@ -89,6 +94,20 @@ const STEER_CHOICE = "Steer…";
 const ABORT_CHOICE = "Abort";
 const SHOW_OUTPUT_CHOICE = "Show output";
 const BACK_CHOICE = "Back";
+const INTERACTIVE_PROTOCOL_VERSION = 1;
+
+type InteractiveReply =
+  { success: true; data?: unknown } | { success: false; error: string };
+
+function replyInteractive(
+  pi: ExtensionAPI,
+  channel: string,
+  requestId: unknown,
+  reply: InteractiveReply,
+) {
+  if (typeof requestId !== "string" || requestId.length === 0) return;
+  pi.events.emit(`${channel}:reply:${requestId}`, reply);
+}
 
 export interface HeadlessSubagentsUI {
   select(title: string, options: string[]): Promise<string | undefined>;
@@ -291,6 +310,10 @@ export default function (pi: ExtensionAPI) {
   let sessionContext: ExtensionContext | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
+  const interactiveUnsubscribers: Array<() => void> = [];
+  const onInteractive = (channel: string, handler: (data: unknown) => void) => {
+    interactiveUnsubscribers.push(pi.events.on(channel, handler));
+  };
   const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
 
   const getRuntime = () => (runtime ??= createSubagentRuntime());
@@ -309,9 +332,18 @@ export default function (pi: ExtensionAPI) {
     return managerPromise;
   };
 
+  const ownedView = (manager: SubagentManagerShape, owner: string) =>
+    scopedSubagentView(manager.view, owner);
+  const standardView = (manager: SubagentManagerShape) =>
+    ownedView(manager, "subagents");
+  const standardSnapshots = (manager: SubagentManagerShape) =>
+    standardView(manager).list();
+  const standardSnapshot = (manager: SubagentManagerShape, id: string) =>
+    standardView(manager).get(id);
+
   const updateStatus = (manager: SubagentManagerShape) => {
     if (!ui) return;
-    const subs = manager.view.list();
+    const subs = standardSnapshots(manager);
     if (subs.length === 0) {
       ui.setStatus("subagents", undefined);
       return;
@@ -323,6 +355,107 @@ export default function (pi: ExtensionAPI) {
       "subagents",
       formatActivityStatus(ui.theme, { running, done, failed }),
     );
+  };
+
+  const snapshotData = (snapshot: SubagentSnapshot) => ({
+    id: snapshot.id,
+    owner: snapshot.owner,
+    title: snapshot.title,
+    status: snapshot.status,
+    createdAt: snapshot.createdAt,
+    settledAt: snapshot.settledAt,
+    errorText: snapshot.errorText,
+    cwd: snapshot.cwd,
+    tools: snapshot.tools ? [...snapshot.tools] : undefined,
+    sessionFile: snapshot.meta.sessionFilePath,
+  });
+
+  const popOut = async (
+    manager: SubagentManagerShape,
+    owner: string,
+    id: string,
+  ): Promise<boolean> => {
+    const snapshot = ownedView(manager, owner).get(id);
+    if (!snapshot) return false;
+    if (!currentExternalHost()) {
+      ui?.notify(
+        "Not currently inside Herdr, cmux, or tmux; session remains floating.",
+        "warning",
+      );
+      return false;
+    }
+    if (snapshot.status === "running") {
+      ui?.notify(
+        "Waiting for the current side-session turn before opening its shell…",
+        "info",
+      );
+      await runTool(getRuntime(), manager.waitFor([id]));
+    }
+    const released = await runTool(getRuntime(), manager.release(id));
+    if (!released) return false;
+    try {
+      const launch = launchInCurrentHost(released);
+      if (!launch) return false;
+      pi.events.emit("subagents:interactive:popped-out", {
+        ...snapshotData(released),
+        host: launch.host,
+        target: launch.target,
+        focusCommand: launch.focusCommand,
+      });
+      ui?.notify(`Opened ${released.title} in ${launch.host}.`, "info");
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ui?.notify(
+        `Could not open shell: ${message}. Resume ${released.meta.sessionFilePath ?? "the saved session"}.`,
+        "error",
+      );
+      return false;
+    }
+  };
+
+  const openOwnedSession = async (
+    manager: SubagentManagerShape,
+    owner: string,
+    id: string,
+  ) => {
+    if (!sessionContext || sessionContext.mode !== "tui") {
+      ui?.notify("Floating sessions require Pi's TUI mode.", "error");
+      return;
+    }
+    await openSubagent(sessionContext, ownedView(manager, owner), id, {
+      title: owner === "btw" ? "BTW Sessions" : "Handoff Sessions",
+      onPopOut: (sessionId) => popOut(manager, owner, sessionId),
+      onCloseSession: async (sessionId) => {
+        const closed = await runTool(getRuntime(), manager.close(sessionId));
+        if (closed)
+          pi.events.emit("subagents:interactive:closed", snapshotData(closed));
+      },
+    });
+  };
+
+  const showOwnedSessions = async (
+    manager: SubagentManagerShape,
+    owner: string,
+  ) => {
+    if (!sessionContext || sessionContext.mode !== "tui") {
+      ui?.notify("Floating sessions require Pi's TUI mode.", "error");
+      return;
+    }
+    const view = ownedView(manager, owner);
+    if (view.size() === 0) {
+      ui?.notify(`No ${owner} sessions.`, "info");
+      return;
+    }
+    await openSubagentPicker(sessionContext, view, {
+      title: owner === "btw" ? "BTW Sessions" : "Handoff Sessions",
+      onPopOut: (sessionId) => popOut(manager, owner, sessionId),
+      onCloseSession: async (sessionId) => {
+        const closed = await runTool(getRuntime(), manager.close(sessionId));
+        if (closed)
+          pi.events.emit("subagents:interactive:closed", snapshotData(closed));
+      },
+    });
   };
 
   const deliverResult = (snap: SubagentSnapshot) => {
@@ -348,6 +481,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const onSettled = (snap: SubagentSnapshot, consumed: boolean) => {
+    if (snap.resultDelivery === "isolated") return;
     if (consumed) {
       resultDelivery.consume([snap.id]);
       return;
@@ -368,6 +502,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", flushResults);
 
   pi.on("session_shutdown", async () => {
+    for (const unsubscribe of interactiveUnsubscribers.splice(0)) unsubscribe();
     sessionContext = undefined;
     resultDelivery.clear();
     unsubStatus?.();
@@ -380,6 +515,236 @@ export default function (pi: ExtensionAPI) {
     // subagent scopes (and, later, their real child processes).
     await closing?.dispose();
   });
+
+  // --- Interactive extension API ----------------------------------------
+
+  onInteractive("subagents:interactive:ping", (raw: unknown) => {
+    const requestId = (raw as { requestId?: unknown })?.requestId;
+    replyInteractive(pi, "subagents:interactive:ping", requestId, {
+      success: true,
+      data: { version: INTERACTIVE_PROTOCOL_VERSION },
+    });
+  });
+
+  onInteractive("subagents:interactive:spawn", async (raw: unknown) => {
+    const request = raw as {
+      requestId?: unknown;
+      owner?: unknown;
+      title?: unknown;
+      prompt?: unknown;
+      cwd?: unknown;
+      tools?: unknown;
+      open?: unknown;
+      sessionSeed?: unknown;
+    };
+    try {
+      if (!sessionContext) throw new Error("No active parent session.");
+      if (
+        typeof request.owner !== "string" ||
+        !request.owner.trim() ||
+        request.owner === "subagents"
+      ) {
+        throw new Error(
+          "Interactive session owner must be a non-empty private namespace.",
+        );
+      }
+      if (typeof request.title !== "string" || !request.title.trim()) {
+        throw new Error("Interactive session title is required.");
+      }
+      if (typeof request.prompt !== "string" || !request.prompt.trim()) {
+        throw new Error("Interactive session prompt is required.");
+      }
+      const cwd = path.resolve(
+        sessionContext.cwd,
+        typeof request.cwd === "string" ? request.cwd : ".",
+      );
+      if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
+        throw new Error(`cwd is not a directory: ${cwd}`);
+      }
+      const tools = Array.isArray(request.tools)
+        ? [
+            ...new Set(
+              request.tools.filter(
+                (tool): tool is string =>
+                  typeof tool === "string" && tool.length > 0,
+              ),
+            ),
+          ]
+        : undefined;
+      const seed = request.sessionSeed;
+      if (!seed || typeof seed !== "object")
+        throw new Error("sessionSeed is required.");
+      const seedRecord = seed as Record<string, unknown>;
+      const kind = seedRecord.kind;
+      const sessionSeed =
+        kind === "fresh"
+          ? {
+              kind: "fresh" as const,
+              parentSession:
+                typeof seedRecord.parentSession === "string"
+                  ? seedRecord.parentSession
+                  : undefined,
+            }
+          : kind === "fork" &&
+              typeof seedRecord.parentSessionFile === "string" &&
+              typeof seedRecord.parentLeafId === "string"
+            ? {
+                kind: "fork" as const,
+                parentSessionFile: seedRecord.parentSessionFile,
+                parentLeafId: seedRecord.parentLeafId,
+              }
+            : undefined;
+      if (!sessionSeed) throw new Error("Invalid sessionSeed.");
+
+      const manager = await getManager();
+      const snapshot = await runTool(
+        getRuntime(),
+        manager.spawn("pi", {
+          title: request.title.trim().slice(0, 160),
+          prompt: request.prompt,
+          cwd,
+          owner: request.owner,
+          resultDelivery: "isolated",
+          tools,
+          sessionSeed,
+          parent: {
+            parentCwd: sessionContext.cwd,
+            projectTrusted: resolveChildProjectTrust({
+              parentCwd: sessionContext.cwd,
+              childCwd: cwd,
+              parentTrusted: sessionContext.isProjectTrusted(),
+            }),
+            inheritedModel: sessionContext.model
+              ? {
+                  provider: sessionContext.model.provider,
+                  id: sessionContext.model.id,
+                }
+              : undefined,
+            inheritedThinkingLevel: pi.getThinkingLevel(),
+            modelRegistry: sessionContext.modelRegistry,
+          },
+        }),
+      );
+      replyInteractive(pi, "subagents:interactive:spawn", request.requestId, {
+        success: true,
+        data: snapshotData(snapshot),
+      });
+      if (request.open !== false) {
+        queueMicrotask(
+          () => void openOwnedSession(manager, snapshot.owner, snapshot.id),
+        );
+      }
+    } catch (error) {
+      replyInteractive(pi, "subagents:interactive:spawn", request.requestId, {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  onInteractive("subagents:interactive:list", async (raw: unknown) => {
+    const request = raw as { requestId?: unknown; owner?: unknown };
+    try {
+      if (typeof request.owner !== "string" || !request.owner.trim()) {
+        throw new Error("owner is required.");
+      }
+      const manager = await getManager();
+      replyInteractive(pi, "subagents:interactive:list", request.requestId, {
+        success: true,
+        data: ownedView(manager, request.owner).list().map(snapshotData),
+      });
+    } catch (error) {
+      replyInteractive(pi, "subagents:interactive:list", request.requestId, {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  onInteractive("subagents:interactive:open", async (raw: unknown) => {
+    const request = raw as {
+      requestId?: unknown;
+      owner?: unknown;
+      id?: unknown;
+    };
+    try {
+      if (typeof request.owner !== "string" || typeof request.id !== "string") {
+        throw new Error("owner and id are required.");
+      }
+      const manager = await getManager();
+      if (!ownedView(manager, request.owner).get(request.id))
+        throw new Error("Session not found.");
+      replyInteractive(pi, "subagents:interactive:open", request.requestId, {
+        success: true,
+      });
+      queueMicrotask(
+        () =>
+          void openOwnedSession(
+            manager,
+            request.owner as string,
+            request.id as string,
+          ),
+      );
+    } catch (error) {
+      replyInteractive(pi, "subagents:interactive:open", request.requestId, {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  onInteractive("subagents:interactive:show", async (raw: unknown) => {
+    const request = raw as { requestId?: unknown; owner?: unknown };
+    try {
+      if (typeof request.owner !== "string")
+        throw new Error("owner is required.");
+      const manager = await getManager();
+      replyInteractive(pi, "subagents:interactive:show", request.requestId, {
+        success: true,
+      });
+      queueMicrotask(
+        () => void showOwnedSessions(manager, request.owner as string),
+      );
+    } catch (error) {
+      replyInteractive(pi, "subagents:interactive:show", request.requestId, {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  onInteractive("subagents:interactive:close", async (raw: unknown) => {
+    const request = raw as {
+      requestId?: unknown;
+      owner?: unknown;
+      id?: unknown;
+    };
+    try {
+      if (typeof request.owner !== "string" || typeof request.id !== "string") {
+        throw new Error("owner and id are required.");
+      }
+      const manager = await getManager();
+      if (!ownedView(manager, request.owner).get(request.id))
+        throw new Error("Session not found.");
+      const closed = await runTool(getRuntime(), manager.close(request.id));
+      if (closed)
+        pi.events.emit("subagents:interactive:closed", snapshotData(closed));
+      replyInteractive(pi, "subagents:interactive:close", request.requestId, {
+        success: true,
+      });
+    } catch (error) {
+      replyInteractive(pi, "subagents:interactive:close", request.requestId, {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  queueMicrotask(() =>
+    pi.events.emit("subagents:interactive:ready", {
+      version: INTERACTIVE_PROTOCOL_VERSION,
+    }),
+  );
 
   // --- Tools -------------------------------------------------------------
 
@@ -488,8 +853,8 @@ export default function (pi: ExtensionAPI) {
       const ids = [...new Set(params.ids)];
       if (ids.length === 0)
         throw new Error("Provide at least one subagent id.");
-      const known = manager.view.list().map((snap) => snap.id);
-      const unknown = ids.filter((id) => !manager.view.get(id));
+      const known = standardSnapshots(manager).map((snap) => snap.id);
+      const unknown = ids.filter((id) => !standardSnapshot(manager, id));
       if (unknown.length > 0) {
         throw new Error(
           `Unknown subagent id(s): ${unknown.join(", ")}. Known: ${known.join(", ") || "none"}.`,
@@ -516,7 +881,7 @@ export default function (pi: ExtensionAPI) {
       const sections: string[] = [];
       let remainingBytes = WAIT_OUTPUT_MAX_BYTES;
       for (const id of ids) {
-        const snap = manager.view.get(id);
+        const snap = standardSnapshot(manager, id);
         if (!snap) {
           sections.push(`## ${id}\n\n(no longer tracked)`);
           continue;
@@ -553,7 +918,7 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text", text }],
         details: {
           results: ids.map((id) => {
-            const snap = manager.view.get(id);
+            const snap = standardSnapshot(manager, id);
             return { id, title: snap?.title, status: snap?.status };
           }),
         },
@@ -576,8 +941,8 @@ export default function (pi: ExtensionAPI) {
       if (ids.length === 0)
         throw new Error("Provide at least one subagent id.");
 
-      const known = manager.view.list().map((snap) => snap.id);
-      const unknown = ids.filter((id) => !manager.view.get(id));
+      const known = standardSnapshots(manager).map((snap) => snap.id);
+      const unknown = ids.filter((id) => !standardSnapshot(manager, id));
       if (unknown.length > 0) {
         throw new Error(
           `Unknown subagent id(s): ${unknown.join(", ")}. Known: ${known.join(", ") || "none"}.`,
@@ -616,9 +981,9 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params) {
       const manager = await getManager();
-      const snap = manager.view.get(params.id);
+      const snap = standardSnapshot(manager, params.id);
       if (!snap) {
-        const known = manager.view.list().map((s) => s.id);
+        const known = standardSnapshots(manager).map((s) => s.id);
         throw new Error(
           `Unknown subagent id "${params.id}". Known: ${known.join(", ") || "none"}.`,
         );
@@ -650,7 +1015,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute() {
       const manager = await getManager();
-      const subs = manager.view.list();
+      const subs = standardSnapshots(manager);
       const text =
         subs.length === 0
           ? "No subagents."
@@ -739,18 +1104,18 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const manager = await getManager();
-        await runHeadlessSubagentsDialog(ctx.ui, manager.view);
+        await runHeadlessSubagentsDialog(ctx.ui, standardView(manager));
         return;
       }
       const manager = await getManager();
-      if (manager.view.size() === 0) {
+      if (standardView(manager).size() === 0) {
         ctx.ui.notify(
           "No subagents yet. The agent spawns them with subagent_spawn.",
           "info",
         );
         return;
       }
-      await openSubagentPicker(ctx, manager.view);
+      await openSubagentPicker(ctx, standardView(manager));
     },
   });
 }
