@@ -425,6 +425,7 @@ export default function (pi: ExtensionAPI) {
     }
     await openSubagent(sessionContext, ownedView(manager, owner), id, {
       title: owner === "btw" ? "BTW Sessions" : "Handoff Sessions",
+      floating: true,
       onPopOut: (sessionId) => popOut(manager, owner, sessionId),
       onCloseSession: async (sessionId) => {
         const closed = await runTool(getRuntime(), manager.close(sessionId));
@@ -449,6 +450,7 @@ export default function (pi: ExtensionAPI) {
     }
     await openSubagentPicker(sessionContext, view, {
       title: owner === "btw" ? "BTW Sessions" : "Handoff Sessions",
+      floating: true,
       onPopOut: (sessionId) => popOut(manager, owner, sessionId),
       onCloseSession: async (sessionId) => {
         const closed = await runTool(getRuntime(), manager.close(sessionId));

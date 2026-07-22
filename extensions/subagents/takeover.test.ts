@@ -2,8 +2,24 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   reconcileDashboardSelection,
+  takeoverOverlayOptions,
   type DashboardSelection,
 } from "./src/ui/takeover.ts";
+
+test("standard subagents keep their original full-width presentation", () => {
+  assert.deepEqual(takeoverOverlayOptions(), {
+    anchor: "center",
+    width: "100%",
+    maxHeight: "100%",
+  });
+  assert.deepEqual(takeoverOverlayOptions(true), {
+    anchor: "right-center",
+    width: "78%",
+    minWidth: 72,
+    maxHeight: "100%",
+    margin: 1,
+  });
+});
 
 test("dashboard selection follows its subagent id and falls back by row", () => {
   const selection: DashboardSelection = { id: "sa-7", index: 6 };
