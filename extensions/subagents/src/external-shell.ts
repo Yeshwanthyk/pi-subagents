@@ -9,6 +9,28 @@ export interface ExternalLaunch {
   focusCommand: string;
 }
 
+export interface PreparedPiSession {
+  name: string;
+  title: string;
+  cwd: string;
+  sessionFile: string;
+  prompt: string;
+  tools?: readonly string[];
+  model?: { provider: string; id: string };
+  thinkingLevel?: string;
+}
+
+interface HerdrTabCreated {
+  result?: {
+    root_pane?: { pane_id?: unknown; tab_id?: unknown };
+  };
+}
+
+type SyncCommandRunner = (command: string, args: string[]) => string;
+
+const runSync: SyncCommandRunner = (command, args) =>
+  execFileSync(command, args, { encoding: "utf8", stdio: "pipe" });
+
 const UUID_PATTERN =
   /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
@@ -32,6 +54,87 @@ function compactTitle(value: string): string {
       .replace(/\s+/g, " ")
       .trim() || "pi session";
   return title.slice(0, 80);
+}
+
+function parseCreatedHerdrTab(output: string) {
+  let response: HerdrTabCreated;
+  try {
+    response = JSON.parse(output) as HerdrTabCreated;
+  } catch {
+    throw new Error(`Unexpected herdr tab create output: ${output.trim()}`);
+  }
+  const paneId = response.result?.root_pane?.pane_id;
+  const tabId = response.result?.root_pane?.tab_id;
+  if (typeof paneId !== "string" || typeof tabId !== "string") {
+    throw new Error(`Unexpected herdr tab create output: ${output.trim()}`);
+  }
+  return { paneId, tabId };
+}
+
+/** Launch a prepared Pi session in a new Herdr tab before its first turn. */
+export function launchPreparedPiInHerdr(
+  prepared: PreparedPiSession,
+  env: NodeJS.ProcessEnv = process.env,
+  run: SyncCommandRunner = runSync,
+): ExternalLaunch {
+  if (currentExternalHost(env) !== "herdr") {
+    throw new Error("Herdr is not the current terminal host.");
+  }
+  const workspace = env.HERDR_WORKSPACE_ID!;
+  const created = run("herdr", [
+    "tab",
+    "create",
+    "--workspace",
+    workspace,
+    "--cwd",
+    prepared.cwd,
+    "--label",
+    compactTitle(prepared.title),
+    "--no-focus",
+  ]);
+  const { paneId, tabId } = parseCreatedHerdrTab(created);
+
+  const piArgs = ["--session", prepared.sessionFile];
+  if (prepared.tools && prepared.tools.length > 0) {
+    piArgs.push("--tools", prepared.tools.join(","));
+  }
+  if (prepared.model) {
+    piArgs.push("--model", `${prepared.model.provider}/${prepared.model.id}`);
+  }
+  if (prepared.thinkingLevel) {
+    piArgs.push("--thinking", prepared.thinkingLevel);
+  }
+
+  try {
+    run("herdr", [
+      "agent",
+      "start",
+      prepared.name,
+      "--kind",
+      "pi",
+      "--pane",
+      paneId,
+      "--timeout",
+      "30000",
+      "--",
+      ...piArgs,
+    ]);
+    run("herdr", ["agent", "prompt", prepared.name, prepared.prompt]);
+    run("herdr", ["agent", "focus", prepared.name]);
+  } catch (error) {
+    try {
+      run("herdr", ["tab", "close", tabId]);
+    } catch {
+      // Preserve the original launch error.
+    }
+    throw error;
+  }
+
+  return {
+    host: "herdr",
+    target: prepared.name,
+    focusCommand: `herdr agent focus ${shellEscape(prepared.name)}`,
+  };
 }
 
 function piArgv(snapshot: SubagentSnapshot): string[] {

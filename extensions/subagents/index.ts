@@ -20,6 +20,7 @@
  * JSON-RPC to a scoped `codex app-server` process.
  */
 
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -44,6 +45,7 @@ import {
   formatElapsed,
   latestText,
   REASONING_EFFORTS,
+  type SpawnTask,
   type SubagentSnapshot,
 } from "./src/domain.ts";
 import {
@@ -77,9 +79,11 @@ import {
   runTool,
   type SubagentRuntime,
 } from "./src/runtime.ts";
+import { createChildSessionManager } from "./src/backends/pi.ts";
 import {
   currentExternalHost,
   launchInCurrentHost,
+  launchPreparedPiInHerdr,
 } from "./src/external-shell.ts";
 import { openSubagent, openSubagentPicker } from "./src/ui/takeover.ts";
 
@@ -537,6 +541,7 @@ export default function (pi: ExtensionAPI) {
       cwd?: unknown;
       tools?: unknown;
       open?: unknown;
+      externalHost?: unknown;
       sessionSeed?: unknown;
     };
     try {
@@ -597,6 +602,97 @@ export default function (pi: ExtensionAPI) {
               }
             : undefined;
       if (!sessionSeed) throw new Error("Invalid sessionSeed.");
+
+      if (request.externalHost === "herdr") {
+        if (request.owner !== "btw") {
+          throw new Error(
+            "Direct Herdr launch is only available for BTW sessions.",
+          );
+        }
+        if (currentExternalHost() !== "herdr") {
+          throw new Error("Herdr is not the current terminal host.");
+        }
+        const createdAt = Date.now();
+        const id = `btw-${randomUUID().slice(0, 8)}`;
+        const title = request.title.trim().slice(0, 160);
+        const parentModel = sessionContext.model
+          ? {
+              provider: sessionContext.model.provider,
+              id: sessionContext.model.id,
+            }
+          : undefined;
+        const task: SpawnTask = {
+          title,
+          prompt: request.prompt,
+          cwd,
+          owner: request.owner,
+          resultDelivery: "isolated",
+          tools,
+          sessionSeed,
+          parent: {
+            parentCwd: sessionContext.cwd,
+            projectTrusted: resolveChildProjectTrust({
+              parentCwd: sessionContext.cwd,
+              childCwd: cwd,
+              parentTrusted: sessionContext.isProjectTrusted(),
+            }),
+            inheritedModel: parentModel,
+            inheritedThinkingLevel: pi.getThinkingLevel(),
+            modelRegistry: sessionContext.modelRegistry,
+          },
+        };
+        const child = createChildSessionManager(task);
+        child.appendSessionInfo(`${request.owner}: ${title}`);
+        const sessionFile = child.getSessionFile();
+        if (!sessionFile) {
+          throw new Error("Failed to create a persisted BTW session.");
+        }
+        try {
+          const launch = launchPreparedPiInHerdr({
+            name: id,
+            title,
+            cwd,
+            sessionFile,
+            prompt: request.prompt,
+            tools,
+            model: parentModel,
+            thinkingLevel: pi.getThinkingLevel(),
+          });
+          replyInteractive(
+            pi,
+            "subagents:interactive:spawn",
+            request.requestId,
+            {
+              success: true,
+              data: {
+                id,
+                owner: request.owner,
+                title,
+                status: "running",
+                createdAt,
+                cwd,
+                tools,
+                sessionFile,
+                host: launch.host,
+                target: launch.target,
+              },
+            },
+          );
+          return;
+        } catch (error) {
+          try {
+            fs.unlinkSync(sessionFile);
+          } catch {
+            // Best-effort cleanup of the unlaunched child session.
+          }
+          throw error;
+        }
+      }
+      if (request.externalHost !== undefined) {
+        throw new Error(
+          `Unsupported external host: ${String(request.externalHost)}`,
+        );
+      }
 
       const manager = await getManager();
       const snapshot = await runTool(

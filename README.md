@@ -34,7 +34,7 @@ Protocol channels (version 1):
 - `subagents:interactive:show`
 - `subagents:interactive:close`
 
-Every request includes a `requestId`; replies use `<channel>:reply:<requestId>`. Spawn supports fresh or parent-forked persisted Pi sessions. Floating sessions can be moved with `o` into the terminal host Pi currently runs inside: Herdr, cmux, or tmux. The in-process runtime is disposed before the external Pi process receives the session file.
+Every request includes a `requestId`; replies use `<channel>:reply:<requestId>`. Spawn supports fresh or parent-forked persisted Pi sessions. BTW may request `externalHost: "herdr"`, which creates the fork and launches it in a new Herdr tab before its first turn. Other floating sessions can be moved with `o` into Herdr, cmux, or tmux after their active turn settles. The in-process runtime is disposed before the external Pi process receives the session file.
 
 `pi-btw` and `pi-handoff` use this API without appearing in the normal subagent UI.
 
