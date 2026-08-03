@@ -38,6 +38,13 @@ export function isReasoningEffort(value: unknown): value is ReasoningEffort {
 }
 
 export type SubagentStatus = "running" | "done" | "error";
+export type SubagentVisibility = "standard" | "private";
+export type SubagentResultDelivery = "parent" | "client" | "none";
+
+export interface SubagentClient {
+  readonly id: string;
+  readonly correlationId: string;
+}
 
 /** Parent-session context resolved by the tool layer and passed opaquely. */
 export interface ParentContext {
@@ -62,10 +69,14 @@ export interface SpawnTask {
   readonly prompt: string;
   readonly title: string;
   readonly cwd: string;
-  /** Logical owner used to keep extension-managed sessions out of /subagents. */
+  /** Logical namespace for the feature or extension that created the session. */
   readonly owner?: string;
-  /** Isolated sessions never deliver completion messages into the parent. */
-  readonly resultDelivery?: "parent" | "isolated";
+  /** Whether the session appears in the standard /subagents management surface. */
+  readonly visibility?: SubagentVisibility;
+  /** Where terminal lifecycle output is delivered. */
+  readonly resultDelivery?: SubagentResultDelivery;
+  /** Correlation metadata for an extension client that owns task state. */
+  readonly client?: SubagentClient;
   /** Explicit active-tool allowlist for Pi children. Omitted keeps normal defaults. */
   readonly tools?: ReadonlyArray<string>;
   /** Initial persisted-session source for Pi children. */
@@ -213,7 +224,9 @@ export interface SubagentSnapshot {
   readonly id: string;
   readonly backend: BackendName;
   readonly owner: string;
-  readonly resultDelivery: "parent" | "isolated";
+  readonly visibility: SubagentVisibility;
+  readonly resultDelivery: SubagentResultDelivery;
+  readonly client?: SubagentClient;
   readonly tools?: ReadonlyArray<string>;
   readonly title: string;
   readonly prompt: string;
@@ -222,6 +235,7 @@ export interface SubagentSnapshot {
   readonly createdAt: number;
   readonly settledAt?: number;
   readonly errorText?: string;
+  readonly outcome?: RunOutcome;
   readonly meta: SubagentMeta;
   readonly usage: { readonly tokens?: number; readonly contextWindow?: number };
   readonly transcript: ReadonlyArray<TranscriptItem>;

@@ -29,9 +29,12 @@ import type {
   RunOutcome,
   SpawnTask,
   SubagentEvent,
+  SubagentClient,
   SubagentMeta,
+  SubagentResultDelivery,
   SubagentSnapshot,
   SubagentStatus,
+  SubagentVisibility,
   TranscriptItem,
 } from "./domain.ts";
 import {
@@ -57,7 +60,9 @@ interface MutableSnapshot {
   id: string;
   backend: BackendName;
   owner: string;
-  resultDelivery: "parent" | "isolated";
+  visibility: SubagentVisibility;
+  resultDelivery: SubagentResultDelivery;
+  client?: SubagentClient;
   tools?: ReadonlyArray<string>;
   title: string;
   prompt: string;
@@ -66,6 +71,7 @@ interface MutableSnapshot {
   createdAt: number;
   settledAt?: number;
   errorText?: string;
+  outcome?: RunOutcome;
   meta: SubagentMeta;
   usage: { tokens?: number; contextWindow?: number };
   transcript: TranscriptItem[];
@@ -114,28 +120,52 @@ export interface SubagentReadModel {
   ): void;
 }
 
-/** Namespace-filtered view used by extension-specific dashboards. */
+/** Predicate-filtered view used by standard and feature-specific dashboards. */
+export function filteredSubagentView(
+  view: SubagentReadModel,
+  includes: (snapshot: SubagentSnapshot) => boolean,
+): SubagentReadModel {
+  const included = (snapshot: SubagentSnapshot | undefined) =>
+    snapshot && includes(snapshot) ? snapshot : undefined;
+  return {
+    list: () => view.list().filter(includes),
+    get: (id) => included(view.get(id)),
+    size: () => view.list().filter(includes).length,
+    subscribe: (listener) => view.subscribe(listener),
+    subscribeTo: (id, listener) => view.subscribeTo(id, listener),
+    requestSend: (id, text) => {
+      if (included(view.get(id))) view.requestSend(id, text);
+    },
+    requestAbort: (id) => {
+      if (included(view.get(id))) view.requestAbort(id);
+    },
+    setOnSettled: () => {
+      throw new Error("Filtered views cannot replace the manager settle hook.");
+    },
+  };
+}
+
 export function scopedSubagentView(
   view: SubagentReadModel,
   owner: string,
 ): SubagentReadModel {
-  const owns = (snapshot: SubagentSnapshot | undefined) =>
-    snapshot?.owner === owner ? snapshot : undefined;
+  return filteredSubagentView(view, (snapshot) => snapshot.owner === owner);
+}
+
+export function standardSubagentView(
+  view: SubagentReadModel,
+): SubagentReadModel {
+  const standard = filteredSubagentView(
+    view,
+    (snapshot) => snapshot.visibility === "standard",
+  );
   return {
-    list: () => view.list().filter((snapshot) => snapshot.owner === owner),
-    get: (id) => owns(view.get(id)),
-    size: () =>
-      view.list().filter((snapshot) => snapshot.owner === owner).length,
-    subscribe: (listener) => view.subscribe(listener),
-    subscribeTo: (id, listener) => view.subscribeTo(id, listener),
+    ...standard,
     requestSend: (id, text) => {
-      if (owns(view.get(id))) view.requestSend(id, text);
-    },
-    requestAbort: (id) => {
-      if (owns(view.get(id))) view.requestAbort(id);
-    },
-    setOnSettled: () => {
-      throw new Error("Scoped views cannot replace the manager settle hook.");
+      const snapshot = standard.get(id);
+      if (!snapshot || (snapshot.client && snapshot.status !== "running"))
+        return;
+      standard.requestSend(id, text);
     },
   };
 }
@@ -286,6 +316,7 @@ const makeManager = Effect.gen(function* () {
     entry.restarting = false;
     if (s.status !== "running") return;
     s.settledAt = Date.now();
+    s.outcome = outcome;
     switch (outcome._tag) {
       case "Completed":
         s.status = "done";
@@ -327,6 +358,7 @@ const makeManager = Effect.gen(function* () {
         s.status = "running";
         s.settledAt = undefined;
         s.errorText = undefined;
+        s.outcome = undefined;
         break;
       case "RunSettled":
         settle(entry, event.outcome);
@@ -449,10 +481,9 @@ const makeManager = Effect.gen(function* () {
             id,
             backend: backendName,
             owner: task.owner ?? "subagents",
-            resultDelivery:
-              (task.owner ?? "subagents") === "subagents"
-                ? (task.resultDelivery ?? "parent")
-                : "isolated",
+            visibility: task.visibility ?? "standard",
+            resultDelivery: task.resultDelivery ?? "parent",
+            client: task.client ? { ...task.client } : undefined,
             tools: task.tools ? [...task.tools] : undefined,
             title: task.title,
             prompt: task.prompt,

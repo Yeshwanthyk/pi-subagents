@@ -15,6 +15,7 @@ function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
     id: "sa-1",
     backend: "pi",
     owner: "subagents",
+    visibility: "standard",
     resultDelivery: "parent",
     title: "Test agent",
     prompt: "test",

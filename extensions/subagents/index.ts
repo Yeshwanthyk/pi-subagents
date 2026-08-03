@@ -20,7 +20,6 @@
  * JSON-RPC to a scoped `codex app-server` process.
  */
 
-import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -53,11 +52,16 @@ import {
   formatContextUtilization,
 } from "./src/format.ts";
 import {
-  scopedSubagentView,
+  standardSubagentView,
   SubagentManager,
   type SubagentManagerShape,
   type SubagentReadModel,
 } from "./src/manager.ts";
+import {
+  clientSettlement,
+  registerSubagentClientApi,
+} from "./src/client-api.ts";
+import { SUBAGENT_CLIENT_CHANNELS } from "./src/client-protocol.ts";
 import {
   buildSubagentResultMessage,
   buildSubagentSpawnResult,
@@ -79,13 +83,8 @@ import {
   runTool,
   type SubagentRuntime,
 } from "./src/runtime.ts";
-import { createChildSessionManager } from "./src/backends/pi.ts";
-import {
-  currentExternalHost,
-  launchInCurrentHost,
-  launchPreparedPiInHerdr,
-} from "./src/external-shell.ts";
-import { openSubagent, openSubagentPicker } from "./src/ui/takeover.ts";
+import { registerBtw } from "./src/btw.ts";
+import { openSubagentPicker } from "./src/ui/takeover.ts";
 
 const SUBAGENT_OUTPUT_MAX_BYTES = 24 * 1024;
 const WAIT_OUTPUT_MAX_BYTES = 48 * 1024;
@@ -98,20 +97,6 @@ const STEER_CHOICE = "Steer…";
 const ABORT_CHOICE = "Abort";
 const SHOW_OUTPUT_CHOICE = "Show output";
 const BACK_CHOICE = "Back";
-const INTERACTIVE_PROTOCOL_VERSION = 1;
-
-type InteractiveReply =
-  { success: true; data?: unknown } | { success: false; error: string };
-
-function replyInteractive(
-  pi: ExtensionAPI,
-  channel: string,
-  requestId: unknown,
-  reply: InteractiveReply,
-) {
-  if (typeof requestId !== "string" || requestId.length === 0) return;
-  pi.events.emit(`${channel}:reply:${requestId}`, reply);
-}
 
 export interface HeadlessSubagentsUI {
   select(title: string, options: string[]): Promise<string | undefined>;
@@ -314,10 +299,7 @@ export default function (pi: ExtensionAPI) {
   let sessionContext: ExtensionContext | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
-  const interactiveUnsubscribers: Array<() => void> = [];
-  const onInteractive = (channel: string, handler: (data: unknown) => void) => {
-    interactiveUnsubscribers.push(pi.events.on(channel, handler));
-  };
+  let disposeClientApi: (() => void) | undefined;
   const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
 
   const getRuntime = () => (runtime ??= createSubagentRuntime());
@@ -336,10 +318,8 @@ export default function (pi: ExtensionAPI) {
     return managerPromise;
   };
 
-  const ownedView = (manager: SubagentManagerShape, owner: string) =>
-    scopedSubagentView(manager.view, owner);
   const standardView = (manager: SubagentManagerShape) =>
-    ownedView(manager, "subagents");
+    standardSubagentView(manager.view);
   const standardSnapshots = (manager: SubagentManagerShape) =>
     standardView(manager).list();
   const standardSnapshot = (manager: SubagentManagerShape, id: string) =>
@@ -359,109 +339,6 @@ export default function (pi: ExtensionAPI) {
       "subagents",
       formatActivityStatus(ui.theme, { running, done, failed }),
     );
-  };
-
-  const snapshotData = (snapshot: SubagentSnapshot) => ({
-    id: snapshot.id,
-    owner: snapshot.owner,
-    title: snapshot.title,
-    status: snapshot.status,
-    createdAt: snapshot.createdAt,
-    settledAt: snapshot.settledAt,
-    errorText: snapshot.errorText,
-    cwd: snapshot.cwd,
-    tools: snapshot.tools ? [...snapshot.tools] : undefined,
-    sessionFile: snapshot.meta.sessionFilePath,
-  });
-
-  const popOut = async (
-    manager: SubagentManagerShape,
-    owner: string,
-    id: string,
-  ): Promise<boolean> => {
-    const snapshot = ownedView(manager, owner).get(id);
-    if (!snapshot) return false;
-    if (!currentExternalHost()) {
-      ui?.notify(
-        "Not currently inside Herdr, cmux, or tmux; session remains floating.",
-        "warning",
-      );
-      return false;
-    }
-    if (snapshot.status === "running") {
-      ui?.notify(
-        "Waiting for the current side-session turn before opening its shell…",
-        "info",
-      );
-      await runTool(getRuntime(), manager.waitFor([id]));
-    }
-    const released = await runTool(getRuntime(), manager.release(id));
-    if (!released) return false;
-    try {
-      const launch = launchInCurrentHost(released);
-      if (!launch) return false;
-      pi.events.emit("subagents:interactive:popped-out", {
-        ...snapshotData(released),
-        host: launch.host,
-        target: launch.target,
-        focusCommand: launch.focusCommand,
-      });
-      ui?.notify(`Opened ${released.title} in ${launch.host}.`, "info");
-      return true;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      ui?.notify(
-        `Could not open shell: ${message}. Resume ${released.meta.sessionFilePath ?? "the saved session"}.`,
-        "error",
-      );
-      return false;
-    }
-  };
-
-  const openOwnedSession = async (
-    manager: SubagentManagerShape,
-    owner: string,
-    id: string,
-  ) => {
-    if (!sessionContext || sessionContext.mode !== "tui") {
-      ui?.notify("Floating sessions require Pi's TUI mode.", "error");
-      return;
-    }
-    await openSubagent(sessionContext, ownedView(manager, owner), id, {
-      title: owner === "btw" ? "BTW Sessions" : "Handoff Sessions",
-      floating: true,
-      onPopOut: (sessionId) => popOut(manager, owner, sessionId),
-      onCloseSession: async (sessionId) => {
-        const closed = await runTool(getRuntime(), manager.close(sessionId));
-        if (closed)
-          pi.events.emit("subagents:interactive:closed", snapshotData(closed));
-      },
-    });
-  };
-
-  const showOwnedSessions = async (
-    manager: SubagentManagerShape,
-    owner: string,
-  ) => {
-    if (!sessionContext || sessionContext.mode !== "tui") {
-      ui?.notify("Floating sessions require Pi's TUI mode.", "error");
-      return;
-    }
-    const view = ownedView(manager, owner);
-    if (view.size() === 0) {
-      ui?.notify(`No ${owner} sessions.`, "info");
-      return;
-    }
-    await openSubagentPicker(sessionContext, view, {
-      title: owner === "btw" ? "BTW Sessions" : "Handoff Sessions",
-      floating: true,
-      onPopOut: (sessionId) => popOut(manager, owner, sessionId),
-      onCloseSession: async (sessionId) => {
-        const closed = await runTool(getRuntime(), manager.close(sessionId));
-        if (closed)
-          pi.events.emit("subagents:interactive:closed", snapshotData(closed));
-      },
-    });
   };
 
   const deliverResult = (snap: SubagentSnapshot) => {
@@ -487,7 +364,12 @@ export default function (pi: ExtensionAPI) {
   };
 
   const onSettled = (snap: SubagentSnapshot, consumed: boolean) => {
-    if (snap.resultDelivery === "isolated") return;
+    if (snap.resultDelivery === "client") {
+      const event = clientSettlement(snap);
+      if (event) pi.events.emit(SUBAGENT_CLIENT_CHANNELS.settled, event);
+      return;
+    }
+    if (snap.resultDelivery === "none") return;
     if (consumed) {
       resultDelivery.consume([snap.id]);
       return;
@@ -507,8 +389,25 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_settled", flushResults);
 
+  disposeClientApi = registerSubagentClientApi({
+    pi,
+    getManager,
+    getRuntime,
+    getSessionContext: () => sessionContext,
+    resolveChildProjectTrust,
+  });
+
+  registerBtw({
+    pi,
+    getManager,
+    getRuntime,
+    getSessionContext: () => sessionContext,
+    resolveChildProjectTrust,
+  });
+
   pi.on("session_shutdown", async () => {
-    for (const unsubscribe of interactiveUnsubscribers.splice(0)) unsubscribe();
+    disposeClientApi?.();
+    disposeClientApi = undefined;
     sessionContext = undefined;
     resultDelivery.clear();
     unsubStatus?.();
@@ -521,328 +420,6 @@ export default function (pi: ExtensionAPI) {
     // subagent scopes (and, later, their real child processes).
     await closing?.dispose();
   });
-
-  // --- Interactive extension API ----------------------------------------
-
-  onInteractive("subagents:interactive:ping", (raw: unknown) => {
-    const requestId = (raw as { requestId?: unknown })?.requestId;
-    replyInteractive(pi, "subagents:interactive:ping", requestId, {
-      success: true,
-      data: { version: INTERACTIVE_PROTOCOL_VERSION },
-    });
-  });
-
-  onInteractive("subagents:interactive:spawn", async (raw: unknown) => {
-    const request = raw as {
-      requestId?: unknown;
-      owner?: unknown;
-      title?: unknown;
-      prompt?: unknown;
-      cwd?: unknown;
-      tools?: unknown;
-      open?: unknown;
-      externalHost?: unknown;
-      sessionSeed?: unknown;
-    };
-    try {
-      if (!sessionContext) throw new Error("No active parent session.");
-      if (
-        typeof request.owner !== "string" ||
-        !request.owner.trim() ||
-        request.owner === "subagents"
-      ) {
-        throw new Error(
-          "Interactive session owner must be a non-empty private namespace.",
-        );
-      }
-      if (typeof request.title !== "string" || !request.title.trim()) {
-        throw new Error("Interactive session title is required.");
-      }
-      if (typeof request.prompt !== "string" || !request.prompt.trim()) {
-        throw new Error("Interactive session prompt is required.");
-      }
-      const cwd = path.resolve(
-        sessionContext.cwd,
-        typeof request.cwd === "string" ? request.cwd : ".",
-      );
-      if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
-        throw new Error(`cwd is not a directory: ${cwd}`);
-      }
-      const tools = Array.isArray(request.tools)
-        ? [
-            ...new Set(
-              request.tools.filter(
-                (tool): tool is string =>
-                  typeof tool === "string" && tool.length > 0,
-              ),
-            ),
-          ]
-        : undefined;
-      const seed = request.sessionSeed;
-      if (!seed || typeof seed !== "object")
-        throw new Error("sessionSeed is required.");
-      const seedRecord = seed as Record<string, unknown>;
-      const kind = seedRecord.kind;
-      const sessionSeed =
-        kind === "fresh"
-          ? {
-              kind: "fresh" as const,
-              parentSession:
-                typeof seedRecord.parentSession === "string"
-                  ? seedRecord.parentSession
-                  : undefined,
-            }
-          : kind === "fork" &&
-              typeof seedRecord.parentSessionFile === "string" &&
-              typeof seedRecord.parentLeafId === "string"
-            ? {
-                kind: "fork" as const,
-                parentSessionFile: seedRecord.parentSessionFile,
-                parentLeafId: seedRecord.parentLeafId,
-              }
-            : undefined;
-      if (!sessionSeed) throw new Error("Invalid sessionSeed.");
-
-      if (request.externalHost === "herdr") {
-        if (request.owner !== "btw") {
-          throw new Error(
-            "Direct Herdr launch is only available for BTW sessions.",
-          );
-        }
-        if (currentExternalHost() !== "herdr") {
-          throw new Error("Herdr is not the current terminal host.");
-        }
-        const createdAt = Date.now();
-        const id = `btw-${randomUUID().slice(0, 8)}`;
-        const title = request.title.trim().slice(0, 160);
-        const parentModel = sessionContext.model
-          ? {
-              provider: sessionContext.model.provider,
-              id: sessionContext.model.id,
-            }
-          : undefined;
-        const task: SpawnTask = {
-          title,
-          prompt: request.prompt,
-          cwd,
-          owner: request.owner,
-          resultDelivery: "isolated",
-          tools,
-          sessionSeed,
-          parent: {
-            parentCwd: sessionContext.cwd,
-            projectTrusted: resolveChildProjectTrust({
-              parentCwd: sessionContext.cwd,
-              childCwd: cwd,
-              parentTrusted: sessionContext.isProjectTrusted(),
-            }),
-            inheritedModel: parentModel,
-            inheritedThinkingLevel: pi.getThinkingLevel(),
-            modelRegistry: sessionContext.modelRegistry,
-          },
-        };
-        const child = createChildSessionManager(task);
-        child.appendSessionInfo(`${request.owner}: ${title}`);
-        const sessionFile = child.getSessionFile();
-        if (!sessionFile) {
-          throw new Error("Failed to create a persisted BTW session.");
-        }
-        try {
-          const launch = launchPreparedPiInHerdr({
-            name: id,
-            title,
-            cwd,
-            sessionFile,
-            prompt: request.prompt,
-            tools,
-            model: parentModel,
-            thinkingLevel: pi.getThinkingLevel(),
-          });
-          replyInteractive(
-            pi,
-            "subagents:interactive:spawn",
-            request.requestId,
-            {
-              success: true,
-              data: {
-                id,
-                owner: request.owner,
-                title,
-                status: "running",
-                createdAt,
-                cwd,
-                tools,
-                sessionFile,
-                host: launch.host,
-                target: launch.target,
-              },
-            },
-          );
-          return;
-        } catch (error) {
-          try {
-            fs.unlinkSync(sessionFile);
-          } catch {
-            // Best-effort cleanup of the unlaunched child session.
-          }
-          throw error;
-        }
-      }
-      if (request.externalHost !== undefined) {
-        throw new Error(
-          `Unsupported external host: ${String(request.externalHost)}`,
-        );
-      }
-
-      const manager = await getManager();
-      const snapshot = await runTool(
-        getRuntime(),
-        manager.spawn("pi", {
-          title: request.title.trim().slice(0, 160),
-          prompt: request.prompt,
-          cwd,
-          owner: request.owner,
-          resultDelivery: "isolated",
-          tools,
-          sessionSeed,
-          parent: {
-            parentCwd: sessionContext.cwd,
-            projectTrusted: resolveChildProjectTrust({
-              parentCwd: sessionContext.cwd,
-              childCwd: cwd,
-              parentTrusted: sessionContext.isProjectTrusted(),
-            }),
-            inheritedModel: sessionContext.model
-              ? {
-                  provider: sessionContext.model.provider,
-                  id: sessionContext.model.id,
-                }
-              : undefined,
-            inheritedThinkingLevel: pi.getThinkingLevel(),
-            modelRegistry: sessionContext.modelRegistry,
-          },
-        }),
-      );
-      replyInteractive(pi, "subagents:interactive:spawn", request.requestId, {
-        success: true,
-        data: snapshotData(snapshot),
-      });
-      if (request.open !== false) {
-        queueMicrotask(
-          () => void openOwnedSession(manager, snapshot.owner, snapshot.id),
-        );
-      }
-    } catch (error) {
-      replyInteractive(pi, "subagents:interactive:spawn", request.requestId, {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  });
-
-  onInteractive("subagents:interactive:list", async (raw: unknown) => {
-    const request = raw as { requestId?: unknown; owner?: unknown };
-    try {
-      if (typeof request.owner !== "string" || !request.owner.trim()) {
-        throw new Error("owner is required.");
-      }
-      const manager = await getManager();
-      replyInteractive(pi, "subagents:interactive:list", request.requestId, {
-        success: true,
-        data: ownedView(manager, request.owner).list().map(snapshotData),
-      });
-    } catch (error) {
-      replyInteractive(pi, "subagents:interactive:list", request.requestId, {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  });
-
-  onInteractive("subagents:interactive:open", async (raw: unknown) => {
-    const request = raw as {
-      requestId?: unknown;
-      owner?: unknown;
-      id?: unknown;
-    };
-    try {
-      if (typeof request.owner !== "string" || typeof request.id !== "string") {
-        throw new Error("owner and id are required.");
-      }
-      const manager = await getManager();
-      if (!ownedView(manager, request.owner).get(request.id))
-        throw new Error("Session not found.");
-      replyInteractive(pi, "subagents:interactive:open", request.requestId, {
-        success: true,
-      });
-      queueMicrotask(
-        () =>
-          void openOwnedSession(
-            manager,
-            request.owner as string,
-            request.id as string,
-          ),
-      );
-    } catch (error) {
-      replyInteractive(pi, "subagents:interactive:open", request.requestId, {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  });
-
-  onInteractive("subagents:interactive:show", async (raw: unknown) => {
-    const request = raw as { requestId?: unknown; owner?: unknown };
-    try {
-      if (typeof request.owner !== "string")
-        throw new Error("owner is required.");
-      const manager = await getManager();
-      replyInteractive(pi, "subagents:interactive:show", request.requestId, {
-        success: true,
-      });
-      queueMicrotask(
-        () => void showOwnedSessions(manager, request.owner as string),
-      );
-    } catch (error) {
-      replyInteractive(pi, "subagents:interactive:show", request.requestId, {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  });
-
-  onInteractive("subagents:interactive:close", async (raw: unknown) => {
-    const request = raw as {
-      requestId?: unknown;
-      owner?: unknown;
-      id?: unknown;
-    };
-    try {
-      if (typeof request.owner !== "string" || typeof request.id !== "string") {
-        throw new Error("owner and id are required.");
-      }
-      const manager = await getManager();
-      if (!ownedView(manager, request.owner).get(request.id))
-        throw new Error("Session not found.");
-      const closed = await runTool(getRuntime(), manager.close(request.id));
-      if (closed)
-        pi.events.emit("subagents:interactive:closed", snapshotData(closed));
-      replyInteractive(pi, "subagents:interactive:close", request.requestId, {
-        success: true,
-      });
-    } catch (error) {
-      replyInteractive(pi, "subagents:interactive:close", request.requestId, {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  });
-
-  queueMicrotask(() =>
-    pi.events.emit("subagents:interactive:ready", {
-      version: INTERACTIVE_PROTOCOL_VERSION,
-    }),
-  );
 
   // --- Tools -------------------------------------------------------------
 

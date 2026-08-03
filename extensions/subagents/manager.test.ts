@@ -15,6 +15,7 @@ import { makeStubBackend } from "./src/backends/stub.ts";
 import type { BackendName, ParentContext, SpawnTask } from "./src/domain.ts";
 import {
   scopedSubagentView,
+  standardSubagentView,
   SubagentManager,
   SubagentManagerLive,
   type SubagentManagerShape,
@@ -209,19 +210,40 @@ test("idle restarts respect the concurrency cap", async () => {
   });
 });
 
-test("isolated owners stay out of the standard view and can be released", async () => {
+test("settled client agents cannot restart from the standard view", async () => {
+  await withManager(async (manager, runtime) => {
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", {
+        ...task("Client task"),
+        owner: "pi-tasks",
+        resultDelivery: "client",
+        client: { id: "pi-tasks", correlationId: "execution-1" },
+      }),
+    );
+    await runTool(runtime, manager.waitFor([snap.id]));
+
+    standardSubagentView(manager.view).requestSend(snap.id, "run again");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.equal(manager.view.get(snap.id)?.status, "done");
+  });
+});
+
+test("private owners stay out of the standard view and can be released", async () => {
   await withManager(async (manager, runtime) => {
     const snap = await runTool(
       runtime,
       manager.spawn("claude", {
         ...task("Side question"),
         owner: "btw",
-        resultDelivery: "isolated",
+        visibility: "private",
+        resultDelivery: "none",
         tools: ["read"],
       }),
     );
 
-    assert.equal(scopedSubagentView(manager.view, "subagents").size(), 0);
+    assert.equal(standardSubagentView(manager.view).size(), 0);
     assert.equal(
       scopedSubagentView(manager.view, "btw").get(snap.id)?.owner,
       "btw",

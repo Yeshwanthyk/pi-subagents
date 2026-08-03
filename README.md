@@ -2,7 +2,7 @@
 
 Local Pi package extracted from [`davis7dotsh/my-pi-setup`](https://github.com/davis7dotsh/my-pi-setup) for personal evaluation.
 
-It provides headless Pi, Claude Code, and Codex subagents with asynchronous result delivery, wait/check/cancel tools, and an interactive `/subagents` transcript/takeover UI.
+It provides headless Pi, Claude Code, and Codex subagents with asynchronous result delivery, wait/check/cancel tools, an interactive `/subagents` transcript/takeover UI, and persistent read-only BTW side conversations.
 
 ## Install locally
 
@@ -19,24 +19,22 @@ Reload an existing Pi session with `/reload`.
 - `subagent_cancel`
 - `subagent_check`
 - `subagent_list`
-- `/subagents`
 
-## Isolated interactive sessions
+## Commands
 
-Other Pi extensions can create private, floating Pi sessions over the shared `pi.events` bus. These sessions are namespaced, excluded from `/subagents` and automatic result delivery, and can use an explicit tool allowlist.
+- `/subagents` — list, inspect, and take over standard subagents
+- `/btw <question>` — open a persistent read-only side conversation
+- `/btw-sessions` — list and reopen BTW sessions
 
-Protocol channels (version 1):
+## BTW side conversations
 
-- `subagents:interactive:ping`
-- `subagents:interactive:spawn`
-- `subagents:interactive:list`
-- `subagents:interactive:open`
-- `subagents:interactive:show`
-- `subagents:interactive:close`
+BTW sessions fork the active persisted parent conversation, inherit its model and thinking level, and receive only the read/research tools `read`, `grep`, `find`, `ls`, `web_search`, `fetch_content`, and `get_search_content`. They use private visibility and no parent result delivery, so they do not appear in `/subagents` or inject answers into the parent thread.
 
-Every request includes a `requestId`; replies use `<channel>:reply:<requestId>`. Spawn supports fresh or parent-forked persisted Pi sessions. BTW may request `externalHost: "herdr"`, which creates the fork and launches it in a new Herdr tab before its first turn. Other floating sessions can be moved with `o` into Herdr, cmux, or tmux after their active turn settles. The in-process runtime is disposed before the external Pi process receives the session file.
+Inside Herdr, `/btw` prepares the fork and launches it directly in a focused Herdr tab before the first turn. Elsewhere it opens the floating takeover UI; pressing `o` can move a settled session into Herdr, cmux, or tmux. `/btw-sessions` restores persisted session records, reopens live floating sessions, and focuses external sessions.
 
-`pi-btw` and `pi-handoff` use this API without appearing in the normal subagent UI.
+## Extension client API
+
+Extensions can launch standard managed subagents through the versioned `subagents:client:*` event protocol. The channels are `ping`, `spawn`, `cancel`, `list`, `ready`, and `settled`. Requests use a `requestId`, `clientId`, and correlation data; replies use `<channel>:reply:<requestId>`. Client-owned settlements are emitted on `subagents:client:settled` instead of being delivered into the parent conversation.
 
 ## Development
 
