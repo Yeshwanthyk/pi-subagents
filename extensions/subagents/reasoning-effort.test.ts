@@ -134,6 +134,7 @@ test("dashboard and takeover metadata render the exact thinking label", () => {
     cwd: process.cwd(),
     status: "running",
     createdAt: 0,
+    lastActivityAt: 0,
     meta: {
       backend: "pi",
       modelLabel: "openai/gpt-test",
@@ -142,6 +143,8 @@ test("dashboard and takeover metadata render the exact thinking label", () => {
     usage: {},
     transcript: [],
     liveTools: [],
+    completedOperations: 0,
+    processTelemetry: "unavailable",
     queued: [],
     finalText: "",
     turns: 0,
@@ -188,6 +191,7 @@ test("dashboard rows and takeover headers stay within constrained widths", () =>
     cwd: process.cwd(),
     status: "running",
     createdAt: Date.now(),
+    lastActivityAt: Date.now(),
     meta: {
       backend: "codex",
       modelLabel: "a-very-long-model-name",
@@ -196,6 +200,8 @@ test("dashboard rows and takeover headers stay within constrained widths", () =>
     usage: { tokens: 42_000, contextWindow: 100_000 },
     transcript: [],
     liveTools: [],
+    completedOperations: 0,
+    processTelemetry: "unavailable",
     queued: [],
     finalText: "",
     turns: 0,

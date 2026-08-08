@@ -141,9 +141,22 @@ export interface LiveToolState {
   readonly name: string;
   readonly argsPreview?: string;
   readonly outputPreview?: string;
+  readonly startedAt: number;
+  readonly updatedAt: number;
   readonly done?: boolean;
   readonly isError?: boolean;
 }
+
+export interface CompletedOperation {
+  readonly toolId: string;
+  readonly name: string;
+  readonly isError: boolean;
+  readonly outputPreview?: string;
+  readonly finishedAt: number;
+}
+
+/** Process telemetry is reserved for a later background-terminal protocol. */
+export type ProcessTelemetry = "unavailable";
 
 export interface QueuedMessage {
   readonly text: string;
@@ -234,6 +247,8 @@ export interface SubagentSnapshot {
   readonly status: SubagentStatus;
   readonly createdAt: number;
   readonly settledAt?: number;
+  /** Latest meaningful model, tool, queue, or lifecycle event. */
+  readonly lastActivityAt: number;
   readonly errorText?: string;
   readonly outcome?: RunOutcome;
   readonly meta: SubagentMeta;
@@ -242,6 +257,9 @@ export interface SubagentSnapshot {
   /** Streaming assistant buffers, cleared when the finalized message lands. */
   readonly liveAssistant?: { readonly text: string; readonly thinking: string };
   readonly liveTools: ReadonlyArray<LiveToolState>;
+  readonly completedOperations: number;
+  readonly lastCompletedOperation?: CompletedOperation;
+  readonly processTelemetry: ProcessTelemetry;
   readonly queued: ReadonlyArray<QueuedMessage>;
   /** Final text of the most recent completed run (v1 `finalOutput`). */
   readonly finalText: string;

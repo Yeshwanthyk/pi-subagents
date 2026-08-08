@@ -31,6 +31,7 @@ import type {
   SubagentEvent,
   SubagentClient,
   SubagentMeta,
+  CompletedOperation,
   SubagentResultDelivery,
   SubagentSnapshot,
   SubagentStatus,
@@ -70,6 +71,7 @@ interface MutableSnapshot {
   status: SubagentStatus;
   createdAt: number;
   settledAt?: number;
+  lastActivityAt: number;
   errorText?: string;
   outcome?: RunOutcome;
   meta: SubagentMeta;
@@ -77,6 +79,9 @@ interface MutableSnapshot {
   transcript: TranscriptItem[];
   liveAssistant?: { text: string; thinking: string };
   liveTools: LiveToolState[];
+  completedOperations: number;
+  lastCompletedOperation?: CompletedOperation;
+  processTelemetry: "unavailable";
   queued: SubagentSnapshot["queued"];
   finalText: string;
   turns: number;
@@ -316,6 +321,7 @@ const makeManager = Effect.gen(function* () {
     entry.restarting = false;
     if (s.status !== "running") return;
     s.settledAt = Date.now();
+    s.lastActivityAt = s.settledAt;
     s.outcome = outcome;
     switch (outcome._tag) {
       case "Completed":
@@ -352,6 +358,8 @@ const makeManager = Effect.gen(function* () {
 
   const foldEvent = (entry: Entry, event: SubagentEvent) => {
     const s = entry.snapshot;
+    const observedAt = Date.now();
+    s.lastActivityAt = observedAt;
     switch (event._tag) {
       case "RunStarted":
         entry.restarting = false;
@@ -384,6 +392,8 @@ const makeManager = Effect.gen(function* () {
           toolId: event.toolId,
           name: event.name,
           argsPreview: event.argsPreview,
+          startedAt: observedAt,
+          updatedAt: observedAt,
         });
         s.liveTools = [...entry.liveToolMap.values()];
         break;
@@ -393,6 +403,7 @@ const makeManager = Effect.gen(function* () {
           entry.liveToolMap.set(event.toolId, {
             ...current,
             outputPreview: event.outputPreview ?? current.outputPreview,
+            updatedAt: observedAt,
           });
           s.liveTools = [...entry.liveToolMap.values()];
         }
@@ -401,6 +412,14 @@ const makeManager = Effect.gen(function* () {
       case "ToolEnd":
         entry.liveToolMap.delete(event.toolId);
         s.liveTools = [...entry.liveToolMap.values()];
+        s.completedOperations++;
+        s.lastCompletedOperation = {
+          toolId: event.toolId,
+          name: event.name,
+          isError: event.isError,
+          outputPreview: event.outputPreview,
+          finishedAt: observedAt,
+        };
         s.transcript.push({
           kind: "toolResult",
           toolId: event.toolId,
@@ -490,10 +509,13 @@ const makeManager = Effect.gen(function* () {
             cwd: task.cwd,
             status: "running",
             createdAt: Date.now(),
+            lastActivityAt: Date.now(),
             meta,
             usage: { contextWindow: meta.contextWindow },
             transcript: [],
             liveTools: [],
+            completedOperations: 0,
+            processTelemetry: "unavailable",
             queued: [],
             finalText: "",
             turns: 0,

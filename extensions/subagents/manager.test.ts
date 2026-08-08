@@ -104,6 +104,32 @@ test("stub subagent completes and delivers a final result", async () => {
   });
 });
 
+test("activity snapshots track live and completed tool operations", async () => {
+  await withManager(async (manager, runtime) => {
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", task("Observe tool activity")),
+    );
+    const deadline = Date.now() + 3_000;
+    while (
+      manager.view.get(snap.id)?.liveTools.length === 0 &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const active = manager.view.get(snap.id);
+    assert.equal(active?.liveTools[0]?.name, "Bash");
+    assert.ok((active?.liveTools[0]?.startedAt ?? 0) > 0);
+    assert.ok((active?.lastActivityAt ?? 0) >= active!.createdAt);
+
+    await runTool(runtime, manager.waitFor([snap.id]));
+    const done = manager.view.get(snap.id);
+    assert.equal(done?.completedOperations, 1);
+    assert.equal(done?.lastCompletedOperation?.name, "Bash");
+    assert.equal(done?.processTelemetry, "unavailable");
+  });
+});
+
 test("backend metadata propagates effective reasoning effort", async () => {
   await withManager(async (manager, runtime) => {
     const snap = await runTool(

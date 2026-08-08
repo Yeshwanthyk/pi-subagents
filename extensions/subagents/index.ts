@@ -85,6 +85,14 @@ import {
 } from "./src/runtime.ts";
 import { registerBtw } from "./src/btw.ts";
 import { openSubagentPicker } from "./src/ui/takeover.ts";
+import {
+  ACTIVE_WORK_CHANNELS,
+  subagentActiveWorkItem,
+} from "./src/activity-protocol.ts";
+import {
+  renderSubagentActivity,
+  renderSubagentWaitSummary,
+} from "./src/ui/activity-card.ts";
 
 const SUBAGENT_OUTPUT_MAX_BYTES = 24 * 1024;
 const WAIT_OUTPUT_MAX_BYTES = 48 * 1024;
@@ -300,6 +308,11 @@ export default function (pi: ExtensionAPI) {
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
   let disposeClientApi: (() => void) | undefined;
+  let liveTick: ReturnType<typeof setInterval> | undefined;
+  let observabilityTimer: ReturnType<typeof setTimeout> | undefined;
+  let renderView: SubagentReadModel | undefined;
+  const toolRowInvalidators = new Map<string, () => void>();
+  const publishedActivityKeys = new Set<`subagent:${string}`>();
   const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
 
   const getRuntime = () => (runtime ??= createSubagentRuntime());
@@ -310,9 +323,11 @@ export default function (pi: ExtensionAPI) {
       .runPromise(SubagentManager)
       .then((manager) => {
         manager.view.setOnSettled(onSettled);
+        renderView = standardSubagentView(manager.view);
+        const schedule = () => scheduleObservability(manager);
         unsubStatus?.();
-        unsubStatus = manager.view.subscribe(() => updateStatus(manager));
-        updateStatus(manager);
+        unsubStatus = manager.view.subscribe(schedule);
+        refreshObservability(manager);
         return manager;
       });
     return managerPromise;
@@ -324,6 +339,61 @@ export default function (pi: ExtensionAPI) {
     standardView(manager).list();
   const standardSnapshot = (manager: SubagentManagerShape, id: string) =>
     standardView(manager).get(id);
+
+  const invalidateToolRows = () => {
+    for (const invalidate of toolRowInvalidators.values()) {
+      try {
+        invalidate();
+      } catch {
+        // Historical tool rows can disappear during branch/session changes.
+      }
+    }
+  };
+
+  const publishSubagentActivity = (manager: SubagentManagerShape) => {
+    const active = new Set<`subagent:${string}`>();
+    for (const snap of standardSnapshots(manager)) {
+      const item = subagentActiveWorkItem(snap);
+      const key = `subagent:${snap.id}` as const;
+      if (item) {
+        active.add(key);
+        publishedActivityKeys.add(key);
+        pi.events.emit(ACTIVE_WORK_CHANNELS.update, item);
+      } else if (publishedActivityKeys.delete(key)) {
+        pi.events.emit(ACTIVE_WORK_CHANNELS.remove, { version: 1, key });
+      }
+    }
+    for (const key of [...publishedActivityKeys]) {
+      if (active.has(key)) continue;
+      publishedActivityKeys.delete(key);
+      pi.events.emit(ACTIVE_WORK_CHANNELS.remove, { version: 1, key });
+    }
+  };
+
+  const scheduleObservability = (manager: SubagentManagerShape) => {
+    if (observabilityTimer) return;
+    observabilityTimer = setTimeout(() => {
+      observabilityTimer = undefined;
+      refreshObservability(manager);
+    }, 100);
+    observabilityTimer.unref?.();
+  };
+
+  const refreshObservability = (manager: SubagentManagerShape) => {
+    updateStatus(manager);
+    publishSubagentActivity(manager);
+    invalidateToolRows();
+    const running = standardSnapshots(manager).some(
+      (snapshot) => snapshot.status === "running",
+    );
+    if (running && !liveTick) {
+      liveTick = setInterval(invalidateToolRows, 1_000);
+      liveTick.unref?.();
+    } else if (!running && liveTick) {
+      clearInterval(liveTick);
+      liveTick = undefined;
+    }
+  };
 
   const updateStatus = (manager: SubagentManagerShape) => {
     if (!ui) return;
@@ -412,6 +482,16 @@ export default function (pi: ExtensionAPI) {
     resultDelivery.clear();
     unsubStatus?.();
     unsubStatus = undefined;
+    if (liveTick) clearInterval(liveTick);
+    if (observabilityTimer) clearTimeout(observabilityTimer);
+    liveTick = undefined;
+    observabilityTimer = undefined;
+    renderView = undefined;
+    toolRowInvalidators.clear();
+    for (const key of publishedActivityKeys) {
+      pi.events.emit(ACTIVE_WORK_CHANNELS.remove, { version: 1, key });
+    }
+    publishedActivityKeys.clear();
     ui?.setStatus("subagents", undefined);
     const closing = runtime;
     runtime = undefined;
@@ -511,6 +591,49 @@ export default function (pi: ExtensionAPI) {
         },
       };
     },
+    renderCall(args, theme, context) {
+      const component =
+        (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      component.setText(
+        `${theme.fg("warning", "■")} ${theme.fg("toolTitle", theme.bold("subagent "))}` +
+          theme.fg("accent", args.name?.trim() || "starting…") +
+          theme.fg("dim", ` · ${args.harness ?? "pi"}`),
+      );
+      return component;
+    },
+    renderResult(result, { expanded }, theme, context) {
+      const details = result.details as
+        | { id?: string; title?: string; harness?: string; cwd?: string }
+        | undefined;
+      const id = details?.id;
+      if (id) {
+        toolRowInvalidators.set(context.toolCallId, context.invalidate);
+        while (toolRowInvalidators.size > 128) {
+          const oldest = toolRowInvalidators.keys().next().value;
+          if (typeof oldest !== "string") break;
+          toolRowInvalidators.delete(oldest);
+        }
+      }
+      const snapshot = id ? renderView?.get(id) : undefined;
+      const component =
+        (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      if (snapshot) {
+        component.setText(
+          renderSubagentActivity(snapshot, theme, { expanded }),
+        );
+        return component;
+      }
+      const first = result.content[0];
+      const fallback =
+        first?.type === "text" ? first.text : "Subagent launch recorded.";
+      component.setText(
+        `${theme.fg("success", "■")} ${theme.fg("accent", id ?? "subagent")}${theme.fg(
+          "muted",
+          ` · ${details?.title ?? "historical launch"}`,
+        )}\n  ${theme.fg("dim", fallback.split("\n", 1)[0] ?? "")}`,
+      );
+      return component;
+    },
   });
 
   pi.registerTool({
@@ -536,14 +659,29 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
+      let lastWaitUpdate = 0;
       await runTool(
         getRuntime(),
         manager.waitFor(ids, (pending) => {
+          const now = Date.now();
+          if (now - lastWaitUpdate < 100) return;
+          lastWaitUpdate = now;
+          const snapshots = ids
+            .map((id) => standardSnapshot(manager, id))
+            .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
           onUpdate?.({
             content: [
-              { type: "text", text: `Waiting for ${pending.join(", ")}...` },
+              { type: "text", text: renderSubagentWaitSummary(snapshots) },
             ],
-            details: { pending },
+            details: {
+              pending,
+              activity: snapshots.map((snapshot) => ({
+                id: snapshot.id,
+                status: snapshot.status,
+                lastActivityAt: snapshot.lastActivityAt,
+                currentTool: snapshot.liveTools[0]?.name,
+              })),
+            },
           });
         }),
         { signal, interruptMessage: "Wait aborted. Subagents keep running." },
