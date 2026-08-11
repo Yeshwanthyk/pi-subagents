@@ -86,15 +86,12 @@ export default function activityRail(pi: ExtensionAPI) {
   const items = new Map<ActiveWorkItem["key"], ActiveWorkItem>();
   let ui: ExtensionUIContext | undefined;
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
-  let tickTimer: ReturnType<typeof setInterval> | undefined;
 
   const flush = () => {
     flushTimer = undefined;
     if (!ui) return;
     if (items.size === 0) {
       ui.setWidget("active-work", undefined);
-      if (tickTimer) clearInterval(tickTimer);
-      tickTimer = undefined;
       return;
     }
     ui.setWidget(
@@ -102,10 +99,6 @@ export default function activityRail(pi: ExtensionAPI) {
       renderActiveWorkRail([...items.values()], ui.theme),
       { placement: "belowEditor" },
     );
-    if (!tickTimer) {
-      tickTimer = setInterval(flush, 1_000);
-      tickTimer.unref?.();
-    }
   };
 
   const schedule = () => {
@@ -141,9 +134,7 @@ export default function activityRail(pi: ExtensionAPI) {
     unsubscribeUpdate();
     unsubscribeRemove();
     if (flushTimer) clearTimeout(flushTimer);
-    if (tickTimer) clearInterval(tickTimer);
     flushTimer = undefined;
-    tickTimer = undefined;
     items.clear();
     ui?.setWidget("active-work", undefined);
     ui = undefined;
