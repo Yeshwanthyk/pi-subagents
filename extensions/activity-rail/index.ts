@@ -10,6 +10,7 @@ import {
 } from "../subagents/src/activity-protocol.ts";
 
 const MAX_VISIBLE = 4;
+const ACTIVE_RAIL_LINES = 1 + MAX_VISIBLE * 2 + 1;
 const COALESCE_MS = 100;
 
 function validItem(value: unknown): value is ActiveWorkItem {
@@ -55,10 +56,7 @@ export function renderActiveWorkRail(
   theme: Theme,
   now = Date.now(),
 ) {
-  const sorted = [...items].sort(
-    (a, b) => b.lastActivityAt - a.lastActivityAt || a.startedAt - b.startedAt,
-  );
-  const visible = sorted.slice(0, MAX_VISIBLE);
+  const visible = items.slice(0, MAX_VISIBLE);
   const lines = [theme.fg("muted", theme.bold("ACTIVE WORK"))];
   for (const item of visible) {
     const quiet =
@@ -74,11 +72,12 @@ export function renderActiveWorkRail(
         : item.summary;
     lines.push(`  ${theme.fg(quiet ? "muted" : "toolTitle", summary)}`);
   }
-  if (sorted.length > MAX_VISIBLE) {
-    lines.push(
-      theme.fg("dim", `+${sorted.length - MAX_VISIBLE} more active items`),
-    );
-  }
+  while (lines.length < ACTIVE_RAIL_LINES - 1) lines.push("");
+  lines.push(
+    items.length > MAX_VISIBLE
+      ? theme.fg("dim", `+${items.length - MAX_VISIBLE} more active items`)
+      : "",
+  );
   return lines;
 }
 
