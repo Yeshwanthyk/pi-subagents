@@ -58,7 +58,8 @@ function renderThinking(
   for (let i = 0; i < wrapped.length; i++) {
     out.push(
       truncateToWidth(
-        (i === 0 ? prefix : "  ") + theme.fg("muted", theme.italic(wrapped[i])),
+        (i === 0 ? prefix : "  ") +
+          theme.fg("thinkingText", theme.italic(wrapped[i])),
         width,
       ),
     );
@@ -108,7 +109,10 @@ function renderToolResultItem(
     ? theme.fg("error", "  error: ")
     : theme.fg("dim", "  output: ");
   out.push(
-    truncateToWidth(label + theme.fg("dim", firstLine || "(no output)"), width),
+    truncateToWidth(
+      label + theme.fg("toolOutput", firstLine || "(no output)"),
+      width,
+    ),
   );
 }
 
@@ -162,7 +166,8 @@ export function buildTranscriptLines(
   // visibly acknowledges the user's input instead of appearing to do nothing.
   for (const message of snap.queued) {
     if (out.length > 0) out.push("");
-    const prefix = theme.fg("warning", `> [queued ${message.kind}] `);
+    // Queued = pending, not in-flight; keep it out of the "hot" warning color.
+    const prefix = theme.fg("muted", `> [queued ${message.kind}] `);
     const wrapped = wrapTextWithAnsi(
       sanitizeText(message.text),
       Math.max(10, width - visibleWidth(prefix)),

@@ -13,6 +13,7 @@ import {
 
 const theme = {
   fg: (_color: string, text: string) => text,
+  bg: (_color: string, text: string) => text,
   bold: (text: string) => text,
 } as unknown as Theme;
 
@@ -87,7 +88,7 @@ test("list pane row shows title, id, status word and dim meta, bounded to width"
   assert.match(line1, /running/);
   assert.match(line2, /deepseek-v4-flash/);
   assert.match(line2, /10%\/100k/);
-  assert.match(line2, /\d+s$/);
+  assert.match(line2, /\d+s\s*$/);
   assert.ok(visibleWidth(line1) <= 40 && visibleWidth(line2) <= 40);
 });
 

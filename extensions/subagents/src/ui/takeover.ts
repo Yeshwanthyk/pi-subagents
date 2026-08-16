@@ -16,7 +16,18 @@ import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { formatElapsed, type SubagentSnapshot } from "../domain.ts";
 import { formatContextUtilization } from "../format.ts";
 import type { SubagentReadModel } from "../manager.ts";
-import { buildTranscriptLines } from "./transcript.ts";
+import { buildTranscriptLines, sanitizeText } from "./transcript.ts";
+
+/** Pad a line to `width` and apply a background fn across the full width
+ * (inline copy of pi-tui's unreachable applyBackgroundToLine). */
+function backgroundLine(
+  line: string,
+  width: number,
+  bgFn: (text: string) => string,
+) {
+  const padding = " ".repeat(Math.max(0, width - visibleWidth(line)));
+  return bgFn(line + padding);
+}
 
 /** Below this terminal width the dashboard falls back to a single list. */
 const TWO_PANE_MIN_WIDTH = 88;
@@ -109,10 +120,11 @@ export function renderTakeoverHeader(
   const header =
     `${statusGlyph(snap, theme)} ` +
     theme.fg("accent", theme.bold(`${snap.id} · ${snap.title}`)) +
-    theme.fg("muted", ` · ${snap.status} · ${formatElapsed(snap)}`) +
-    theme.fg("dim", ` · ${takeoverMetaLabels(snap).join(" · ")}`) +
+    ` · ${statusWord(snap, theme)} · ` +
+    theme.fg("dim", formatElapsed(snap)) +
+    theme.fg("dim", ` · ${takeoverMetaLabels(snap).slice(0, 2).join(" · ")}`) +
     (utilization ? theme.fg("dim", ` · ${utilization}`) : "");
-  return truncateToWidth(header, width);
+  return truncateToWidth(header, width, "…");
 }
 
 /** Two-line row for the left-hand agent list of the two-pane dashboard. */
@@ -126,9 +138,19 @@ export function renderListPaneRow(
   const title = isSelected
     ? theme.fg("accent", snap.title)
     : theme.fg("text", snap.title);
-  const line1 =
-    `${marker} ${statusGlyph(snap, theme)} ${title} ${theme.fg("dim", snap.id)} ` +
-    statusWord(snap, theme);
+  // Right-align the status word so every row's right edge is clean.
+  const status = statusWord(snap, theme);
+  const rightWidth = visibleWidth(status) + 1;
+  const left = `${marker} ${statusGlyph(snap, theme)} ${title} ${theme.fg("dim", snap.id)}`;
+  const leftTruncated = truncateToWidth(
+    left,
+    Math.max(0, width - rightWidth),
+    "…",
+  );
+  const gap = Math.max(1, width - visibleWidth(leftTruncated) - rightWidth);
+  const line1 = leftTruncated + " ".repeat(gap) + status;
+
+  // Meta aligns under the title column (marker + space + glyph + space).
   const meta = [
     snap.meta.modelLabel ?? snap.backend,
     formatContextUtilization(snap.usage) || undefined,
@@ -136,8 +158,16 @@ export function renderListPaneRow(
   ]
     .filter((label): label is string => label !== undefined)
     .join(" · ");
-  const line2 = `  ${theme.fg("dim", meta)}`;
-  return [truncateToWidth(line1, width), truncateToWidth(line2, width)];
+  const line2 = `    ${truncateToWidth(theme.fg("dim", meta), Math.max(0, width - 4), "…")}`;
+
+  if (!isSelected) {
+    return [truncateToWidth(line1, width, "…"), line2];
+  }
+  // Full-row highlight: the selection is the row you stare at while steering.
+  return [
+    backgroundLine(line1, width, (text) => theme.bg("selectedBg", text)),
+    backgroundLine(line2, width, (text) => theme.bg("selectedBg", text)),
+  ];
 }
 
 /** Two header lines for the right-hand detail pane of the two-pane dashboard. */
@@ -446,8 +476,9 @@ class SubagentDashboard implements Component {
   }
 
   private pad(text: string, width: number): string {
-    const truncated = truncateToWidth(text, width);
-    return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
+    // Callers truncate first; pad only (no ellipsis, no double-cut).
+    const padded = truncateToWidth(text, width, "", true);
+    return padded;
   }
 
   private borderSegment(width: number, title: string): string {
@@ -482,9 +513,10 @@ class SubagentDashboard implements Component {
       "accent",
       theme.bold(this.options.title ?? "Subagents"),
     );
+    const running = subs.filter((s) => s.status === "running").length;
     const headerRight = theme.fg(
-      "muted",
-      `${subs.length} agent${subs.length === 1 ? "" : "s"}`,
+      running > 0 ? "warning" : "muted",
+      `● ${running} running`,
     );
     const headerPad = Math.max(
       1,
@@ -497,16 +529,17 @@ class SubagentDashboard implements Component {
       ),
     );
 
-    // Top border with panel title
+    // Top border with panel title.
     const settled = subs.filter((s) => s.status !== "running").length;
-    lines.push(
-      theme.fg("border", "╭") +
-        this.borderSegment(innerWidth, `agents · ${settled}/${subs.length}`) +
-        theme.fg("border", "╮"),
-    );
+    const borderLabel = `agents · ${settled}/${subs.length}`;
 
     if (this.narrow()) {
       // Single-column list (narrow terminals).
+      lines.push(
+        theme.fg("border", "╭") +
+          this.borderSegment(innerWidth, borderLabel) +
+          theme.fg("border", "╮"),
+      );
       const divider = theme.fg("border", "│");
       const rowLines = this.renderRows(subs, innerWidth, bodyHeight);
       for (let i = 0; i < bodyHeight; i++) {
@@ -524,13 +557,25 @@ class SubagentDashboard implements Component {
         Math.min(42, Math.floor(innerWidth * 0.38)),
       );
       const detailWidth = innerWidth - listWidth - 1;
+      lines.push(
+        theme.fg("border", "╭") +
+          this.borderSegment(listWidth, borderLabel) +
+          theme.fg("border", "┬") +
+          theme.fg("border", "─".repeat(detailWidth)) +
+          theme.fg("border", "╮"),
+      );
       const left = this.renderListPane(subs, listWidth, bodyHeight);
       const right = this.renderDetailPane(
         subs[this.selection.index],
         detailWidth,
         bodyHeight,
       );
-      const divider = theme.fg("border", "│");
+      // The divider's color is the focus affordance: accent = detail pane
+      // active, muted = list pane active (the selected row highlights there).
+      const divider = theme.fg(
+        this.focusPane === "detail" ? "borderAccent" : "borderMuted",
+        "│",
+      );
       for (let i = 0; i < bodyHeight; i++) {
         lines.push(
           theme.fg("border", "│") +
@@ -595,12 +640,17 @@ class SubagentDashboard implements Component {
         ),
       );
     }
+    // Scroll markers occupy a full 2-line slot so no orphaned meta line
+    // dangles under a marker.
     if (start > 0) {
-      out[0] = truncateToWidth(theme.fg("dim", `  ... ${start} more`), width);
+      out[0] = truncateToWidth(theme.fg("dim", `  +${start} more`), width);
+      out[1] = "";
     }
     if (start + maxVisible < subs.length) {
+      const remaining = subs.length - start - maxVisible;
+      out[out.length - 2] = "";
       out[out.length - 1] = truncateToWidth(
-        theme.fg("dim", "  ... more"),
+        theme.fg("dim", `  +${remaining} more`),
         width,
       );
     }
@@ -866,7 +916,14 @@ class TakeoverView implements Component, Focusable {
     const body: string[] = [];
     if (snap.errorText) {
       body.push(
-        truncateToWidth(theme.fg("error", `error: ${snap.errorText}`), width),
+        truncateToWidth(
+          theme.fg(
+            "error",
+            `error: ${sanitizeText(snap.errorText).replace(/\s+/g, " ").trim()}`,
+          ),
+          width,
+          "…",
+        ),
       );
     }
 

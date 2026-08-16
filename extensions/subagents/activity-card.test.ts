@@ -55,7 +55,7 @@ test("subagent activity card shows current work and bounded activity metadata", 
   });
   assert.match(text, /sa-3 · final-verify RUNNING · 5s/);
   assert.match(text, /bash npm test 4s/);
-  assert.match(text, /3 operations complete · activity 2s ago/);
+  assert.match(text, /3 operations complete/);
   assert.match(text, /pi · openai\/test · 10%\/100k/);
   assert.match(text, /\/subagents for transcript and takeover/);
 });
@@ -103,9 +103,10 @@ test("active-work rail derives quiet state as activity ages", () => {
   };
   const lines = renderActiveWorkRail([item], theme, 40_000);
   assert.match(lines.join("\n"), /quiet · no recent events/);
+  assert.match(lines.join("\n"), /\[QUIET\]/);
 });
 
-test("active-work rail renders running cards with chip, model, ops and ctx", () => {
+test("active-work rail renders running cards with spinner, model, ops and ctx", () => {
   const item: ActiveWorkItem = {
     version: 1,
     key: "subagent:sa-1",
@@ -122,7 +123,8 @@ test("active-work rail renders running cards with chip, model, ops and ctx", () 
     completedOperations: 12,
   };
   const text = renderActiveWorkRail([item], theme, 3_000).join("\n");
-  assert.match(text, /\[RUNNING\]/);
+  assert.match(text, /⠋/);
+  assert.doesNotMatch(text, /\[RUNNING\]/);
   assert.match(text, /Fix login flow/);
   assert.match(text, /deepseek-v4-flash/);
   assert.match(text, /12 ops/);

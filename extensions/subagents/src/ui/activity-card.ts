@@ -36,7 +36,12 @@ function toolLine(tool: LiveToolState, theme: Theme, now: number) {
   const operation = bounded(
     `${tool.name}${tool.argsPreview ? ` ${tool.argsPreview}` : ""}`,
   );
-  return `  ${theme.fg("warning", "■")} ${theme.fg("toolTitle", operation)} ${theme.fg(
+  const marker = tool.isError
+    ? theme.fg("error", "✕")
+    : tool.done
+      ? theme.fg("success", "✓")
+      : theme.fg("warning", "■");
+  return `  ${marker} ${theme.fg("toolTitle", operation)} ${theme.fg(
     "dim",
     formatActivityDuration(tool.startedAt, now),
   )}`;
@@ -95,7 +100,7 @@ export function renderSubagentActivity(
   }
 
   const operationCount = `${snapshot.completedOperations} operation${snapshot.completedOperations === 1 ? "" : "s"} complete`;
-  text += `\n  ${theme.fg("dim", `${operationCount} · activity ${formatActivityAge(snapshot.lastActivityAt, now)}`)}`;
+  text += `\n  ${theme.fg("dim", operationCount)}`;
 
   if (snapshot.errorText) {
     text += `\n  ${theme.fg("error", bounded(snapshot.errorText, 220))}`;

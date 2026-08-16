@@ -3,6 +3,7 @@ import type {
   ExtensionUIContext,
   Theme,
 } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import {
   ACTIVE_WORK_CHANNELS,
   type ActiveWorkItem,
@@ -91,25 +92,33 @@ function statusChip(
 }
 
 /** Render one running/quiet item as a 2-line card. */
-function cardLines(item: ActiveWorkItem, theme: Theme, now: number) {
+function cardLines(
+  item: ActiveWorkItem,
+  theme: Theme,
+  now: number,
+  width: number,
+) {
   const quiet = item.status === "quiet" || now - item.lastActivityAt >= 30_000;
   const glyph = quiet
     ? theme.fg("muted", "■")
     : theme.fg("warning", spinnerAt(now));
-  const title = theme.fg("accent", bounded(item.label, 34));
+  const title = theme.fg("accent", bounded(item.label, 28));
   const meta = [
     item.modelLabel ? bounded(item.modelLabel, 18) : undefined,
     age(item.lastActivityAt, now),
   ]
     .filter(Boolean)
     .join(" · ");
-  const line1 =
-    `${glyph} ${title} ${statusChip(item.status, theme)}` +
-    (meta ? theme.fg("dim", ` · ${meta}`) : "");
+  // Live spinner already signals activity; the chip is reserved for
+  // quiet/settled rows so the running state isn't stated twice.
+  const line1 = quiet
+    ? `${glyph} ${title} ${statusChip("quiet", theme)}` +
+      (meta ? theme.fg("dim", ` · ${meta}`) : "")
+    : `${glyph} ${title}` + (meta ? theme.fg("dim", ` · ${meta}`) : "");
 
   const parts: string[] = [];
   if (item.currentOperation) {
-    parts.push(`→ ${bounded(item.currentOperation, 44)}`);
+    parts.push(`→ ${bounded(item.currentOperation, 36)}`);
   } else if (quiet) {
     parts.push("quiet · no recent events");
   } else {
@@ -122,10 +131,18 @@ function cardLines(item: ActiveWorkItem, theme: Theme, now: number) {
     parts.push(`ctx ${item.contextPercent}%`);
   }
   const line2 = `  ${theme.fg(quiet ? "muted" : "toolTitle", parts.join(" · "))}`;
-  return [line1, line2];
+  return [
+    truncateToWidth(line1, width, "…"),
+    truncateToWidth(line2, width, "…"),
+  ];
 }
 
-function flashLine(flash: SettleFlash, theme: Theme, now: number) {
+function flashLine(
+  flash: SettleFlash,
+  theme: Theme,
+  now: number,
+  width: number,
+) {
   const ok = flash.status === "done";
   const glyph = theme.fg(ok ? "success" : "error", ok ? "✓" : "✕");
   const meta = [
@@ -134,11 +151,11 @@ function flashLine(flash: SettleFlash, theme: Theme, now: number) {
   ]
     .filter(Boolean)
     .join(" · ");
-  return (
-    `${glyph} ${theme.fg("muted", bounded(flash.title, 34))} ` +
+  const line =
+    `${glyph} ${theme.fg("muted", bounded(flash.title, 28))} ` +
     `${statusChip(flash.status, theme)}` +
-    (meta ? theme.fg("dim", ` · ${meta}`) : "")
-  );
+    (meta ? theme.fg("dim", ` · ${meta}`) : "");
+  return truncateToWidth(line, width, "…");
 }
 
 export function renderActiveWorkRail(
@@ -146,19 +163,21 @@ export function renderActiveWorkRail(
   theme: Theme,
   now = Date.now(),
   flashes: ReadonlyArray<SettleFlash> = [],
+  maxWidth = 100,
 ) {
   const lines = [theme.fg("muted", theme.bold("ACTIVE WORK"))];
   const visible = items.slice(0, MAX_VISIBLE);
-  for (const item of visible) lines.push(...cardLines(item, theme, now));
+  for (const item of visible)
+    lines.push(...cardLines(item, theme, now, maxWidth));
   for (const flash of flashes.slice(0, MAX_FLASH))
-    lines.push(flashLine(flash, theme, now));
+    lines.push(flashLine(flash, theme, now, maxWidth));
   const overflow =
     Math.max(0, items.length - MAX_VISIBLE) +
     Math.max(0, flashes.length - MAX_FLASH);
   while (lines.length < ACTIVE_RAIL_LINES - 1) lines.push("");
   lines.push(
     overflow > 0
-      ? theme.fg("dim", `+${overflow} more active items`)
+      ? theme.fg("dim", `+${overflow} more active items · ctrl+shift+a`)
       : theme.fg("dim", "ctrl+shift+a · subagents"),
   );
   return lines;
