@@ -96,8 +96,6 @@ import {
   encodeBrowserActivityWidget,
   nextBrowserActivityRevision,
   projectBrowserActivity,
-  projectBrowserTerminal,
-  type BrowserActivityTerminalSnapshot,
 } from "./src/browser-protocol.ts";
 import {
   renderSubagentActivity,
@@ -323,7 +321,6 @@ export default function (pi: ExtensionAPI) {
   const publishedActivity = new Map<`subagent:${string}`, ActiveWorkItem>();
   let browserUI: ExtensionUIContext | undefined;
   let browserRevision = 0;
-  let pendingBrowserTerminal: BrowserActivityTerminalSnapshot | undefined;
   let publishedStatus: string | undefined;
   const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
 
@@ -390,21 +387,21 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const publishBrowserActivity = (manager: SubagentManagerShape) => {
+  const publishBrowserActivity = (
+    snapshots: ReadonlyArray<SubagentSnapshot>,
+    terminal?: SubagentSnapshot,
+  ) => {
     if (!browserUI) return;
-    const projection = projectBrowserActivity(
-      manager.view.list(),
+    const snapshot = projectBrowserActivity(
+      snapshots,
       nextBrowserActivityRevision(browserRevision),
+      terminal,
     );
-    const snapshot = pendingBrowserTerminal
-      ? { ...projection, terminal: pendingBrowserTerminal }
-      : projection;
     browserRevision = snapshot.revision;
     browserUI.setWidget(
       BROWSER_ACTIVITY_WIDGET_KEY,
       encodeBrowserActivityWidget(snapshot),
     );
-    pendingBrowserTerminal = undefined;
   };
 
   const scheduleObservability = (manager: SubagentManagerShape) => {
@@ -419,7 +416,7 @@ export default function (pi: ExtensionAPI) {
   const refreshObservability = (manager: SubagentManagerShape) => {
     updateStatus(manager);
     publishSubagentActivity(manager);
-    publishBrowserActivity(manager);
+    publishBrowserActivity(manager.view.list());
   };
 
   const updateStatus = (manager: SubagentManagerShape) => {
@@ -464,8 +461,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const onSettled = (snap: SubagentSnapshot, consumed: boolean) => {
-    const terminal = projectBrowserTerminal(snap);
-    if (terminal) pendingBrowserTerminal = terminal;
+    publishBrowserActivity(renderView?.list() ?? [], snap);
     if (snap.resultDelivery === "client") {
       const event = clientSettlement(snap);
       if (event) pi.events.emit(SUBAGENT_CLIENT_CHANNELS.settled, event);
@@ -490,7 +486,6 @@ export default function (pi: ExtensionAPI) {
     ui = ctx.hasUI ? ctx.ui : undefined;
     browserUI = ctx.mode === "rpc" && ctx.hasUI ? ctx.ui : undefined;
     browserRevision = 0;
-    pendingBrowserTerminal = undefined;
     if (browserUI) {
       const existingManager = managerPromise;
       if (existingManager) {
@@ -536,7 +531,6 @@ export default function (pi: ExtensionAPI) {
     browserUI?.setWidget(BROWSER_ACTIVITY_WIDGET_KEY, undefined);
     browserUI = undefined;
     browserRevision = 0;
-    pendingBrowserTerminal = undefined;
     for (const key of publishedActivity.keys()) {
       pi.events.emit(ACTIVE_WORK_CHANNELS.remove, { version: 1, key });
     }
