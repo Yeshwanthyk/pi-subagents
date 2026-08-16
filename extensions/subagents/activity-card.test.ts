@@ -84,7 +84,7 @@ test("active-work rail is bounded and shows overflow", () => {
     lastActivityAt: 2_000 + index,
   }));
   const lines = renderActiveWorkRail(items, theme, 7_000);
-  assert.equal(lines.length, 10);
+  assert.equal(lines.length, 12);
   assert.equal(lines.filter((line) => /sa-\d/.test(line)).length, 4);
   assert.match(lines.at(-1) ?? "", /\+2 more active items/);
 });
@@ -103,4 +103,80 @@ test("active-work rail derives quiet state as activity ages", () => {
   };
   const lines = renderActiveWorkRail([item], theme, 40_000);
   assert.match(lines.join("\n"), /quiet · no recent events/);
+});
+
+test("active-work rail renders running cards with chip, model, ops and ctx", () => {
+  const item: ActiveWorkItem = {
+    version: 1,
+    key: "subagent:sa-1",
+    kind: "subagent",
+    label: "Fix login flow",
+    status: "running",
+    summary: "bash npm test",
+    currentOperation: "bash npm test",
+    runningProcesses: 0,
+    startedAt: 1_000,
+    lastActivityAt: 2_000,
+    modelLabel: "deepseek-v4-flash",
+    contextPercent: 4,
+    completedOperations: 12,
+  };
+  const text = renderActiveWorkRail([item], theme, 3_000).join("\n");
+  assert.match(text, /\[RUNNING\]/);
+  assert.match(text, /Fix login flow/);
+  assert.match(text, /deepseek-v4-flash/);
+  assert.match(text, /12 ops/);
+  assert.match(text, /ctx 4%/);
+  assert.match(text, /→ bash npm test/);
+});
+
+test("active-work rail spinner advances with time and is deterministic per now", () => {
+  const item: ActiveWorkItem = {
+    version: 1,
+    key: "subagent:sa-spin",
+    kind: "subagent",
+    label: "spinner",
+    status: "running",
+    summary: "working",
+    runningProcesses: 0,
+    startedAt: 1_000,
+    lastActivityAt: 2_000,
+  };
+  const first = renderActiveWorkRail([item], theme, 0).join("\n");
+  const second = renderActiveWorkRail([item], theme, 150).join("\n");
+  assert.notEqual(first, second);
+  assert.match(first, /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/);
+});
+
+test("active-work rail shows settle flashes bounded to MAX_FLASH", () => {
+  const flashes = [
+    {
+      status: "done" as const,
+      title: "Lint pass",
+      ops: 24,
+      settledAt: 5_000,
+    },
+    {
+      status: "error" as const,
+      title: "Migrate config",
+      ops: 3,
+      settledAt: 6_000,
+    },
+    {
+      status: "done" as const,
+      title: "Overflow flash",
+      ops: 1,
+      settledAt: 7_000,
+    },
+  ];
+  const lines = renderActiveWorkRail([], theme, 8_000, flashes);
+  assert.match(lines.join("\n"), /✓ Lint pass \[DONE\] · 24 ops · 3s/);
+  assert.match(lines.join("\n"), /✕ Migrate config \[FAILED\] · 3 ops/);
+  assert.doesNotMatch(lines.join("\n"), /Overflow flash/);
+  assert.match(lines.at(-1) ?? "", /\+1 more active items/);
+});
+
+test("active-work rail footer shows the dashboard shortcut when not overflowing", () => {
+  const lines = renderActiveWorkRail([], theme, 1_000);
+  assert.match(lines.at(-1) ?? "", /ctrl\+shift\+a · subagents/);
 });

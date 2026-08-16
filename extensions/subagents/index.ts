@@ -88,8 +88,17 @@ import { openSubagentPicker } from "./src/ui/takeover.ts";
 import {
   ACTIVE_WORK_CHANNELS,
   subagentActiveWorkItem,
+  subagentActiveWorkRemoval,
   type ActiveWorkItem,
 } from "./src/activity-protocol.ts";
+import {
+  BROWSER_ACTIVITY_WIDGET_KEY,
+  encodeBrowserActivityWidget,
+  nextBrowserActivityRevision,
+  projectBrowserActivity,
+  projectBrowserTerminal,
+  type BrowserActivityTerminalSnapshot,
+} from "./src/browser-protocol.ts";
 import {
   renderSubagentActivity,
   renderSubagentWaitSummary,
@@ -312,6 +321,9 @@ export default function (pi: ExtensionAPI) {
   let observabilityTimer: ReturnType<typeof setTimeout> | undefined;
   let renderView: SubagentReadModel | undefined;
   const publishedActivity = new Map<`subagent:${string}`, ActiveWorkItem>();
+  let browserUI: ExtensionUIContext | undefined;
+  let browserRevision = 0;
+  let pendingBrowserTerminal: BrowserActivityTerminalSnapshot | undefined;
   let publishedStatus: string | undefined;
   const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
 
@@ -355,12 +367,20 @@ export default function (pi: ExtensionAPI) {
           previous.status !== item.status ||
           previous.summary !== item.summary ||
           previous.currentOperation !== item.currentOperation ||
-          previous.runningProcesses !== item.runningProcesses
+          previous.runningProcesses !== item.runningProcesses ||
+          previous.modelLabel !== item.modelLabel ||
+          previous.contextPercent !== item.contextPercent ||
+          previous.completedOperations !== item.completedOperations
         ) {
           pi.events.emit(ACTIVE_WORK_CHANNELS.update, item);
         }
       } else if (publishedActivity.delete(key)) {
-        pi.events.emit(ACTIVE_WORK_CHANNELS.remove, { version: 1, key });
+        // Settled (or dropped): carry the final status so the rail can show a
+        // brief done/failed flash row.
+        pi.events.emit(
+          ACTIVE_WORK_CHANNELS.remove,
+          subagentActiveWorkRemoval(snap),
+        );
       }
     }
     for (const key of [...publishedActivity.keys()]) {
@@ -368,6 +388,23 @@ export default function (pi: ExtensionAPI) {
       publishedActivity.delete(key);
       pi.events.emit(ACTIVE_WORK_CHANNELS.remove, { version: 1, key });
     }
+  };
+
+  const publishBrowserActivity = (manager: SubagentManagerShape) => {
+    if (!browserUI) return;
+    const projection = projectBrowserActivity(
+      manager.view.list(),
+      nextBrowserActivityRevision(browserRevision),
+    );
+    const snapshot = pendingBrowserTerminal
+      ? { ...projection, terminal: pendingBrowserTerminal }
+      : projection;
+    browserRevision = snapshot.revision;
+    browserUI.setWidget(
+      BROWSER_ACTIVITY_WIDGET_KEY,
+      encodeBrowserActivityWidget(snapshot),
+    );
+    pendingBrowserTerminal = undefined;
   };
 
   const scheduleObservability = (manager: SubagentManagerShape) => {
@@ -382,6 +419,7 @@ export default function (pi: ExtensionAPI) {
   const refreshObservability = (manager: SubagentManagerShape) => {
     updateStatus(manager);
     publishSubagentActivity(manager);
+    publishBrowserActivity(manager);
   };
 
   const updateStatus = (manager: SubagentManagerShape) => {
@@ -426,6 +464,8 @@ export default function (pi: ExtensionAPI) {
   };
 
   const onSettled = (snap: SubagentSnapshot, consumed: boolean) => {
+    const terminal = projectBrowserTerminal(snap);
+    if (terminal) pendingBrowserTerminal = terminal;
     if (snap.resultDelivery === "client") {
       const event = clientSettlement(snap);
       if (event) pi.events.emit(SUBAGENT_CLIENT_CHANNELS.settled, event);
@@ -445,8 +485,24 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("session_start", (_event, ctx) => {
+    browserUI?.setWidget(BROWSER_ACTIVITY_WIDGET_KEY, undefined);
     sessionContext = ctx;
-    if (ctx.hasUI) ui = ctx.ui;
+    ui = ctx.hasUI ? ctx.ui : undefined;
+    browserUI = ctx.mode === "rpc" && ctx.hasUI ? ctx.ui : undefined;
+    browserRevision = 0;
+    pendingBrowserTerminal = undefined;
+    if (browserUI) {
+      const existingManager = managerPromise;
+      if (existingManager) {
+        void existingManager
+          .then((manager) => {
+            if (browserUI) refreshObservability(manager);
+          })
+          .catch(() => undefined);
+      } else {
+        void getManager().catch(() => undefined);
+      }
+    }
   });
 
   pi.on("agent_settled", flushResults);
@@ -477,6 +533,10 @@ export default function (pi: ExtensionAPI) {
     if (observabilityTimer) clearTimeout(observabilityTimer);
     observabilityTimer = undefined;
     renderView = undefined;
+    browserUI?.setWidget(BROWSER_ACTIVITY_WIDGET_KEY, undefined);
+    browserUI = undefined;
+    browserRevision = 0;
+    pendingBrowserTerminal = undefined;
     for (const key of publishedActivity.keys()) {
       pi.events.emit(ACTIVE_WORK_CHANNELS.remove, { version: 1, key });
     }
@@ -597,6 +657,30 @@ export default function (pi: ExtensionAPI) {
         | undefined;
       const id = details?.id;
       const snapshot = id ? renderView?.get(id) : undefined;
+
+      // Keep the in-transcript card live while the agent runs: subscribe for
+      // this id (throttled — pi backends can emit an event per token) and drop
+      // the subscription once the agent settles. Mirrors the bash tool's
+      // state.interval + context.invalidate() pattern.
+      const state = context.state as
+        | { unsubActivity?: () => void; lastActivityRefresh?: number }
+        | undefined;
+      const settled = !snapshot || snapshot.status !== "running";
+      if (state) {
+        if (settled && state.unsubActivity) {
+          state.unsubActivity();
+          state.unsubActivity = undefined;
+        } else if (!settled && !state.unsubActivity && renderView) {
+          state.unsubActivity = renderView.subscribeTo(id!, () => {
+            const now = Date.now();
+            if (now - (state.lastActivityRefresh ?? 0) >= 100) {
+              state.lastActivityRefresh = now;
+              context.invalidate();
+            }
+          });
+        }
+      }
+
       const component =
         (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       if (snapshot) {
@@ -900,6 +984,29 @@ export default function (pi: ExtensionAPI) {
         }
         const manager = await getManager();
         await runHeadlessSubagentsDialog(ctx.ui, standardView(manager));
+        return;
+      }
+      const manager = await getManager();
+      if (standardView(manager).size() === 0) {
+        ctx.ui.notify(
+          "No subagents yet. The agent spawns them with subagent_spawn.",
+          "info",
+        );
+        return;
+      }
+      await openSubagentPicker(ctx, standardView(manager));
+    },
+  });
+
+  pi.registerShortcut("ctrl+shift+a", {
+    description: "Open the subagents dashboard",
+    handler: async (ctx) => {
+      if (ctx.mode !== "tui") {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "Subagents dashboard is only available in the TUI",
+            "error",
+          );
         return;
       }
       const manager = await getManager();

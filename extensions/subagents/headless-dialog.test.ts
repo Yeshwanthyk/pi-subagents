@@ -106,6 +106,7 @@ test("RPC command without dialogs keeps the TUI-only notification fallback", asy
     events: { on() {}, emit() {} },
     registerTool() {},
     registerMessageRenderer() {},
+    registerShortcut() {},
     registerCommand(name: string, command: { handler: typeof commandHandler }) {
       if (name === "subagents") commandHandler = command.handler;
     },

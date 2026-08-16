@@ -18,6 +18,10 @@ import { formatContextUtilization } from "../format.ts";
 import type { SubagentReadModel } from "../manager.ts";
 import { buildTranscriptLines } from "./transcript.ts";
 
+/** Below this terminal width the dashboard falls back to a single list. */
+const TWO_PANE_MIN_WIDTH = 88;
+const TRANSCRIPT_SCROLL_STEP = 6;
+
 function configuredKeys(
   keybindings: KeybindingsManager,
   binding: Parameters<KeybindingsManager["getKeys"]>[0],
@@ -109,6 +113,58 @@ export function renderTakeoverHeader(
     theme.fg("dim", ` · ${takeoverMetaLabels(snap).join(" · ")}`) +
     (utilization ? theme.fg("dim", ` · ${utilization}`) : "");
   return truncateToWidth(header, width);
+}
+
+/** Two-line row for the left-hand agent list of the two-pane dashboard. */
+export function renderListPaneRow(
+  snap: SubagentSnapshot,
+  width: number,
+  isSelected: boolean,
+  theme: Theme,
+): string[] {
+  const marker = isSelected ? theme.fg("accent", "❯") : " ";
+  const title = isSelected
+    ? theme.fg("accent", snap.title)
+    : theme.fg("text", snap.title);
+  const line1 =
+    `${marker} ${statusGlyph(snap, theme)} ${title} ${theme.fg("dim", snap.id)} ` +
+    statusWord(snap, theme);
+  const meta = [
+    snap.meta.modelLabel ?? snap.backend,
+    formatContextUtilization(snap.usage) || undefined,
+    formatElapsed(snap),
+  ]
+    .filter((label): label is string => label !== undefined)
+    .join(" · ");
+  const line2 = `  ${theme.fg("dim", meta)}`;
+  return [truncateToWidth(line1, width), truncateToWidth(line2, width)];
+}
+
+/** Two header lines for the right-hand detail pane of the two-pane dashboard. */
+export function renderDetailHeader(
+  snap: SubagentSnapshot,
+  width: number,
+  theme: Theme,
+): string[] {
+  const line1 =
+    `${statusGlyph(snap, theme)} ` +
+    theme.fg("accent", theme.bold(snap.id)) +
+    ` · ${theme.fg("accent", snap.title)} ${statusWord(snap, theme)}`;
+  const meta = [
+    `${snap.backend}: ${snap.meta.modelLabel ?? "?"}`,
+    formatContextUtilization(snap.usage) || undefined,
+    formatElapsed(snap),
+    snap.completedOperations > 0
+      ? `${snap.completedOperations} ops`
+      : undefined,
+    subagentThinkingLabel(snap),
+  ]
+    .filter((label): label is string => label !== undefined)
+    .join(" · ");
+  return [
+    truncateToWidth(line1, width),
+    truncateToWidth(theme.fg("dim", meta || " "), width),
+  ];
 }
 
 // --- Entry point ---------------------------------------------------------------
@@ -227,6 +283,9 @@ class SubagentDashboard implements Component {
   private closed = false;
   private ticker: ReturnType<typeof setInterval>;
   private unsubChange: () => void;
+  private input = new Input();
+  private focusPane: "list" | "detail" = "list";
+  private detailScrollOffset = 0;
 
   constructor(
     tui: TUI,
@@ -247,6 +306,32 @@ class SubagentDashboard implements Component {
     // Elapsed times, token counts, and statuses tick along at 1Hz.
     this.ticker = setInterval(() => this.tui.requestRender(), 1000);
     this.unsubChange = view.subscribe(() => this.tui.requestRender());
+    this.input.onSubmit = (value: string) => {
+      const text = value.trim();
+      if (!text) return;
+      const snap = this.subs()[this.selection.index];
+      if (snap) this.view.requestSend(snap.id, text);
+      this.input.setValue("");
+      this.detailScrollOffset = 0;
+      this.tui.requestRender();
+    };
+  }
+
+  private narrow(): boolean {
+    return (this.tui.terminal.columns || 100) < TWO_PANE_MIN_WIDTH;
+  }
+
+  private focusDetail() {
+    this.focusPane = "detail";
+    this.input.focused = true;
+    this.detailScrollOffset = 0;
+    this.tui.requestRender();
+  }
+
+  private focusList() {
+    this.focusPane = "list";
+    this.input.focused = false;
+    this.tui.requestRender();
   }
 
   private subs(): ReadonlyArray<SubagentSnapshot> {
@@ -262,6 +347,7 @@ class SubagentDashboard implements Component {
   }
 
   private close(result: string | null) {
+    this.input.focused = false;
     if (this.cleanup()) this.done(result);
   }
 
@@ -274,12 +360,55 @@ class SubagentDashboard implements Component {
     reconcileDashboardSelection(this.selection, subs);
 
     if (this.keybindings.matches(data, "tui.select.cancel")) {
+      if (this.focusPane === "detail") {
+        this.focusList();
+        return;
+      }
       this.close(null);
       return;
     }
+    if (data === "\t") {
+      if (this.focusPane === "list") this.focusDetail();
+      else this.focusList();
+      return;
+    }
+
+    if (this.focusPane === "detail") {
+      if (this.keybindings.matches(data, "app.clear")) {
+        const snap = subs[this.selection.index];
+        if (snap?.status === "running") this.view.requestAbort(snap.id);
+        return;
+      }
+      if (data === "o" && this.options.onPopOut) {
+        const snap = subs[this.selection.index];
+        if (snap) void this.options.onPopOut(snap.id);
+        return;
+      }
+      if (this.keybindings.matches(data, "tui.editor.cursorUp")) {
+        this.detailScrollOffset += TRANSCRIPT_SCROLL_STEP;
+        this.tui.requestRender();
+        return;
+      }
+      if (this.keybindings.matches(data, "tui.editor.cursorDown")) {
+        this.detailScrollOffset = Math.max(
+          0,
+          this.detailScrollOffset - TRANSCRIPT_SCROLL_STEP,
+        );
+        this.tui.requestRender();
+        return;
+      }
+      this.input.handleInput(data);
+      this.tui.requestRender();
+      return;
+    }
+
+    // List focus.
     if (this.keybindings.matches(data, "tui.select.confirm")) {
-      const snap = subs[this.selection.index];
-      if (snap) this.close(snap.id);
+      if (!this.narrow()) this.focusDetail();
+      else {
+        const snap = subs[this.selection.index];
+        if (snap) this.close(snap.id);
+      }
       return;
     }
     if (this.keybindings.matches(data, "tui.select.up") || data === "k") {
@@ -287,6 +416,7 @@ class SubagentDashboard implements Component {
         this.selection.index =
           (this.selection.index - 1 + subs.length) % subs.length;
         this.selection.id = subs[this.selection.index]?.id;
+        this.detailScrollOffset = 0;
         this.tui.requestRender();
       }
       return;
@@ -295,6 +425,7 @@ class SubagentDashboard implements Component {
       if (subs.length > 0) {
         this.selection.index = (this.selection.index + 1) % subs.length;
         this.selection.id = subs[this.selection.index]?.id;
+        this.detailScrollOffset = 0;
         this.tui.requestRender();
       }
       return;
@@ -374,26 +505,141 @@ class SubagentDashboard implements Component {
         theme.fg("border", "╮"),
     );
 
-    // Rows
-    const divider = theme.fg("border", "│");
-    const rowLines = this.renderRows(subs, innerWidth, bodyHeight);
-    for (let i = 0; i < bodyHeight; i++) {
-      lines.push(divider + this.pad(rowLines[i] ?? "", innerWidth) + divider);
+    if (this.narrow()) {
+      // Single-column list (narrow terminals).
+      const divider = theme.fg("border", "│");
+      const rowLines = this.renderRows(subs, innerWidth, bodyHeight);
+      for (let i = 0; i < bodyHeight; i++) {
+        lines.push(divider + this.pad(rowLines[i] ?? "", innerWidth) + divider);
+      }
+      lines.push(
+        theme.fg("border", "╰") +
+          theme.fg("border", "─".repeat(innerWidth)) +
+          theme.fg("border", "╯"),
+      );
+    } else {
+      // Two panes: agent list on the left, live detail on the right.
+      const listWidth = Math.max(
+        26,
+        Math.min(42, Math.floor(innerWidth * 0.38)),
+      );
+      const detailWidth = innerWidth - listWidth - 1;
+      const left = this.renderListPane(subs, listWidth, bodyHeight);
+      const right = this.renderDetailPane(
+        subs[this.selection.index],
+        detailWidth,
+        bodyHeight,
+      );
+      const divider = theme.fg("border", "│");
+      for (let i = 0; i < bodyHeight; i++) {
+        lines.push(
+          theme.fg("border", "│") +
+            this.pad(left[i] ?? "", listWidth) +
+            divider +
+            this.pad(right[i] ?? "", detailWidth) +
+            theme.fg("border", "│"),
+        );
+      }
+      lines.push(
+        theme.fg("border", "╰") +
+          theme.fg("border", "─".repeat(listWidth)) +
+          theme.fg("border", "┴") +
+          theme.fg("border", "─".repeat(detailWidth)) +
+          theme.fg("border", "╯"),
+      );
     }
 
-    // Bottom border
-    lines.push(
-      theme.fg("border", "╰") +
-        theme.fg("border", "─".repeat(innerWidth)) +
-        theme.fg("border", "╯"),
-    );
-
     // Hints
-    const help = this.options.floating
-      ? `  ${configuredKeys(this.keybindings, "tui.select.up")}/${configuredKeys(this.keybindings, "tui.select.down")}/jk select · ${configuredKeys(this.keybindings, "tui.select.confirm")} open${this.options.onPopOut ? " · o shell" : ""} · x ${this.options.onCloseSession ? "close" : "abort"} · ${configuredKeys(this.keybindings, "tui.select.cancel")} back`
-      : `  ${configuredKeys(this.keybindings, "tui.select.up")}/${configuredKeys(this.keybindings, "tui.select.down")}/jk select · ${configuredKeys(this.keybindings, "tui.select.confirm")} take over · x abort · ${configuredKeys(this.keybindings, "tui.select.cancel")} close`;
-    lines.push(truncateToWidth(theme.fg("dim", help), width));
+    lines.push(truncateToWidth(theme.fg("dim", this.helpLine()), width));
 
+    return lines;
+  }
+
+  private helpLine(): string {
+    const keys = this.keybindings;
+    if (this.narrow() || this.options.floating) {
+      return this.options.floating
+        ? `  ${configuredKeys(keys, "tui.select.up")}/${configuredKeys(keys, "tui.select.down")}/jk select · ${configuredKeys(keys, "tui.select.confirm")} open${this.options.onPopOut ? " · o shell" : ""} · x ${this.options.onCloseSession ? "close" : "abort"} · ${configuredKeys(keys, "tui.select.cancel")} back`
+        : `  ${configuredKeys(keys, "tui.select.up")}/${configuredKeys(keys, "tui.select.down")}/jk select · ${configuredKeys(keys, "tui.select.confirm")} take over · x abort · ${configuredKeys(keys, "tui.select.cancel")} close`;
+    }
+    return this.focusPane === "detail"
+      ? `  tab list · ⏎ send steer · ${configuredKeys(keys, "tui.editor.cursorUp")}/${configuredKeys(keys, "tui.editor.cursorDown")} scroll · ${configuredKeys(keys, "app.clear")} abort run${this.options.onPopOut ? " · o shell" : ""} · ${configuredKeys(keys, "tui.select.cancel")} back to list`
+      : `  ${configuredKeys(keys, "tui.select.up")}/${configuredKeys(keys, "tui.select.down")}/jk select · tab detail · x abort${this.options.onPopOut ? " · o shell" : ""} · ${configuredKeys(keys, "tui.select.cancel")} close`;
+  }
+
+  /** Left pane: compact 2-line rows with a scroll window around the selection. */
+  private renderListPane(
+    subs: ReadonlyArray<SubagentSnapshot>,
+    width: number,
+    height: number,
+  ): string[] {
+    const theme = this.theme;
+    const out: string[] = [];
+    const maxVisible = Math.max(1, Math.floor(height / 2));
+    let start = 0;
+    if (subs.length > maxVisible) {
+      start = Math.min(
+        Math.max(0, this.selection.index - Math.floor((maxVisible - 1) / 2)),
+        subs.length - maxVisible,
+      );
+    }
+    const visible = subs.slice(start, start + maxVisible);
+    for (let i = 0; i < visible.length; i++) {
+      const index = start + i;
+      out.push(
+        ...renderListPaneRow(
+          visible[i]!,
+          width,
+          index === this.selection.index,
+          theme,
+        ),
+      );
+    }
+    if (start > 0) {
+      out[0] = truncateToWidth(theme.fg("dim", `  ... ${start} more`), width);
+    }
+    if (start + maxVisible < subs.length) {
+      out[out.length - 1] = truncateToWidth(
+        theme.fg("dim", "  ... more"),
+        width,
+      );
+    }
+    return out;
+  }
+
+  /** Right pane: detail header + live transcript viewport + steer input. */
+  private renderDetailPane(
+    snap: SubagentSnapshot | undefined,
+    width: number,
+    height: number,
+  ): string[] {
+    const theme = this.theme;
+    if (!snap) return [theme.fg("dim", "  select an agent")];
+    const chrome = 3; // header(2) + input(1)
+    const transcriptCapacity = Math.max(1, height - chrome);
+    const full = buildTranscriptLines(snap, width, theme);
+    const maxOffset = Math.max(0, full.length - transcriptCapacity);
+    if (this.detailScrollOffset > maxOffset)
+      this.detailScrollOffset = maxOffset;
+    const end = full.length - this.detailScrollOffset;
+    const visible = full.slice(Math.max(0, end - transcriptCapacity), end);
+
+    const lines = [...renderDetailHeader(snap, width, theme)];
+    if (visible.length === 0) lines.push(theme.fg("dim", "(no output yet)"));
+    else lines.push(...visible);
+    if (this.detailScrollOffset > 0) {
+      lines.push(
+        truncateToWidth(
+          theme.fg(
+            "dim",
+            `... ${this.detailScrollOffset} lines below · ↑/pgup`,
+          ),
+          width,
+        ),
+      );
+    }
+    while (lines.length < height - 1) lines.push("");
+    lines.push(...this.input.render(width));
     return lines;
   }
 
@@ -439,8 +685,6 @@ class SubagentDashboard implements Component {
 }
 
 // --- Takeover view ------------------------------------------------------------
-
-const TRANSCRIPT_SCROLL_STEP = 6;
 
 class TakeoverView implements Component, Focusable {
   private tui: TUI;
