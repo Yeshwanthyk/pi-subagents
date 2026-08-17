@@ -1,7 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import type { LiveToolState, SubagentSnapshot } from "../domain.ts";
-import { formatContextUtilization } from "../format.ts";
+import { formatActivityCounts, formatContextUtilization } from "../format.ts";
 
 const ARGUMENT_MAX_LENGTH = 140;
 
@@ -138,6 +138,7 @@ export function renderSubagentActivity(
 
 export function renderSubagentWaitSummary(
   snapshots: ReadonlyArray<SubagentSnapshot>,
+  theme: Theme,
   now = Date.now(),
 ) {
   const pending = snapshots.filter((snapshot) => snapshot.status === "running");
@@ -145,6 +146,17 @@ export function renderSubagentWaitSummary(
   const lines = [
     `Waiting for ${pending.length} subagent${pending.length === 1 ? "" : "s"}${complete ? ` · ${complete} complete` : ""}`,
   ];
+  const done = snapshots.filter(
+    (snapshot) => snapshot.status === "done",
+  ).length;
+  const failed = snapshots.filter(
+    (snapshot) => snapshot.status === "error",
+  ).length;
+  if (done + failed > 0) {
+    lines.push(
+      formatActivityCounts(theme, { running: pending.length, done, failed }),
+    );
+  }
   for (const snapshot of pending.slice(0, 6)) {
     const current = snapshot.liveTools[0];
     const operation = current

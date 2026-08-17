@@ -4,6 +4,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { renderActiveWorkRail } from "../activity-rail/index.ts";
 import type { ActiveWorkItem } from "./src/activity-protocol.ts";
 import type { SubagentSnapshot } from "./src/domain.ts";
+import { formatActivityCounts, formatActivityStatus } from "./src/format.ts";
 import {
   renderSubagentActivity,
   renderSubagentWaitSummary,
@@ -63,11 +64,60 @@ test("subagent activity card shows current work and bounded activity metadata", 
 test("wait summary reports each pending subagent's current operation", () => {
   const text = renderSubagentWaitSummary(
     [snapshot(), snapshot({ id: "sa-4", status: "done", liveTools: [] })],
+    theme,
     6_000,
   );
   assert.match(text, /Waiting for 1 subagent · 1 complete/);
   assert.match(text, /sa-3 · bash npm test · activity 2s ago/);
   assert.doesNotMatch(text, /sa-4 ·/);
+});
+
+test("wait summary ribbons the full status mix once any agent settles", () => {
+  const text = renderSubagentWaitSummary(
+    [
+      snapshot(),
+      snapshot({ id: "sa-2" }),
+      snapshot({ id: "sa-4", status: "done", liveTools: [] }),
+      snapshot({ id: "sa-5", status: "error", liveTools: [] }),
+    ],
+    theme,
+    6_000,
+  );
+  const lines = text.split("\n");
+  assert.match(lines[0], /Waiting for 2 subagents · 2 complete/);
+  assert.equal(lines[1], "■ 2 running · ■ 1 done · ■ 1 failed");
+});
+
+test("wait summary omits the counts ribbon while nothing has settled", () => {
+  const text = renderSubagentWaitSummary(
+    [snapshot(), snapshot({ id: "sa-2" })],
+    theme,
+    6_000,
+  );
+  assert.match(text.split("\n")[0], /Waiting for 2 subagents$/);
+  assert.doesNotMatch(text, /■/);
+});
+
+test("formatActivityCounts renders only nonzero groups", () => {
+  assert.equal(
+    formatActivityCounts(theme, { running: 2, done: 1, failed: 1 }),
+    "■ 2 running · ■ 1 done · ■ 1 failed",
+  );
+  assert.equal(
+    formatActivityCounts(theme, { running: 1, done: 0, failed: 0 }),
+    "■ 1 running",
+  );
+  assert.equal(
+    formatActivityCounts(theme, { running: 0, done: 0, failed: 0 }),
+    "",
+  );
+});
+
+test("formatActivityStatus keeps its established string for a given mix", () => {
+  assert.equal(
+    formatActivityStatus(theme, { running: 2, done: 1, failed: 1 }),
+    "subagents: ■ 2 running · ■ 1 done · ■ 1 failed · /subagents to view",
+  );
 });
 
 test("active-work rail is bounded and shows overflow", () => {

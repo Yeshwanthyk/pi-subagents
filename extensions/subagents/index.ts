@@ -27,6 +27,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   ExtensionUIContext,
+  Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_MAX_BYTES,
@@ -113,6 +114,16 @@ const STEER_CHOICE = "Steer…";
 const ABORT_CHOICE = "Abort";
 const SHOW_OUTPUT_CHOICE = "Show output";
 const BACK_CHOICE = "Back";
+
+/**
+ * Fallback theme for rendering wait summaries when no UI session is active
+ * (headless runs): plain passthrough, so the ribbon text stays readable even
+ * when there is nothing to color.
+ */
+const PLAIN_THEME = {
+  fg: (_color: string, text: string) => text,
+  bold: (text: string) => text,
+} as unknown as Theme;
 
 export interface HeadlessSubagentsUI {
   select(title: string, options: string[]): Promise<string | undefined>;
@@ -731,7 +742,13 @@ export default function (pi: ExtensionAPI) {
             .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
           onUpdate?.({
             content: [
-              { type: "text", text: renderSubagentWaitSummary(snapshots) },
+              {
+                type: "text",
+                text: renderSubagentWaitSummary(
+                  snapshots,
+                  ui?.theme ?? PLAIN_THEME,
+                ),
+              },
             ],
             details: {
               pending,

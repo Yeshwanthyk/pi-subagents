@@ -4,6 +4,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { SubagentSnapshot } from "./src/domain.ts";
 import {
+  orderDashboardSnapshots,
   reconcileDashboardSelection,
   renderDetailHeader,
   renderListPaneRow,
@@ -126,4 +127,98 @@ test("settled list rows render done/failed status words", () => {
     theme,
   );
   assert.match(failedLine, /failed/);
+});
+test("dashboard snapshots order running → error → done, unknown last, most recent first", () => {
+  const now = Date.now();
+  const running = snapshot({
+    id: "run",
+    status: "running",
+    createdAt: now - 40_000,
+    lastActivityAt: now - 10_000,
+  });
+  const failed = snapshot({
+    id: "fail",
+    status: "error",
+    createdAt: now - 30_000,
+    lastActivityAt: now - 20_000,
+  });
+  const done = snapshot({
+    id: "done",
+    status: "done",
+    createdAt: now - 20_000,
+    lastActivityAt: now - 30_000,
+  });
+  // "unknown" is not part of SubagentStatus yet; the rank's default still
+  // pushes it to the final group.
+  const unknown = {
+    ...snapshot({
+      id: "unk",
+      createdAt: now - 10_000,
+      lastActivityAt: now - 1_000,
+    }),
+    status: "unknown",
+  } as unknown as SubagentSnapshot;
+
+  assert.deepEqual(
+    orderDashboardSnapshots([done, unknown, running, failed]).map((s) => s.id),
+    ["run", "fail", "done", "unk"],
+  );
+});
+
+test("same status ties break by most recent activity, descending", () => {
+  const now = Date.now();
+  const idle = snapshot({
+    id: "idle",
+    status: "error",
+    createdAt: now - 60_000,
+    lastActivityAt: now - 50_000,
+  });
+  const busy = snapshot({
+    id: "busy",
+    status: "error",
+    createdAt: now - 20_000,
+    lastActivityAt: now - 10_000,
+  });
+  assert.deepEqual(
+    orderDashboardSnapshots([idle, busy]).map((s) => s.id),
+    ["busy", "idle"],
+  );
+
+  // Equal lastActivityAt falls back to createdAt, descending.
+  const createdEarly = snapshot({
+    id: "early",
+    status: "done",
+    createdAt: now - 40_000,
+    lastActivityAt: now - 5_000,
+  });
+  const createdLate = snapshot({
+    id: "late",
+    status: "done",
+    createdAt: now - 10_000,
+    lastActivityAt: now - 5_000,
+  });
+  assert.deepEqual(
+    orderDashboardSnapshots([createdEarly, createdLate]).map((s) => s.id),
+    ["late", "early"],
+  );
+});
+
+test("empty input stays empty and the input array is not mutated", () => {
+  assert.deepEqual(orderDashboardSnapshots([]), []);
+
+  const subs = [
+    snapshot({ id: "b", status: "done", createdAt: 100, lastActivityAt: 50 }),
+    snapshot({
+      id: "a",
+      status: "running",
+      createdAt: 200,
+      lastActivityAt: 150,
+    }),
+  ];
+  const idsBefore = subs.map((s) => s.id);
+  orderDashboardSnapshots(subs);
+  assert.deepEqual(
+    subs.map((s) => s.id),
+    idsBefore,
+  );
 });

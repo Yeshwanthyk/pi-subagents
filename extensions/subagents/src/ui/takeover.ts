@@ -301,6 +301,36 @@ export function reconcileDashboardSelection(
   selection.id = subs[selection.index]?.id;
 }
 
+/**
+ * Dashboard ordering (Cursor-style subagents panel): running first, then
+ * error, then done, then anything else ("unknown" / future statuses); most
+ * recently active first within each group (lastActivityAt, then createdAt,
+ * descending). Returns a new array; the input is never mutated.
+ */
+function dashboardStatusRank(status: SubagentSnapshot["status"]): number {
+  switch (status) {
+    case "running":
+      return 0;
+    case "error":
+      return 1;
+    case "done":
+      return 2;
+    default:
+      return 3;
+  }
+}
+
+export function orderDashboardSnapshots(
+  subs: ReadonlyArray<SubagentSnapshot>,
+): ReadonlyArray<SubagentSnapshot> {
+  return [...subs].sort(
+    (a, b) =>
+      dashboardStatusRank(a.status) - dashboardStatusRank(b.status) ||
+      b.lastActivityAt - a.lastActivityAt ||
+      b.createdAt - a.createdAt,
+  );
+}
+
 class SubagentDashboard implements Component {
   private tui: TUI;
   private theme: Theme;
@@ -365,7 +395,7 @@ class SubagentDashboard implements Component {
   }
 
   private subs(): ReadonlyArray<SubagentSnapshot> {
-    return this.view.list();
+    return orderDashboardSnapshots(this.view.list());
   }
 
   private cleanup() {

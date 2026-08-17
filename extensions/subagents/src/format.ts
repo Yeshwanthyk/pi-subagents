@@ -49,7 +49,7 @@ export function formatContextUtilization(usage: ContextUtilization) {
   return `${percent === undefined ? "?" : percent}%/${formatCompactTokens(capacity)}`;
 }
 
-interface ActivityCounts {
+export interface ActivityCounts {
   running: number;
   done: number;
   failed: number;
@@ -57,7 +57,12 @@ interface ActivityCounts {
 
 const SQUARE = "■";
 
-export function formatActivityStatus(theme: Theme, counts: ActivityCounts) {
+/**
+ * Render the per-status count ribbon (`■ N running · ■ N done · ■ N failed`),
+ * showing only nonzero groups, colored warning/success/error and joined with
+ * a dim " · ". Returns "" when every group is zero.
+ */
+export function formatActivityCounts(theme: Theme, counts: ActivityCounts) {
   const parts: string[] = [];
   if (counts.running > 0) {
     parts.push(theme.fg("warning", `${SQUARE} ${counts.running} running`));
@@ -68,6 +73,13 @@ export function formatActivityStatus(theme: Theme, counts: ActivityCounts) {
   if (counts.failed > 0) {
     parts.push(theme.fg("error", `${SQUARE} ${counts.failed} failed`));
   }
+  return parts.join(theme.fg("dim", " · "));
+}
+
+export function formatActivityStatus(theme: Theme, counts: ActivityCounts) {
+  const parts: string[] = [];
+  const countsText = formatActivityCounts(theme, counts);
+  if (countsText) parts.push(countsText);
   parts.push(theme.fg("accent", "/subagents") + theme.fg("dim", " to view"));
 
   return `${theme.fg("muted", "subagents:")} ${parts.join(theme.fg("dim", " · "))}`;

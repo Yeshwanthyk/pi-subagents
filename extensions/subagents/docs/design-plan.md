@@ -566,3 +566,23 @@ Recommendation: (a) during development, rename to final names when v2 replaces v
     (disposeAll). Codex/Claude children are external processes that *could* outlive a
     pi reload — should v2 keep v1's kill-everything behavior (proposed for v1 of v2) or
     plan for reattach later?
+
+---
+
+### 4.1 UI polish — Cursor-style pass (implemented)
+
+Follow-on to the v1/v2 UI, informed by Cursor's subagents panel:
+
+- **Dashboard ordering.** `/subagents` lists agents running → failed → done →
+  unknown, most recently active first within each group
+  (`orderDashboardSnapshots` in `src/ui/takeover.ts`). Selection stays stable by
+  id via `reconcileDashboardSelection`; the ordered view flows through list
+  pane, detail pane, send, and abort because everything indexes `subs()`.
+- **Counts ribbon.** The wait summary and the expanded in-transcript activity
+  card render a colored per-status ribbon `■ N running · ■ N done · ■ N failed`
+  once anything has settled (`formatActivityCounts` in `src/format.ts`;
+  `renderSubagentWaitSummary(snapshots, theme, now)` now takes the theme).
+  `formatActivityStatus` (footer status) reuses the helper with byte-identical
+  output.
+
+Both verified: `tsc` clean, 66/66 tests (11 new/updated), prettier clean.
