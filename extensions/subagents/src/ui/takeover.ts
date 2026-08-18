@@ -17,6 +17,7 @@ import {
   matchesKey,
   truncateToWidth,
   visibleWidth,
+  wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { formatElapsed, type SubagentSnapshot } from "../domain.ts";
 import { formatContextUtilization } from "../format.ts";
@@ -105,6 +106,17 @@ function statusWord(snap: SubagentSnapshot, theme: Theme): string {
       return theme.fg("success", "done");
     case "error":
       return theme.fg("error", "failed");
+  }
+}
+
+function detailStatusLabel(snap: SubagentSnapshot, theme: Theme): string {
+  switch (snap.status) {
+    case "running":
+      return theme.fg("warning", theme.bold("RUNNING"));
+    case "done":
+      return theme.fg("success", theme.bold("DONE"));
+    case "error":
+      return theme.fg("error", theme.bold("FAILED"));
   }
 }
 
@@ -261,23 +273,24 @@ export function renderDetailHeader(
   theme: Theme,
 ): string[] {
   const line1 =
-    `${statusGlyph(snap, theme)} ` +
-    theme.fg("accent", theme.bold(snap.id)) +
-    ` · ${theme.fg("accent", snap.title)} ${statusWord(snap, theme)}`;
-  const meta = [
-    `${snap.backend}: ${snap.meta.modelLabel ?? "?"}`,
-    formatContextUtilization(snap.usage) || undefined,
+    `${statusGlyph(snap, theme)} ${detailStatusLabel(snap, theme)}  ` +
+    theme.fg("accent", theme.bold(snap.title));
+  const identity = [
+    snap.id,
+    snap.backend,
     formatElapsed(snap),
-    snap.completedOperations > 0
-      ? `${snap.completedOperations} ops`
-      : undefined,
-    subagentThinkingLabel(snap),
-  ]
-    .filter((label): label is string => label !== undefined)
-    .join(" · ");
+    `${snap.completedOperations} ops`,
+  ].join(" · ");
+  const model = theme.fg("muted", `model: ${snap.meta.modelLabel ?? "?"}`);
+  const thinking = snap.meta.reasoningEffort ?? "default";
+  const context = formatContextUtilization(snap.usage) || "unknown";
+  const runMeta = theme.fg("dim", `think: ${thinking} · ctx: ${context}`);
+
   return [
-    truncateToWidth(line1, width),
-    truncateToWidth(theme.fg("dim", meta || " "), width),
+    truncateToWidth(line1, width, "…"),
+    truncateToWidth(theme.fg("dim", identity), width, "…"),
+    ...wrapTextWithAnsi(model, Math.max(1, width)),
+    truncateToWidth(runMeta, width, "…"),
   ];
 }
 
@@ -735,7 +748,8 @@ class SubagentDashboard implements Component {
   ): string[] {
     const theme = this.theme;
     if (!snap) return [theme.fg("dim", "  select an agent")];
-    const chrome = 3; // header(2) + input(1)
+    const header = renderDetailHeader(snap, width, theme);
+    const chrome = header.length + 1; // header + input
     const transcriptCapacity = Math.max(1, height - chrome);
     const full = buildTranscriptLines(snap, width, theme);
     const maxOffset = Math.max(0, full.length - transcriptCapacity);
@@ -744,7 +758,7 @@ class SubagentDashboard implements Component {
     const end = full.length - this.detailScrollOffset;
     const visible = full.slice(Math.max(0, end - transcriptCapacity), end);
 
-    const lines = [...renderDetailHeader(snap, width, theme)];
+    const lines = [...header];
     if (visible.length === 0) lines.push(theme.fg("dim", "(no output yet)"));
     else lines.push(...visible);
     if (this.detailScrollOffset > 0) {

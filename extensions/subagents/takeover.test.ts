@@ -125,16 +125,18 @@ test("list pane row shows title, id, status word and dim meta, bounded to width"
 
 test("detail header shows id, title, status and live meta", () => {
   const settledAt = Date.now();
-  const [line1, line2] = renderDetailHeader(
+  const header = renderDetailHeader(
     snapshot({ status: "done", completedOperations: 5, settledAt }),
     60,
     theme,
   );
-  assert.match(line1, /sa-1 · Fix login flow done/);
-  assert.match(line2, /pi: deepseek-v4-flash/);
-  assert.match(line2, /10%\/100k/);
-  assert.match(line2, /5 ops/);
-  assert.ok(visibleWidth(line1) <= 60 && visibleWidth(line2) <= 60);
+  assert.equal(header.length, 4);
+  assert.match(header[0]!, /DONE  Fix login flow/);
+  assert.match(header[1]!, /sa-1 · pi/);
+  assert.match(header[1]!, /5 ops/);
+  assert.match(header[2]!, /model: deepseek-v4-flash/);
+  assert.match(header[3]!, /think: default · ctx: 10%\/100k/);
+  assert.ok(header.every((line) => visibleWidth(line) <= 60));
 });
 
 test("settled list rows render done/failed status words", () => {
