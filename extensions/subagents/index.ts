@@ -426,7 +426,6 @@ export default function (pi: ExtensionAPI) {
 
   const refreshObservability = (manager: SubagentManagerShape) => {
     updateStatus(manager);
-    publishSubagentActivity(manager);
     publishBrowserActivity(manager.view.list());
   };
 
@@ -492,6 +491,9 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("session_start", (_event, ctx) => {
+    // The activity rail is no longer part of the package UI. Clear a stale
+    // widget when a session is opened after upgrading from an older version.
+    ctx.ui?.setWidget("active-work", undefined);
     browserUI?.setWidget(BROWSER_ACTIVITY_WIDGET_KEY, undefined);
     sessionContext = ctx;
     ui = ctx.hasUI ? ctx.ui : undefined;

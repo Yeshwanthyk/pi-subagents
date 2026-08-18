@@ -342,6 +342,7 @@ class SubagentDashboard implements Component {
 
   private closed = false;
   private ticker: ReturnType<typeof setInterval>;
+  private renderTimer?: ReturnType<typeof setTimeout>;
   private unsubChange: () => void;
   private input = new Input();
   private focusPane: "list" | "detail" = "list";
@@ -364,8 +365,10 @@ class SubagentDashboard implements Component {
     this.done = done;
     this.options = options;
     // Elapsed times, token counts, and statuses tick along at 1Hz.
-    this.ticker = setInterval(() => this.tui.requestRender(), 1000);
-    this.unsubChange = view.subscribe(() => this.tui.requestRender());
+    this.ticker = setInterval(() => this.scheduleRender(), 1000);
+    // Snapshot updates can arrive once per streamed token. Coalesce them so
+    // the dashboard does not repaint the list pane for every child event.
+    this.unsubChange = view.subscribe(() => this.scheduleRender());
     this.input.onSubmit = (value: string) => {
       const text = value.trim();
       if (!text) return;
@@ -373,7 +376,7 @@ class SubagentDashboard implements Component {
       if (snap) this.view.requestSend(snap.id, text);
       this.input.setValue("");
       this.detailScrollOffset = 0;
-      this.tui.requestRender();
+      this.scheduleRender();
     };
   }
 
@@ -385,13 +388,13 @@ class SubagentDashboard implements Component {
     this.focusPane = "detail";
     this.input.focused = true;
     this.detailScrollOffset = 0;
-    this.tui.requestRender();
+    this.scheduleRender();
   }
 
   private focusList() {
     this.focusPane = "list";
     this.input.focused = false;
-    this.tui.requestRender();
+    this.scheduleRender();
   }
 
   private subs(): ReadonlyArray<SubagentSnapshot> {
@@ -402,8 +405,18 @@ class SubagentDashboard implements Component {
     if (this.closed) return false;
     this.closed = true;
     clearInterval(this.ticker);
+    if (this.renderTimer) clearTimeout(this.renderTimer);
+    this.renderTimer = undefined;
     this.unsubChange();
     return true;
+  }
+
+  private scheduleRender() {
+    if (this.renderTimer) return;
+    this.renderTimer = setTimeout(() => {
+      this.renderTimer = undefined;
+      if (!this.closed) this.tui.requestRender();
+    }, 50);
   }
 
   private close(result: string | null) {
@@ -446,7 +459,7 @@ class SubagentDashboard implements Component {
       }
       if (this.keybindings.matches(data, "tui.editor.cursorUp")) {
         this.detailScrollOffset += TRANSCRIPT_SCROLL_STEP;
-        this.tui.requestRender();
+        this.scheduleRender();
         return;
       }
       if (this.keybindings.matches(data, "tui.editor.cursorDown")) {
@@ -454,11 +467,11 @@ class SubagentDashboard implements Component {
           0,
           this.detailScrollOffset - TRANSCRIPT_SCROLL_STEP,
         );
-        this.tui.requestRender();
+        this.scheduleRender();
         return;
       }
       this.input.handleInput(data);
-      this.tui.requestRender();
+      this.scheduleRender();
       return;
     }
 
@@ -477,7 +490,7 @@ class SubagentDashboard implements Component {
           (this.selection.index - 1 + subs.length) % subs.length;
         this.selection.id = subs[this.selection.index]?.id;
         this.detailScrollOffset = 0;
-        this.tui.requestRender();
+        this.scheduleRender();
       }
       return;
     }
@@ -486,7 +499,7 @@ class SubagentDashboard implements Component {
         this.selection.index = (this.selection.index + 1) % subs.length;
         this.selection.id = subs[this.selection.index]?.id;
         this.detailScrollOffset = 0;
-        this.tui.requestRender();
+        this.scheduleRender();
       }
       return;
     }
@@ -862,7 +875,7 @@ class TakeoverView implements Component, Focusable {
         if (opened) this.close();
         else {
           this.poppingOut = false;
-          this.tui.requestRender();
+          this.scheduleRender();
         }
       });
       return;
@@ -881,7 +894,7 @@ class TakeoverView implements Component, Focusable {
     }
     if (this.keybindings.matches(data, "tui.editor.cursorUp")) {
       this.scrollOffset += TRANSCRIPT_SCROLL_STEP;
-      this.tui.requestRender();
+      this.scheduleRender();
       return;
     }
     if (this.keybindings.matches(data, "tui.editor.cursorDown")) {
@@ -889,7 +902,7 @@ class TakeoverView implements Component, Focusable {
         0,
         this.scrollOffset - TRANSCRIPT_SCROLL_STEP,
       );
-      this.tui.requestRender();
+      this.scheduleRender();
       return;
     }
     if (this.keybindings.matches(data, "tui.editor.pageUp")) {
