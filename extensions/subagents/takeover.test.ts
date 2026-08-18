@@ -128,7 +128,7 @@ test("settled list rows render done/failed status words", () => {
   );
   assert.match(failedLine, /failed/);
 });
-test("dashboard snapshots order running → error → done, unknown last, most recent first", () => {
+test("dashboard snapshots preserve manager insertion order", () => {
   const now = Date.now();
   const running = snapshot({
     id: "run",
@@ -148,8 +148,8 @@ test("dashboard snapshots order running → error → done, unknown last, most r
     createdAt: now - 20_000,
     lastActivityAt: now - 30_000,
   });
-  // "unknown" is not part of SubagentStatus yet; the rank's default still
-  // pushes it to the final group.
+  // "unknown" is not part of SubagentStatus yet, but it must not reorder the
+  // stable list if a future status is introduced.
   const unknown = {
     ...snapshot({
       id: "unk",
@@ -161,11 +161,11 @@ test("dashboard snapshots order running → error → done, unknown last, most r
 
   assert.deepEqual(
     orderDashboardSnapshots([done, unknown, running, failed]).map((s) => s.id),
-    ["run", "fail", "done", "unk"],
+    ["done", "unk", "run", "fail"],
   );
 });
 
-test("same status ties break by most recent activity, descending", () => {
+test("activity updates do not reorder rows", () => {
   const now = Date.now();
   const idle = snapshot({
     id: "idle",
@@ -181,10 +181,10 @@ test("same status ties break by most recent activity, descending", () => {
   });
   assert.deepEqual(
     orderDashboardSnapshots([idle, busy]).map((s) => s.id),
-    ["busy", "idle"],
+    ["idle", "busy"],
   );
 
-  // Equal lastActivityAt falls back to createdAt, descending.
+  // Equal or different timestamps do not affect the visible order.
   const createdEarly = snapshot({
     id: "early",
     status: "done",
@@ -199,7 +199,7 @@ test("same status ties break by most recent activity, descending", () => {
   });
   assert.deepEqual(
     orderDashboardSnapshots([createdEarly, createdLate]).map((s) => s.id),
-    ["late", "early"],
+    ["early", "late"],
   );
 });
 

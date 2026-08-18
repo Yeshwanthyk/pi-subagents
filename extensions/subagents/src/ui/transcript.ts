@@ -66,6 +66,68 @@ function renderThinking(
   }
 }
 
+function renderAssistantText(
+  theme: Theme,
+  text: string,
+  width: number,
+  out: string[],
+) {
+  let inCodeBlock = false;
+  for (const rawLine of sanitizeText(text).split("\n")) {
+    const line = rawLine.trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed) {
+      out.push("");
+      continue;
+    }
+
+    if (trimmed.startsWith("```")) {
+      inCodeBlock = !inCodeBlock;
+      out.push(truncateToWidth(theme.fg("dim", `  ${trimmed}`), width));
+      continue;
+    }
+
+    if (inCodeBlock) {
+      const wrapped = wrapTextWithAnsi(line, Math.max(10, width - 4));
+      for (const part of wrapped) {
+        out.push(
+          truncateToWidth(
+            theme.fg("borderMuted", "  | ") + theme.fg("toolOutput", part),
+            width,
+          ),
+        );
+      }
+      continue;
+    }
+
+    const heading = trimmed.match(/^(?:#{1,6}\s+|\*\*(.+)\*\*\s*$)/);
+    if (heading) {
+      const content = heading[1] ?? trimmed.replace(/^#{1,6}\s+/, "");
+      out.push(
+        truncateToWidth(theme.fg("accent", theme.bold(`  ${content}`)), width),
+      );
+      continue;
+    }
+
+    const bullet = line.match(/^(\s*)([-*+] |\d+\. )(.*)$/);
+    const prefix = bullet ? `${bullet[1]}${theme.fg("accent", bullet[2])}` : "";
+    const body = bullet ? bullet[3] : line;
+    const wrapped = wrapTextWithAnsi(
+      body,
+      Math.max(10, width - visibleWidth(prefix)),
+    );
+    for (let index = 0; index < wrapped.length; index++) {
+      out.push(
+        truncateToWidth(
+          (index === 0 ? prefix : " ".repeat(visibleWidth(prefix))) +
+            theme.fg("text", wrapped[index]),
+          width,
+        ),
+      );
+    }
+  }
+}
+
 function renderAssistantItem(
   theme: Theme,
   item: Extract<TranscriptItem, { kind: "assistant" }>,
@@ -74,9 +136,8 @@ function renderAssistantItem(
 ) {
   for (const part of item.parts) {
     if (part.type === "text") {
-      const text = sanitizeText(part.text).trim();
-      if (!text) continue;
-      out.push(...wrapTextWithAnsi(text, width));
+      if (!sanitizeText(part.text).trim()) continue;
+      renderAssistantText(theme, part.text, width, out);
     } else if (part.type === "thinking") {
       renderThinking(
         theme,
@@ -87,8 +148,8 @@ function renderAssistantItem(
     } else if (part.type === "toolCall") {
       const preview = part.argsPreview ? sanitizeText(part.argsPreview) : "";
       const line =
-        theme.fg("muted", "→ ") +
-        theme.fg("toolTitle", part.name) +
+        theme.fg("warning", "→ ") +
+        theme.fg("toolTitle", theme.bold(part.name)) +
         (preview && preview !== "{}" ? theme.fg("dim", ` ${preview}`) : "");
       out.push(truncateToWidth(line, width));
     }
@@ -101,19 +162,23 @@ function renderToolResultItem(
   width: number,
   out: string[],
 ) {
-  const firstLine =
-    sanitizeText(item.outputPreview ?? "")
-      .split("\n")
-      .find((line) => line.trim()) ?? "";
+  const output = sanitizeText(item.outputPreview ?? "").trim() || "(no output)";
   const label = item.isError
-    ? theme.fg("error", "  error: ")
-    : theme.fg("dim", "  output: ");
-  out.push(
-    truncateToWidth(
-      label + theme.fg("toolOutput", firstLine || "(no output)"),
-      width,
-    ),
+    ? theme.fg("error", "  x error: ")
+    : theme.fg("success", "  ✓ output: ");
+  const wrapped = wrapTextWithAnsi(
+    output,
+    Math.max(10, width - visibleWidth(label)),
   );
+  for (let index = 0; index < wrapped.length; index++) {
+    out.push(
+      truncateToWidth(
+        (index === 0 ? label : " ".repeat(visibleWidth(label))) +
+          theme.fg(item.isError ? "error" : "toolOutput", wrapped[index]),
+        width,
+      ),
+    );
+  }
 }
 
 /** Render a subagent's conversation as plain lines, wrapped to `width`. */
@@ -153,13 +218,17 @@ export function buildTranscriptLines(
     if (out.length > 0) out.push("");
     const marker = tool.done
       ? tool.isError
-        ? theme.fg("error", "error")
-        : theme.fg("success", "done")
-      : theme.fg("warning", "running");
-    let line = `${theme.fg("toolTitle", tool.name)} · ${marker}`;
+        ? theme.fg("error", "x error")
+        : theme.fg("success", "✓ done")
+      : theme.fg("warning", "■ running");
+    let line = `${theme.fg("warning", "→ ")}${theme.fg(
+      "toolTitle",
+      theme.bold(tool.name),
+    )} · ${marker}`;
     const preview = tool.outputPreview && sanitizeText(tool.outputPreview);
     if (preview) line += theme.fg("dim", ` · ${preview}`);
-    out.push(truncateToWidth(line, width));
+    const wrapped = wrapTextWithAnsi(line, width);
+    out.push(...wrapped.map((part) => truncateToWidth(part, width)));
   }
 
   // Queued steering/follow-up messages: show them immediately so Enter
