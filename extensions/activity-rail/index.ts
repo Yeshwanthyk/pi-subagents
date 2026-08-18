@@ -3,18 +3,16 @@ import type {
   ExtensionUIContext,
   Theme,
 } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import {
   ACTIVE_WORK_CHANNELS,
   type ActiveWorkItem,
   type ActiveWorkRemoval,
 } from "../subagents/src/activity-protocol.ts";
 
-const MAX_VISIBLE = 4;
-const MAX_FLASH = 2;
+const MAX_VISIBLE = 3;
+const MAX_FLASH = 1;
 const FLASH_TTL_MS = 20_000;
-const SPINNER_MS = 150;
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const COALESCE_MS = 100;
 
 interface SettleFlash {
@@ -74,10 +72,6 @@ function compactAge(timestamp: number, now: number) {
   return seconds < 2 ? "active now" : `active ${age(timestamp, now)} ago`;
 }
 
-function spinnerAt(now: number) {
-  return SPINNER_FRAMES[Math.floor(now / SPINNER_MS) % SPINNER_FRAMES.length];
-}
-
 function statusChip(
   status: "running" | "quiet" | "done" | "error",
   theme: Theme,
@@ -94,18 +88,16 @@ function statusChip(
   }
 }
 
-/** Render one item as compact metadata plus a fully wrapped operation. */
-function cardLines(
+/** Render one active item on a single bounded line. */
+function itemLine(
   item: ActiveWorkItem,
   theme: Theme,
   now: number,
   width: number,
 ) {
   const quiet = item.status === "quiet" || now - item.lastActivityAt >= 30_000;
-  const glyph = quiet
-    ? theme.fg("muted", "■")
-    : theme.fg("warning", spinnerAt(now));
-  const title = theme.fg("accent", bounded(item.label, 32));
+  const glyph = quiet ? theme.fg("muted", "■") : theme.fg("warning", "●");
+  const title = theme.fg("accent", bounded(item.label, 30));
   const meta = [
     compactAge(item.lastActivityAt, now),
     item.completedOperations && item.completedOperations > 0
@@ -117,28 +109,18 @@ function cardLines(
   ]
     .filter(Boolean)
     .join(" · ");
-  // Live spinner already signals activity; the chip is reserved for quiet rows.
-  const line1 = quiet
-    ? `${glyph} ${title} ${statusChip("quiet", theme)}` +
-      (meta ? theme.fg("dim", ` · ${meta}`) : "")
-    : `${glyph} ${title}` + (meta ? theme.fg("dim", ` · ${meta}`) : "");
-
   const operation =
     item.currentOperation ??
     (quiet ? "quiet · no recent events" : "model working");
-  const operationLines = wrapTextWithAnsi(operation, Math.max(10, width - 5));
-  return [
-    truncateToWidth(line1, width, "…"),
-    ...operationLines.map((line, index) =>
-      truncateToWidth(
-        `${index === 0 ? "  → " : "     "}${theme.fg(
-          quiet ? "muted" : "toolTitle",
-          line,
-        )}`,
-        width,
-      ),
-    ),
-  ];
+  const chip = quiet ? ` ${statusChip("quiet", theme)}` : "";
+  return truncateToWidth(
+    `${glyph} ${title}${chip}${theme.fg("dim", " — ")}${theme.fg(
+      quiet ? "muted" : "toolTitle",
+      operation,
+    )}${meta ? theme.fg("dim", ` · ${meta}`) : ""}`,
+    width,
+    "…",
+  );
 }
 
 function flashLine(
@@ -169,20 +151,21 @@ export function renderActiveWorkRail(
   flashes: ReadonlyArray<SettleFlash> = [],
   maxWidth = 100,
 ) {
-  const lines = [theme.fg("muted", theme.bold("ACTIVE WORK"))];
+  const count = items.length;
+  const lines = [
+    `${theme.fg("warning", "●")} ${theme.fg(
+      "muted",
+      theme.bold(`${count} active ${count === 1 ? "item" : "items"}`),
+    )}${theme.fg("dim", " · ctrl+shift+a")}`,
+  ];
   const visible = items.slice(0, MAX_VISIBLE);
-  for (const item of visible)
-    lines.push(...cardLines(item, theme, now, maxWidth));
+  for (const item of visible) lines.push(itemLine(item, theme, now, maxWidth));
   for (const flash of flashes.slice(0, MAX_FLASH))
     lines.push(flashLine(flash, theme, now, maxWidth));
   const overflow =
     Math.max(0, items.length - MAX_VISIBLE) +
     Math.max(0, flashes.length - MAX_FLASH);
-  lines.push(
-    overflow > 0
-      ? theme.fg("dim", `+${overflow} more active items · ctrl+shift+a`)
-      : theme.fg("dim", "ctrl+shift+a · subagents"),
-  );
+  if (overflow > 0) lines.push(theme.fg("dim", `+${overflow} more`));
   return lines;
 }
 
@@ -191,7 +174,7 @@ export default function activityRail(pi: ExtensionAPI) {
   const flashes = new Map<ActiveWorkItem["key"], SettleFlash>();
   let ui: ExtensionUIContext | undefined;
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
-  let spinnerTicker: ReturnType<typeof setInterval> | undefined;
+  let flashExpiryTimer: ReturnType<typeof setTimeout> | undefined;
 
   const render = (now = Date.now()) => {
     if (!ui) return;
@@ -208,27 +191,30 @@ export default function activityRail(pi: ExtensionAPI) {
     );
   };
 
-  const reconcileTicker = (now = Date.now()) => {
-    const animating = [...items.values()].some(
-      (item) => item.status === "running" && now - item.lastActivityAt < 30_000,
-    );
-    if (animating && !spinnerTicker) {
-      spinnerTicker = setInterval(() => render(), SPINNER_MS);
-      spinnerTicker.unref?.();
-    } else if (!animating && spinnerTicker) {
-      clearInterval(spinnerTicker);
-      spinnerTicker = undefined;
-    }
-  };
-
   const flush = (now = Date.now()) => {
     flushTimer = undefined;
     // Drop flashes older than the TTL so settled rows fade out on their own.
     for (const [key, flash] of flashes) {
       if (now - flash.settledAt >= FLASH_TTL_MS) flashes.delete(key);
     }
-    reconcileTicker(now);
     render(now);
+    if (flashExpiryTimer) clearTimeout(flashExpiryTimer);
+    flashExpiryTimer = undefined;
+    const nextExpiry = Math.min(
+      ...[...flashes.values()].map(
+        (flash) => flash.settledAt + FLASH_TTL_MS - now,
+      ),
+    );
+    if (Number.isFinite(nextExpiry)) {
+      flashExpiryTimer = setTimeout(
+        () => {
+          flashExpiryTimer = undefined;
+          flush();
+        },
+        Math.max(1, nextExpiry),
+      );
+      flashExpiryTimer.unref?.();
+    }
   };
 
   const schedule = () => {
@@ -283,8 +269,8 @@ export default function activityRail(pi: ExtensionAPI) {
     unsubscribeRemove();
     if (flushTimer) clearTimeout(flushTimer);
     flushTimer = undefined;
-    if (spinnerTicker) clearInterval(spinnerTicker);
-    spinnerTicker = undefined;
+    if (flashExpiryTimer) clearTimeout(flashExpiryTimer);
+    flashExpiryTimer = undefined;
     items.clear();
     flashes.clear();
     ui?.setWidget("active-work", undefined);

@@ -1,6 +1,6 @@
 {
   "name": "pi-subagents",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -19,7 +19,8 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/subagents/index.ts"
+      "./extensions/subagents/index.ts",
+      "./extensions/activity-rail/index.ts"
     ],
     "skills": [
       "./skills/subagents"

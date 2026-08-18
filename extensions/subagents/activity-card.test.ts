@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { renderActiveWorkRail } from "../activity-rail/index.ts";
 import type { ActiveWorkItem } from "./src/activity-protocol.ts";
 import type { SubagentSnapshot } from "./src/domain.ts";
@@ -120,7 +121,7 @@ test("formatActivityStatus keeps its established string for a given mix", () => 
   );
 });
 
-test("active-work rail is bounded and shows overflow", () => {
+test("active-work rail stays compact and shows overflow", () => {
   const items: ActiveWorkItem[] = Array.from({ length: 6 }, (_, index) => ({
     version: 1,
     key: `subagent:sa-${index}`,
@@ -134,9 +135,9 @@ test("active-work rail is bounded and shows overflow", () => {
     lastActivityAt: 2_000 + index,
   }));
   const lines = renderActiveWorkRail(items, theme, 7_000);
-  assert.equal(lines.length, 10);
-  assert.equal(lines.filter((line) => /sa-\d/.test(line)).length, 4);
-  assert.match(lines.at(-1) ?? "", /\+2 more active items/);
+  assert.equal(lines.length, 5);
+  assert.equal(lines.filter((line) => /sa-\d/.test(line)).length, 3);
+  assert.match(lines.at(-1) ?? "", /\+3 more/);
 });
 
 test("active-work rail derives quiet state as activity ages", () => {
@@ -156,7 +157,7 @@ test("active-work rail derives quiet state as activity ages", () => {
   assert.match(lines.join("\n"), /\[QUIET\]/);
 });
 
-test("active-work rail renders compact running rows with spinner, ops and ctx", () => {
+test("active-work rail renders one-line running rows with ops and ctx", () => {
   const item: ActiveWorkItem = {
     version: 1,
     key: "subagent:sa-1",
@@ -173,15 +174,15 @@ test("active-work rail renders compact running rows with spinner, ops and ctx", 
     completedOperations: 12,
   };
   const text = renderActiveWorkRail([item], theme, 3_000).join("\n");
-  assert.match(text, /⠋/);
+  assert.match(text, /●/);
   assert.doesNotMatch(text, /\[RUNNING\]/);
   assert.match(text, /Fix login flow/);
   assert.match(text, /12 ops/);
   assert.match(text, /ctx 4%/);
-  assert.match(text, /→ bash npm test/);
+  assert.match(text, /— bash npm test/);
 });
 
-test("active-work rail wraps the full operation instead of truncating it", () => {
+test("active-work rail truncates long operations to keep one bounded row", () => {
   const item: ActiveWorkItem = {
     version: 1,
     key: "subagent:sa-long",
@@ -196,14 +197,12 @@ test("active-work rail wraps the full operation instead of truncating it", () =>
     lastActivityAt: 2_000,
   };
   const text = renderActiveWorkRail([item], theme, 3_000, [], 42).join("\n");
-  assert.match(
-    text.replace(/\s+/g, ""),
-    /vendor\/alchemy\/packages\/alchemy\/src\/Cloudflare\/Workers\/Source\.ts/,
-  );
-  assert.doesNotMatch(text, /…/);
+  assert.equal(text.split("\n").length, 2);
+  assert.ok(text.split("\n").every((line) => visibleWidth(line) <= 42));
+  assert.match(text, /…/);
 });
 
-test("active-work rail spinner advances with time and is deterministic per now", () => {
+test("active-work rail uses a stable marker to avoid idle repaint churn", () => {
   const item: ActiveWorkItem = {
     version: 1,
     key: "subagent:sa-spin",
@@ -217,8 +216,8 @@ test("active-work rail spinner advances with time and is deterministic per now",
   };
   const first = renderActiveWorkRail([item], theme, 0).join("\n");
   const second = renderActiveWorkRail([item], theme, 150).join("\n");
-  assert.notEqual(first, second);
-  assert.match(first, /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/);
+  assert.equal(first, second);
+  assert.match(first, /●/);
 });
 
 test("active-work rail shows settle flashes bounded to MAX_FLASH", () => {
@@ -244,12 +243,12 @@ test("active-work rail shows settle flashes bounded to MAX_FLASH", () => {
   ];
   const lines = renderActiveWorkRail([], theme, 8_000, flashes);
   assert.match(lines.join("\n"), /✓ Lint pass \[DONE\] · 24 ops · 3s/);
-  assert.match(lines.join("\n"), /✕ Migrate config \[FAILED\] · 3 ops/);
+  assert.doesNotMatch(lines.join("\n"), /Migrate config/);
   assert.doesNotMatch(lines.join("\n"), /Overflow flash/);
-  assert.match(lines.at(-1) ?? "", /\+1 more active items/);
+  assert.match(lines.at(-1) ?? "", /\+2 more/);
 });
 
-test("active-work rail footer shows the dashboard shortcut when not overflowing", () => {
+test("active-work rail header shows the dashboard shortcut", () => {
   const lines = renderActiveWorkRail([], theme, 1_000);
-  assert.match(lines.at(-1) ?? "", /ctrl\+shift\+a · subagents/);
+  assert.match(lines[0] ?? "", /0 active items · ctrl\+shift\+a/);
 });
