@@ -5,13 +5,14 @@
  * Tools (for the parent LLM):
  * - subagent_spawn: fire-and-forget spawn (prompt, title, agent, working_dir,
  *   model, reasoning_effort). Max 4 running at once across all backends.
- * - subagent_wait: block until the listed subagents settle, return results.
- * - subagent_cancel: stop one or more running subagents.
- * - subagent_check: peek at a subagent's status and recent activity.
- * - subagent_list: list all subagents.
+ * - subagent_wait: block until the listed parent-owned subagents settle, return results.
+ * - subagent_cancel: stop one or more running parent-owned subagents.
+ * - subagent_check: peek at a parent-owned subagent's status and recent activity.
+ * - subagent_list: list all parent-owned subagents.
  *
- * Unawaited subagents queue their result as a follow-up message when they
- * settle. `/subagents` opens a picker + full interactive takeover view.
+ * Unawaited parent-owned subagents queue their result as a follow-up message
+ * when they settle. `/subagents` opens a picker + full interactive takeover
+ * view; client-owned jobs stay in the client API surface.
  *
  * Architecture: Effect v4 generators throughout (backends -> manager ->
  * runtime); this file is the async boundary where tool handlers run effects
@@ -45,7 +46,6 @@ import {
   formatElapsed,
   latestText,
   REASONING_EFFORTS,
-  type SpawnTask,
   type SubagentSnapshot,
 } from "./src/domain.ts";
 import {
@@ -53,9 +53,9 @@ import {
   formatContextUtilization,
 } from "./src/format.ts";
 import {
-  standardSubagentView,
+  parentSubagentView,
   SubagentManager,
-  type SubagentManagerShape,
+  type SubagentManagerApi,
   type SubagentReadModel,
 } from "./src/manager.ts";
 import {
@@ -64,7 +64,6 @@ import {
 } from "./src/client-api.ts";
 import { SUBAGENT_CLIENT_CHANNELS } from "./src/client-protocol.ts";
 import {
-  buildSubagentResultMessage,
   buildSubagentSpawnResult,
   SUBAGENT_CANCEL_PARAMETER_DESCRIPTIONS,
   SUBAGENT_CANCEL_TOOL_DESCRIPTION,
@@ -78,13 +77,18 @@ import {
   SUBAGENT_WAIT_PARAMETER_DESCRIPTIONS,
   SUBAGENT_WAIT_TOOL_DESCRIPTION,
 } from "./src/prompt.ts";
-import { createDeferredResultDelivery } from "./src/result-delivery.ts";
+import { createParentResultCoordinator } from "./src/parent-coordinator.ts";
+import type { ParentResultEnvelope } from "./src/parent-mailbox.ts";
+import {
+  buildParentResultBatchMessage,
+  PARENT_RESULT_BATCH_OPTIONS,
+} from "./src/parent-message.ts";
+import { captureParentRef } from "./src/parent-ref.ts";
 import {
   createSubagentRuntime,
   runTool,
   type SubagentRuntime,
 } from "./src/runtime.ts";
-import { registerBtw } from "./src/btw.ts";
 import { openSubagentPicker } from "./src/ui/takeover.ts";
 import {
   ACTIVE_WORK_CHANNELS,
@@ -120,10 +124,11 @@ const BACK_CHOICE = "Back";
  * (headless runs): plain passthrough, so the ribbon text stays readable even
  * when there is nothing to color.
  */
+// SAFETY: Headless rendering uses only the passthrough fg and bold methods.
 const PLAIN_THEME = {
   fg: (_color: string, text: string) => text,
   bold: (text: string) => text,
-} as unknown as Theme;
+} as Theme;
 
 export interface HeadlessSubagentsUI {
   select(title: string, options: string[]): Promise<string | undefined>;
@@ -137,6 +142,17 @@ type HeadlessSubagentView = Pick<
   SubagentReadModel,
   "list" | "get" | "requestSend" | "requestAbort"
 >;
+
+/** Structured details attached to subagent-result messages. */
+export interface SubagentResultDetails {
+  id?: string;
+  title?: string;
+  status?: string;
+}
+
+export interface SubagentResultBatchDetails {
+  results?: ReadonlyArray<SubagentResultDetails>;
+}
 
 function singleLine(text: string) {
   return text
@@ -263,7 +279,7 @@ export async function runHeadlessSubagentsDialog(
 
       if (action === SHOW_OUTPUT_CHOICE) {
         const output = headlessOutput(snap);
-        if (typeof ui.editor === "function") {
+        if (ui.editor !== undefined) {
           await ui.editor(`${snap.id} output`, output);
         } else {
           ui.notify(output.slice(-HEADLESS_NOTIFY_MAX_LENGTH), "info");
@@ -322,7 +338,7 @@ function resolveChildProjectTrust(options: {
 
 export default function (pi: ExtensionAPI) {
   let runtime: SubagentRuntime | undefined;
-  let managerPromise: Promise<SubagentManagerShape> | undefined;
+  let managerPromise: Promise<SubagentManagerApi> | undefined;
   let sessionContext: ExtensionContext | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
@@ -333,7 +349,8 @@ export default function (pi: ExtensionAPI) {
   let browserUI: ExtensionUIContext | undefined;
   let browserRevision = 0;
   let publishedStatus: string | undefined;
-  const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
+  let sessionEpoch = 0;
+  let sessionClosed = false;
 
   const getRuntime = () => (runtime ??= createSubagentRuntime());
 
@@ -343,7 +360,7 @@ export default function (pi: ExtensionAPI) {
       .runPromise(SubagentManager)
       .then((manager) => {
         manager.view.setOnSettled(onSettled);
-        renderView = standardSubagentView(manager.view);
+        renderView = parentSubagentView(manager.view);
         const schedule = () => scheduleObservability(manager);
         unsubStatus?.();
         unsubStatus = manager.view.subscribe(schedule);
@@ -353,14 +370,14 @@ export default function (pi: ExtensionAPI) {
     return managerPromise;
   };
 
-  const standardView = (manager: SubagentManagerShape) =>
-    standardSubagentView(manager.view);
-  const standardSnapshots = (manager: SubagentManagerShape) =>
+  const standardView = (manager: SubagentManagerApi) =>
+    parentSubagentView(manager.view);
+  const standardSnapshots = (manager: SubagentManagerApi) =>
     standardView(manager).list();
-  const standardSnapshot = (manager: SubagentManagerShape, id: string) =>
+  const standardSnapshot = (manager: SubagentManagerApi, id: string) =>
     standardView(manager).get(id);
 
-  const publishSubagentActivity = (manager: SubagentManagerShape) => {
+  const publishSubagentActivity = (manager: SubagentManagerApi) => {
     const active = new Set<`subagent:${string}`>();
     for (const snap of standardSnapshots(manager)) {
       const item = subagentActiveWorkItem(snap);
@@ -391,7 +408,7 @@ export default function (pi: ExtensionAPI) {
         );
       }
     }
-    for (const key of [...publishedActivity.keys()]) {
+    for (const key of publishedActivity.keys()) {
       if (active.has(key)) continue;
       publishedActivity.delete(key);
       pi.events.emit(ACTIVE_WORK_CHANNELS.remove, { version: 1, key });
@@ -415,7 +432,7 @@ export default function (pi: ExtensionAPI) {
     );
   };
 
-  const scheduleObservability = (manager: SubagentManagerShape) => {
+  const scheduleObservability = (manager: SubagentManagerApi) => {
     if (observabilityTimer) return;
     observabilityTimer = setTimeout(() => {
       observabilityTimer = undefined;
@@ -424,13 +441,13 @@ export default function (pi: ExtensionAPI) {
     observabilityTimer.unref?.();
   };
 
-  const refreshObservability = (manager: SubagentManagerShape) => {
+  const refreshObservability = (manager: SubagentManagerApi) => {
     updateStatus(manager);
     publishSubagentActivity(manager);
-    publishBrowserActivity(manager.view.list());
+    publishBrowserActivity(standardSnapshots(manager));
   };
 
-  const updateStatus = (manager: SubagentManagerShape) => {
+  const updateStatus = (manager: SubagentManagerApi) => {
     if (!ui) return;
     const subs = standardSnapshots(manager);
     if (subs.length === 0) {
@@ -449,49 +466,40 @@ export default function (pi: ExtensionAPI) {
     ui.setStatus("subagents", status);
   };
 
-  const deliverResult = (snap: SubagentSnapshot) => {
+  const sendParentResultBatch = (
+    batch: ReadonlyArray<ParentResultEnvelope>,
+  ) => {
     pi.sendMessage(
-      {
-        customType: "subagent-result",
-        content: buildSubagentResultMessage({
-          id: snap.id,
-          title: snap.title,
-          status: snap.status,
-          errorText: snap.errorText,
-          output: truncatedOutput(snap),
-        }),
-        display: true,
-        details: { id: snap.id, title: snap.title, status: snap.status },
-      },
-      { deliverAs: "followUp", triggerTurn: true },
+      buildParentResultBatchMessage(batch),
+      PARENT_RESULT_BATCH_OPTIONS,
     );
   };
 
-  const flushResults = () => {
-    for (const snap of resultDelivery.drain()) deliverResult(snap);
-  };
+  const parentResults = createParentResultCoordinator({
+    sendBatch: sendParentResultBatch,
+  });
 
   const onSettled = (snap: SubagentSnapshot, consumed: boolean) => {
-    publishBrowserActivity(renderView?.list() ?? [], snap);
-    if (snap.resultDelivery === "client") {
+    if (sessionClosed) return;
+    const parentVisible =
+      snap.client === undefined && snap.resultDelivery === "parent";
+    publishBrowserActivity(
+      renderView?.list() ?? [],
+      parentVisible ? snap : undefined,
+    );
+    if (!parentVisible) {
       const event = clientSettlement(snap);
       if (event) pi.events.emit(SUBAGENT_CLIENT_CHANNELS.settled, event);
       return;
     }
-    if (snap.resultDelivery === "none") return;
-    if (consumed) {
-      resultDelivery.consume([snap.id]);
-      return;
-    }
-    // Keep the result retractable while the parent is working. A later
-    // subagent_wait can consume it before agent_settled flushes follow-ups.
-    // Defer a copy: the live snapshot keeps mutating if the subagent is
-    // restarted before the deferred result flushes.
-    resultDelivery.defer({ ...snap, meta: { ...snap.meta } });
-    if (sessionContext?.isIdle()) flushResults();
+    parentResults.onSettled(snap, consumed);
+    if (sessionContext) parentResults.flush(sessionContext);
   };
 
   pi.on("session_start", (_event, ctx) => {
+    sessionEpoch += 1;
+    sessionClosed = false;
+    parentResults.startSession(ctx, sessionEpoch);
     browserUI?.setWidget(BROWSER_ACTIVITY_WIDGET_KEY, undefined);
     sessionContext = ctx;
     ui = ctx.hasUI ? ctx.ui : undefined;
@@ -511,29 +519,25 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("agent_settled", flushResults);
+  pi.on("agent_settled", (_event, ctx) => {
+    parentResults.flush(ctx);
+  });
 
   disposeClientApi = registerSubagentClientApi({
     pi,
     getManager,
     getRuntime,
     getSessionContext: () => sessionContext,
-    resolveChildProjectTrust,
-  });
-
-  registerBtw({
-    pi,
-    getManager,
-    getRuntime,
-    getSessionContext: () => sessionContext,
+    getParentEpoch: () => sessionEpoch,
     resolveChildProjectTrust,
   });
 
   pi.on("session_shutdown", async () => {
+    sessionClosed = true;
+    parentResults.close();
     disposeClientApi?.();
     disposeClientApi = undefined;
     sessionContext = undefined;
-    resultDelivery.clear();
     unsubStatus?.();
     unsubStatus = undefined;
     if (observabilityTimer) clearTimeout(observabilityTimer);
@@ -599,6 +603,7 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`working_dir is not a directory: ${cwd}`);
       }
 
+      const parentRef = captureParentRef(sessionEpoch, ctx.sessionManager);
       const title = params.name.trim().slice(0, 160) || "subagent";
       const snap = await runTool(
         getRuntime(),
@@ -608,6 +613,7 @@ export default function (pi: ExtensionAPI) {
           cwd,
           model: params.model,
           reasoningEffort: params.reasoning_effort,
+          parentRef,
           parent: {
             parentCwd: ctx.cwd,
             projectTrusted: resolveChildProjectTrust({
@@ -647,6 +653,8 @@ export default function (pi: ExtensionAPI) {
       };
     },
     renderCall(args, theme, context) {
+      // SAFETY: this renderer only returns Text components for this tool row,
+      // so a previously rendered component, when present, is a Text.
       const component =
         (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       component.setText(
@@ -657,6 +665,8 @@ export default function (pi: ExtensionAPI) {
       return component;
     },
     renderResult(result, { expanded }, theme, context) {
+      // SAFETY: execute always attaches id/title/cwd/harness/model details,
+      // and the renderer must tolerate restored renders without them.
       const details = result.details as
         | { id?: string; title?: string; harness?: string; cwd?: string }
         | undefined;
@@ -667,6 +677,8 @@ export default function (pi: ExtensionAPI) {
       // this id (throttled — pi backends can emit an event per token) and drop
       // the subscription once the agent settles. Mirrors the bash tool's
       // state.interval + context.invalidate() pattern.
+      // SAFETY: this renderer owns the per-tool-row state it persists in
+      // context.state (unsubActivity handle and lastActivityRefresh timestamp).
       const state = context.state as
         | { unsubActivity?: () => void; lastActivityRefresh?: number }
         | undefined;
@@ -686,6 +698,8 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      // SAFETY: this renderer only returns Text components for this tool row,
+      // so a previously rendered component, when present, is a Text.
       const component =
         (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       if (snapshot) {
@@ -730,6 +744,9 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
+      const waitOwners = ids
+        .map((id) => standardSnapshot(manager, id))
+        .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
       let lastWaitUpdate = 0;
       await runTool(
         getRuntime(),
@@ -765,8 +782,8 @@ export default function (pi: ExtensionAPI) {
       );
 
       // Settlement may have happened before this wait began. Remove any
-      // deferred automatic delivery now that the tool is returning the result.
-      resultDelivery.consume(ids);
+      // automatic delivery now that the tool is returning the result.
+      parentResults.consume(waitOwners);
 
       const sections: string[] = [];
       let remainingBytes = WAIT_OUTPUT_MAX_BYTES;
@@ -839,7 +856,13 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
+      const cancelOwners = ids
+        .map((id) => standardSnapshot(manager, id))
+        .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
       const report = await runTool(getRuntime(), manager.cancel(ids));
+      // Cancellation consumes automatic delivery even when the target had
+      // already settled before this tool call began.
+      parentResults.consume(cancelOwners);
 
       const lines = report.map((entry) =>
         entry.cancelled
@@ -926,14 +949,10 @@ export default function (pi: ExtensionAPI) {
 
   // --- Result message rendering ------------------------------------------
 
-  pi.registerMessageRenderer(
+  pi.registerMessageRenderer<SubagentResultDetails>(
     "subagent-result",
     (message, { expanded }, theme) => {
-      const details = (message.details ?? {}) as {
-        id?: string;
-        title?: string;
-        status?: string;
-      };
+      const details: SubagentResultDetails = message.details ?? {};
       const failed = details.status === "error";
       const icon = failed ? theme.fg("error", "x") : theme.fg("success", "■");
       const header =
@@ -944,8 +963,7 @@ export default function (pi: ExtensionAPI) {
           ` · ${details.title ?? ""} · ${failed ? "failed" : "finished"}`,
         );
 
-      const content =
-        typeof message.content === "string" ? message.content : "";
+      const content = Array.isArray(message.content) ? "" : message.content;
       // Remove only the summary line. The following Error line (when present)
       // is part of the actual result and must remain visible.
       const body = content.split("\n").slice(1).join("\n").trim();
@@ -975,17 +993,68 @@ export default function (pi: ExtensionAPI) {
     },
   );
 
+  pi.registerMessageRenderer<SubagentResultBatchDetails>(
+    "subagent-result-batch",
+    (message, { expanded }, theme) => {
+      const details: SubagentResultBatchDetails = message.details ?? {};
+      const results = details.results ?? [];
+      const content = Array.isArray(message.content) ? "" : message.content;
+      const cards = content.split("\n\n---\n\n");
+      const summary = theme.fg(
+        "accent",
+        theme.bold(
+          `${results.length} subagent result${results.length === 1 ? "" : "s"}`,
+        ),
+      );
+
+      if (expanded) {
+        const md = new Markdown(content, 0, 0, getMarkdownTheme());
+        const container = new Text(summary, 0, 0);
+        return {
+          render: (width: number) => [
+            ...container.render(width),
+            ...md.render(width),
+          ],
+          invalidate: () => {
+            container.invalidate();
+            md.invalidate();
+          },
+        };
+      }
+
+      let text = summary;
+      for (let index = 0; index < results.length; index++) {
+        const result = results[index];
+        if (result === undefined) continue;
+        const failed = result.status === "error";
+        const icon = failed ? theme.fg("error", "x") : theme.fg("success", "■");
+        const header =
+          `${icon} ` +
+          theme.fg("accent", theme.bold(`subagent ${result.id ?? "?"}`)) +
+          theme.fg(
+            "muted",
+            ` · ${result.title ?? ""} · ${failed ? "failed" : "finished"}`,
+          );
+        text += `\n${header}`;
+        const body = (cards[index] ?? "").split("\n").slice(1).join("\n");
+        for (const line of body.split("\n").slice(0, 4)) {
+          if (line.trim()) text += `\n  ${theme.fg("toolOutput", line)}`;
+        }
+        if (body.split("\n").length > 4)
+          text += `\n  ${theme.fg("dim", "... (ctrl+o to expand)")}`;
+      }
+      return new Text(text, 0, 0);
+    },
+  );
+
   // --- Command ------------------------------------------------------------
 
   pi.registerCommand("subagents", {
-    description: "List, inspect, and take over subagents",
+    description: "List, inspect, and take over parent-owned subagents",
     handler: async (_args, ctx) => {
       if (ctx.mode !== "tui") {
-        if (
-          !ctx.hasUI ||
-          typeof ctx.ui.select !== "function" ||
-          typeof ctx.ui.input !== "function"
-        ) {
+        const dialogUI = ctx.ui;
+        if (!ctx.hasUI || !dialogUI.select || !dialogUI.input) {
           if (ctx.hasUI)
             ctx.ui.notify(
               "Subagent takeover is only available in the TUI",
@@ -994,7 +1063,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const manager = await getManager();
-        await runHeadlessSubagentsDialog(ctx.ui, standardView(manager));
+        await runHeadlessSubagentsDialog(dialogUI, standardView(manager));
         return;
       }
       const manager = await getManager();
@@ -1010,7 +1079,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerShortcut("ctrl+shift+a", {
-    description: "Open the subagents dashboard",
+    description: "Open the parent-owned subagents dashboard",
     handler: async (ctx) => {
       if (ctx.mode !== "tui") {
         if (ctx.hasUI)

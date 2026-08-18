@@ -8,22 +8,21 @@ import {
   reconcileDashboardSelection,
   renderDetailHeader,
   renderListPaneRow,
-  takeoverOverlayOptions,
   type DashboardSelection,
 } from "./src/ui/takeover.ts";
 
+// SAFETY: This fixture implements only the Theme methods exercised by takeover rendering.
 const theme = {
   fg: (_color: string, text: string) => text,
   bg: (_color: string, text: string) => text,
   bold: (text: string) => text,
-} as unknown as Theme;
+} as Theme;
 
 function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
   return {
     id: "sa-1",
     backend: "pi",
     owner: "subagents",
-    visibility: "standard",
     resultDelivery: "parent",
     title: "Fix login flow",
     prompt: "fix",
@@ -43,21 +42,6 @@ function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
     ...overrides,
   };
 }
-
-test("standard subagents keep their original full-width presentation", () => {
-  assert.deepEqual(takeoverOverlayOptions(), {
-    anchor: "center",
-    width: "100%",
-    maxHeight: "100%",
-  });
-  assert.deepEqual(takeoverOverlayOptions(true), {
-    anchor: "right-center",
-    width: "78%",
-    minWidth: 72,
-    maxHeight: "100%",
-    margin: 1,
-  });
-});
 
 test("dashboard selection follows its subagent id and falls back by row", () => {
   const selection: DashboardSelection = { id: "sa-7", index: 6 };
@@ -150,14 +134,16 @@ test("dashboard snapshots preserve manager insertion order", () => {
   });
   // "unknown" is not part of SubagentStatus yet, but it must not reorder the
   // stable list if a future status is introduced.
+  // SAFETY: The test intentionally injects a future status to verify stable ordering.
   const unknown = {
     ...snapshot({
       id: "unk",
       createdAt: now - 10_000,
       lastActivityAt: now - 1_000,
     }),
-    status: "unknown",
-  } as unknown as SubagentSnapshot;
+    // SAFETY: This fixture deliberately models an unknown future status for ordering behavior.
+    status: "unknown" as SubagentSnapshot["status"],
+  } as SubagentSnapshot;
 
   assert.deepEqual(
     orderDashboardSnapshots([done, unknown, running, failed]).map((s) => s.id),

@@ -11,17 +11,17 @@ import {
   renderSubagentWaitSummary,
 } from "./src/ui/activity-card.ts";
 
+// SAFETY: This fixture implements only the Theme methods exercised by the activity-card renderer.
 const theme = {
   fg: (_color: string, text: string) => text,
   bold: (text: string) => text,
-} as unknown as Theme;
+} as Theme;
 
 function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
   return {
     id: "sa-3",
     backend: "pi",
     owner: "subagents",
-    visibility: "standard",
     resultDelivery: "parent",
     title: "final-verify",
     prompt: "verify",

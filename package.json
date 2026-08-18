@@ -8,11 +8,12 @@
     "pi-package"
   ],
   "engines": {
-    "node": ">=22.0.0"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "scripts": {
-    "check": "tsc --noEmit",
-    "test": "node --test --experimental-strip-types extensions/subagents/manager.test.ts extensions/subagents/activity-card.test.ts extensions/subagents/browser-protocol.test.ts extensions/subagents/result-delivery.test.ts extensions/subagents/context-usage.test.ts extensions/subagents/reasoning-effort.test.ts extensions/subagents/takeover.test.ts extensions/subagents/headless-dialog.test.ts extensions/subagents/external-shell.test.ts extensions/subagents/pi-session-seed.test.ts extensions/subagents/client-api.test.ts extensions/subagents/btw.test.ts",
+    "lint": "oxlint",
+    "check": "npm run lint && tsc --noEmit",
+    "test": "node --test --experimental-strip-types extensions/subagents/manager.test.ts extensions/subagents/activity-card.test.ts extensions/subagents/browser-protocol.test.ts extensions/subagents/result-delivery.test.ts extensions/subagents/parent-coordinator.test.ts extensions/subagents/context-usage.test.ts extensions/subagents/reasoning-effort.test.ts extensions/subagents/takeover.test.ts extensions/subagents/headless-dialog.test.ts extensions/subagents/client-api.test.ts",
     "test:live": "node --test --experimental-strip-types extensions/subagents/claude.test.ts extensions/subagents/codex.test.ts",
     "format": "prettier --write \"extensions/**/*.ts\" \"skills/**/*.md\" \"*.{json,md}\"",
     "format:check": "prettier --check \"extensions/**/*.ts\" \"skills/**/*.md\" \"*.{json,md}\""
@@ -40,7 +41,9 @@
     "@earendil-works/pi-ai": "^0.80.7",
     "@earendil-works/pi-coding-agent": "^0.80.7",
     "@earendil-works/pi-tui": "^0.80.7",
+    "@oxlint/plugins": "1.79.0",
     "@types/node": "^24.0.0",
+    "oxlint": "1.79.0",
     "prettier": "^3.6.0",
     "typebox": "^1.0.0",
     "typescript": "^5.9.0"

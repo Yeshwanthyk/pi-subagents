@@ -203,26 +203,6 @@ type TakeoverContext = Pick<ExtensionContext, "mode" | "ui">;
 
 export interface TakeoverOptions {
   title?: string;
-  /** Use the narrower right-side overlay reserved for extension-owned sessions. */
-  floating?: boolean;
-  onPopOut?: (id: string) => Promise<boolean>;
-  onCloseSession?: (id: string) => Promise<void>;
-}
-
-export function takeoverOverlayOptions(floating = false) {
-  return floating
-    ? {
-        anchor: "right-center" as const,
-        width: "78%" as const,
-        minWidth: 72,
-        maxHeight: "100%" as const,
-        margin: 1,
-      }
-    : {
-        anchor: "center" as const,
-        width: "100%" as const,
-        maxHeight: "100%" as const,
-      };
 }
 
 export async function openSubagent(
@@ -237,7 +217,6 @@ export async function openSubagent(
       new TakeoverView(tui, theme, keybindings, id, view, done, options),
     {
       overlay: true,
-      overlayOptions: takeoverOverlayOptions(options.floating),
     },
   );
 }
@@ -268,7 +247,6 @@ export async function openSubagentPicker(
         ),
       {
         overlay: true,
-        overlayOptions: takeoverOverlayOptions(options.floating),
       },
     );
 
@@ -432,11 +410,6 @@ class SubagentDashboard implements Component {
         if (snap?.status === "running") this.view.requestAbort(snap.id);
         return;
       }
-      if (data === "o" && this.options.onPopOut) {
-        const snap = subs[this.selection.index];
-        if (snap) void this.options.onPopOut(snap.id);
-        return;
-      }
       if (this.keybindings.matches(data, "tui.editor.cursorUp")) {
         this.detailScrollOffset += TRANSCRIPT_SCROLL_STEP;
         this.scheduleRender();
@@ -483,17 +456,10 @@ class SubagentDashboard implements Component {
       }
       return;
     }
-    if (data === "o" && this.options.onPopOut) {
-      const snap = subs[this.selection.index];
-      if (snap) void this.options.onPopOut(snap.id);
-      return;
-    }
     if (data === "x") {
       const snap = subs[this.selection.index];
       if (!snap) return;
-      if (this.options.onCloseSession)
-        void this.options.onCloseSession(snap.id);
-      else if (snap.status === "running") this.view.requestAbort(snap.id);
+      if (snap.status === "running") this.view.requestAbort(snap.id);
       return;
     }
   }
@@ -625,14 +591,11 @@ class SubagentDashboard implements Component {
 
   private helpLine(): string {
     const keys = this.keybindings;
-    if (this.narrow() || this.options.floating) {
-      return this.options.floating
-        ? `  ${configuredKeys(keys, "tui.select.up")}/${configuredKeys(keys, "tui.select.down")}/jk select · ${configuredKeys(keys, "tui.select.confirm")} open${this.options.onPopOut ? " · o shell" : ""} · x ${this.options.onCloseSession ? "close" : "abort"} · ${configuredKeys(keys, "tui.select.cancel")} back`
-        : `  ${configuredKeys(keys, "tui.select.up")}/${configuredKeys(keys, "tui.select.down")}/jk select · ${configuredKeys(keys, "tui.select.confirm")} take over · x abort · ${configuredKeys(keys, "tui.select.cancel")} close`;
-    }
+    if (this.narrow())
+      return `  ${configuredKeys(keys, "tui.select.up")}/${configuredKeys(keys, "tui.select.down")}/jk select · ${configuredKeys(keys, "tui.select.confirm")} take over · x abort · ${configuredKeys(keys, "tui.select.cancel")} close`;
     return this.focusPane === "detail"
-      ? `  tab list · ⏎ send steer · ${configuredKeys(keys, "tui.editor.cursorUp")}/${configuredKeys(keys, "tui.editor.cursorDown")} scroll · ${configuredKeys(keys, "app.clear")} abort run${this.options.onPopOut ? " · o shell" : ""} · ${configuredKeys(keys, "tui.select.cancel")} back to list`
-      : `  ${configuredKeys(keys, "tui.select.up")}/${configuredKeys(keys, "tui.select.down")}/jk select · tab detail · x abort${this.options.onPopOut ? " · o shell" : ""} · ${configuredKeys(keys, "tui.select.cancel")} close`;
+      ? `  tab list · ⏎ send steer · ${configuredKeys(keys, "tui.editor.cursorUp")}/${configuredKeys(keys, "tui.editor.cursorDown")} scroll · ${configuredKeys(keys, "app.clear")} abort run · ${configuredKeys(keys, "tui.select.cancel")} back to list`
+      : `  ${configuredKeys(keys, "tui.select.up")}/${configuredKeys(keys, "tui.select.down")}/jk select · tab detail · x abort · ${configuredKeys(keys, "tui.select.cancel")} close`;
   }
 
   /** Left pane: compact 2-line rows with a scroll window around the selection. */
@@ -769,7 +732,6 @@ class TakeoverView implements Component, Focusable {
   private options: TakeoverOptions;
 
   private input = new Input();
-  private poppingOut = false;
   /** Scroll offset in lines from the bottom of the transcript. 0 = pinned to bottom. */
   private scrollOffset = 0;
   private unsubscribe: () => void;
@@ -848,18 +810,6 @@ class TakeoverView implements Component, Focusable {
   }
 
   handleInput(data: string): void {
-    if (data === "o" && this.options.onPopOut && !this.poppingOut) {
-      this.poppingOut = true;
-      this.tui.requestRender();
-      void this.options.onPopOut(this.id).then((opened) => {
-        if (opened) this.close();
-        else {
-          this.poppingOut = false;
-          this.scheduleRender();
-        }
-      });
-      return;
-    }
     if (this.keybindings.matches(data, "app.clear")) {
       const snap = this.snap();
       if (snap?.status === "running") this.view.requestAbort(this.id);
@@ -972,9 +922,7 @@ class TakeoverView implements Component, Focusable {
 
     lines.push(border);
     lines.push(...this.input.render(width));
-    const help = this.options.floating
-      ? `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back${this.options.onPopOut ? ` · o ${this.poppingOut ? "opening…" : "shell"}` : ""} · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll`
-      : `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page`;
+    const help = `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page`;
     lines.push(truncateToWidth(theme.fg("dim", help), width));
     lines.push(border);
     return lines;

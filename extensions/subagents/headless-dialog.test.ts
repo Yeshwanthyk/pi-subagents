@@ -15,7 +15,6 @@ function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
     id: "sa-1",
     backend: "pi",
     owner: "subagents",
-    visibility: "standard",
     resultDelivery: "parent",
     title: "Test agent",
     prompt: "test",
@@ -103,17 +102,41 @@ test("RPC command without dialogs keeps the TUI-only notification fallback", asy
     | undefined;
   const pi = {
     on() {},
-    events: { on() {}, emit() {} },
     registerTool() {},
-    registerMessageRenderer() {},
-    registerShortcut() {},
     registerCommand(name: string, command: { handler: typeof commandHandler }) {
       if (name === "subagents") commandHandler = command.handler;
     },
-  } as unknown as ExtensionAPI;
+    registerShortcut() {},
+    registerFlag() {},
+    getFlag: () => undefined,
+    registerMessageRenderer() {},
+    registerEntryRenderer() {},
+    sendMessage() {},
+    sendUserMessage() {},
+    appendEntry() {},
+    setSessionName() {},
+    getSessionName: () => undefined,
+    setLabel() {},
+    exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    getActiveTools: () => [],
+    getAllTools: () => [],
+    setActiveTools() {},
+    getCommands: () => [],
+    setModel: async () => false,
+    getThinkingLevel: () => "high",
+    setThinkingLevel() {},
+    registerProvider() {},
+    unregisterProvider() {},
+    events: {
+      on: () => () => {},
+      emit() {},
+    },
+  } satisfies ExtensionAPI;
   subagentsExtension(pi);
 
   const notifications: Array<[string, string | undefined]> = [];
+  // SAFETY: This fixture implements the command-context fields read by the
+  // RPC command handler (mode, hasUI, and the ui.notify surface).
   const ctx = {
     mode: "rpc",
     hasUI: true,
@@ -122,7 +145,7 @@ test("RPC command without dialogs keeps the TUI-only notification fallback", asy
         notifications.push([message, type]);
       },
     },
-  } as unknown as ExtensionCommandContext;
+  } as ExtensionCommandContext;
 
   assert.ok(commandHandler);
   await commandHandler("", ctx);

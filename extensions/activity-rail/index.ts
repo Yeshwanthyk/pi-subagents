@@ -7,49 +7,22 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import {
   ACTIVE_WORK_CHANNELS,
   type ActiveWorkItem,
-  type ActiveWorkRemoval,
+  type ActivityProtocolBoundary,
+  parseActiveWorkItem,
+  parseActiveWorkRemoval,
 } from "../subagents/src/activity-protocol.ts";
 
 const MAX_VISIBLE = 3;
 const MAX_FLASH = 1;
 const FLASH_TTL_MS = 20_000;
 const COALESCE_MS = 100;
+type EventPayload = Parameters<Parameters<ExtensionAPI["events"]["on"]>[1]>[0];
 
 interface SettleFlash {
   status: "done" | "error";
   title: string;
   ops?: number;
   settledAt: number;
-}
-
-function validItem(value: unknown): value is ActiveWorkItem {
-  if (!value || typeof value !== "object") return false;
-  const item = value as Partial<ActiveWorkItem>;
-  return (
-    item.version === 1 &&
-    (item.kind === "subagent" || item.kind === "workflow") &&
-    typeof item.key === "string" &&
-    item.key.startsWith(`${item.kind}:`) &&
-    typeof item.label === "string" &&
-    (item.status === "running" || item.status === "quiet") &&
-    typeof item.summary === "string" &&
-    typeof item.runningProcesses === "number" &&
-    Number.isFinite(item.runningProcesses) &&
-    typeof item.startedAt === "number" &&
-    Number.isFinite(item.startedAt) &&
-    typeof item.lastActivityAt === "number" &&
-    Number.isFinite(item.lastActivityAt)
-  );
-}
-
-function validRemoval(value: unknown): value is ActiveWorkRemoval {
-  if (!value || typeof value !== "object") return false;
-  const removal = value as Partial<ActiveWorkRemoval>;
-  return (
-    removal.version === 1 &&
-    typeof removal.key === "string" &&
-    (removal.key.startsWith("subagent:") || removal.key.startsWith("workflow:"))
-  );
 }
 
 function age(timestamp: number, now: number) {
@@ -103,7 +76,7 @@ function itemLine(
     item.completedOperations && item.completedOperations > 0
       ? `${item.completedOperations} ops`
       : undefined,
-    typeof item.contextPercent === "number"
+    item.contextPercent !== undefined
       ? `ctx ${item.contextPercent}%`
       : undefined,
   ]
@@ -132,7 +105,7 @@ function flashLine(
   const ok = flash.status === "done";
   const glyph = theme.fg(ok ? "success" : "error", ok ? "✓" : "✕");
   const meta = [
-    typeof flash.ops === "number" ? `${flash.ops} ops` : undefined,
+    flash.ops !== undefined ? `${flash.ops} ops` : undefined,
     age(flash.settledAt, now),
   ]
     .filter(Boolean)
@@ -225,27 +198,31 @@ export default function activityRail(pi: ExtensionAPI) {
 
   const unsubscribeUpdate = pi.events.on(
     ACTIVE_WORK_CHANNELS.update,
-    (value: unknown) => {
-      if (!ui || !validItem(value)) return;
-      items.set(value.key, value);
+    (value: EventPayload) => {
+      // SAFETY: the parser validates the event payload against the public protocol schema.
+      const item = parseActiveWorkItem(value as ActivityProtocolBoundary);
+      if (!ui || !item) return;
+      items.set(item.key, item);
       schedule();
     },
   );
   const unsubscribeRemove = pi.events.on(
     ACTIVE_WORK_CHANNELS.remove,
-    (value: unknown) => {
-      if (!ui || !validRemoval(value)) return;
-      if (value.status === "done" || value.status === "error") {
-        flashes.set(value.key, {
-          status: value.status,
-          title: value.title ?? value.key,
-          ops: value.ops,
-          settledAt: value.settledAt ?? Date.now(),
+    (value: EventPayload) => {
+      // SAFETY: the parser validates the event payload against the public protocol schema.
+      const removal = parseActiveWorkRemoval(value as ActivityProtocolBoundary);
+      if (!ui || !removal) return;
+      if (removal.status === "done" || removal.status === "error") {
+        flashes.set(removal.key, {
+          status: removal.status,
+          title: removal.title ?? removal.key,
+          ops: removal.ops,
+          settledAt: removal.settledAt ?? Date.now(),
         });
       } else {
-        flashes.delete(value.key);
+        flashes.delete(removal.key);
       }
-      items.delete(value.key);
+      items.delete(removal.key);
       schedule();
     },
   );

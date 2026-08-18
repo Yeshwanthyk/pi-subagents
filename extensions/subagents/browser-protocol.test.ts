@@ -17,7 +17,6 @@ function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
     id: "sa-1",
     backend: "claude",
     owner: "subagents",
-    visibility: "standard",
     resultDelivery: "parent",
     title: "Browser fixture",
     prompt: "Inspect the repository",
@@ -43,7 +42,7 @@ function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
   };
 }
 
-test("browser projection is public, bounded, and caps live standard children", () => {
+test("browser projection is public, bounded, and caps live children", () => {
   const running = Array.from({ length: 6 }, (_, index) =>
     snapshot({
       id: `sa-${index + 1}`,
@@ -74,11 +73,6 @@ test("browser projection is public, bounded, and caps live standard children", (
       ],
     }),
   );
-  const privateChild = snapshot({
-    id: "sa-private",
-    visibility: "private",
-    owner: "btw",
-  });
   const terminal = snapshot({
     id: "sa-finished",
     status: "error",
@@ -88,7 +82,7 @@ test("browser projection is public, bounded, and caps live standard children", (
   });
 
   const projected = projectBrowserActivity(
-    [...running, privateChild, terminal],
+    [...running, terminal],
     7,
     terminal,
     4_000,
@@ -125,11 +119,73 @@ test("browser projection is public, bounded, and caps live standard children", (
     Buffer.byteLength(encoded, "utf8") <=
       BROWSER_ACTIVITY_LIMITS.maxSnapshotBytes,
   );
-  assert.doesNotMatch(encoded, /sessionFilePath|nativeSessionId|cwd|owner|btw/);
+  assert.doesNotMatch(encoded, /sessionFilePath|nativeSessionId|cwd|owner/);
   assert.equal(encoded, JSON.stringify(JSON.parse(encoded)));
   assert.deepEqual(decodeBrowserActivitySnapshot(encoded), JSON.parse(encoded));
   assert.deepEqual(encodeBrowserActivityWidget(projected), [encoded]);
   assert.equal(BROWSER_ACTIVITY_WIDGET_KEY, "pi-subagents/activity/v1");
+});
+
+test("transcript variants reject undeclared fields", () => {
+  const projected = projectBrowserActivity(
+    [
+      snapshot({
+        transcript: [
+          { kind: "user", text: "user prompt" },
+          {
+            kind: "assistant",
+            parts: [
+              { type: "text", text: "assistant response" },
+              { type: "thinking", text: "private reasoning", redacted: true },
+              {
+                type: "toolCall",
+                toolId: "tool-1",
+                name: "bash",
+                argsPreview: "ls",
+              },
+            ],
+          },
+          {
+            kind: "toolResult",
+            toolId: "tool-1",
+            name: "bash",
+            isError: false,
+            outputPreview: "files",
+          },
+        ],
+      }),
+    ],
+    1,
+    undefined,
+    10_000,
+  );
+  assert.equal(isBrowserActivitySnapshot(projected), true);
+  assert.deepEqual(projected.children[0]?.transcript, [
+    { kind: "user", text: "user prompt" },
+    { kind: "assistant", text: "assistant response" },
+    { kind: "thinking", text: "private reasoning", redacted: true },
+    { kind: "tool", name: "bash", args: "ls" },
+    { kind: "tool", name: "bash", output: "files", isError: false },
+  ]);
+
+  const child = projected.children[0];
+  assert.ok(child);
+  for (const item of child.transcript) {
+    const unsafe = {
+      ...projected,
+      children: [
+        {
+          ...child,
+          transcript: [{ ...item, cwd: "/secret" }],
+        },
+      ],
+    };
+    assert.equal(isBrowserActivitySnapshot(unsafe), false);
+    assert.equal(
+      decodeBrowserActivitySnapshot(JSON.stringify(unsafe)),
+      undefined,
+    );
+  }
 });
 
 test("browser protocol rejects unsafe or unbounded payload shapes", () => {
@@ -158,6 +214,37 @@ test("browser protocol rejects unsafe or unbounded payload shapes", () => {
   assert.equal(isBrowserActivitySnapshot(oversized), false);
   assert.equal(decodeBrowserActivitySnapshot("not json"), undefined);
   assert.equal(decodeBrowserActivitySnapshot(["{}", "extra"]), undefined);
+});
+
+test("browser protocol rejects unsafe revisions and oversized direct objects", () => {
+  const projected = projectBrowserActivity(
+    Array.from({ length: 4 }, (_, index) =>
+      snapshot({
+        id: `sa-${index + 1}`,
+        finalText: "x".repeat(BROWSER_ACTIVITY_LIMITS.maxOutputLength),
+      }),
+    ),
+    1,
+    undefined,
+    10_000,
+  );
+  const unsafeRevision = {
+    ...projected,
+    revision: Number.MAX_SAFE_INTEGER + 1,
+  };
+  assert.equal(isBrowserActivitySnapshot(unsafeRevision), false);
+  assert.equal(decodeBrowserActivitySnapshot(unsafeRevision), undefined);
+
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(projected), "utf8") >
+      BROWSER_ACTIVITY_LIMITS.maxSnapshotBytes,
+  );
+  assert.equal(isBrowserActivitySnapshot(projected), false);
+  assert.equal(decodeBrowserActivitySnapshot(projected), undefined);
+  assert.equal(
+    decodeBrowserActivitySnapshot(JSON.stringify(projected)),
+    undefined,
+  );
 });
 
 test("terminal projection carries one bounded final status/output/failure", () => {

@@ -12,14 +12,20 @@ import { Effect, Layer, ManagedRuntime } from "effect";
 import { BackendRegistry, type SubagentBackend } from "./src/backend.ts";
 import { piBackend } from "./src/backends/pi.ts";
 import { makeStubBackend } from "./src/backends/stub.ts";
-import type { BackendName, ParentContext, SpawnTask } from "./src/domain.ts";
+import type {
+  BackendName,
+  ParentContext,
+  SpawnTask,
+  SubagentSnapshot,
+} from "./src/domain.ts";
 import {
-  scopedSubagentView,
-  standardSubagentView,
   SubagentManager,
   SubagentManagerLive,
-  type SubagentManagerShape,
+  parentSubagentView,
+  type SubagentManagerApi,
 } from "./src/manager.ts";
+import { createParentResultCoordinator } from "./src/parent-coordinator.ts";
+import type { ParentSessionManager } from "./src/parent-ref.ts";
 import { runTool } from "./src/runtime.ts";
 
 const TestRegistryLive = Layer.sync(BackendRegistry, () => {
@@ -61,7 +67,7 @@ function task(prompt: string): SpawnTask {
 
 async function withManager(
   run: (
-    manager: SubagentManagerShape,
+    manager: SubagentManagerApi,
     runtime: ReturnType<typeof createTestRuntime>,
   ) => Promise<void>,
 ) {
@@ -72,6 +78,20 @@ async function withManager(
   } finally {
     await runtime.dispose();
   }
+}
+
+async function waitForSettlement(
+  manager: SubagentManagerApi,
+  id: string,
+): Promise<SubagentSnapshot> {
+  const deadline = Date.now() + 3_000;
+  while (manager.view.get(id)?.status === "running" && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const snapshot = manager.view.get(id);
+  assert.ok(snapshot);
+  assert.notEqual(snapshot.status, "running");
+  return snapshot;
 }
 
 test("stub subagent completes and delivers a final result", async () => {
@@ -101,6 +121,34 @@ test("stub subagent completes and delivers a final result", async () => {
     assert.ok(done.transcript.some((item) => item.kind === "toolResult"));
     // The waitFor marked the settle as consumed.
     assert.deepEqual(settled, [{ id: snap.id, consumed: true }]);
+  });
+});
+test("listener re-subscription waits for the next notification pass", async () => {
+  await withManager(async (manager, runtime) => {
+    const calls: string[] = [];
+    let unsubscribeFirst = () => {};
+    const second = () => calls.push("second");
+    const first = () => {
+      calls.push("first");
+      unsubscribeFirst();
+      manager.view.subscribe(second);
+    };
+    unsubscribeFirst = manager.view.subscribe(first);
+
+    await assert.rejects(
+      runTool(runtime, manager.spawn("pi", task("missing model registry"))),
+      /model registry/,
+    );
+    assert.deepEqual(calls, ["first"]);
+
+    await assert.rejects(
+      runTool(
+        runtime,
+        manager.spawn("pi", task("missing model registry again")),
+      ),
+      /model registry/,
+    );
+    assert.deepEqual(calls, ["first", "second"]);
   });
 });
 
@@ -236,7 +284,7 @@ test("idle restarts respect the concurrency cap", async () => {
   });
 });
 
-test("settled client agents cannot restart from the standard view", async () => {
+test("settled client agents cannot restart from the manager view", async () => {
   await withManager(async (manager, runtime) => {
     const snap = await runTool(
       runtime,
@@ -249,56 +297,10 @@ test("settled client agents cannot restart from the standard view", async () => 
     );
     await runTool(runtime, manager.waitFor([snap.id]));
 
-    standardSubagentView(manager.view).requestSend(snap.id, "run again");
+    manager.view.requestSend(snap.id, "run again");
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     assert.equal(manager.view.get(snap.id)?.status, "done");
-  });
-});
-
-test("private owners stay out of the standard view and can be released", async () => {
-  await withManager(async (manager, runtime) => {
-    const snap = await runTool(
-      runtime,
-      manager.spawn("claude", {
-        ...task("Side question"),
-        owner: "btw",
-        visibility: "private",
-        resultDelivery: "none",
-        tools: ["read"],
-      }),
-    );
-
-    assert.equal(standardSubagentView(manager.view).size(), 0);
-    assert.equal(
-      scopedSubagentView(manager.view, "btw").get(snap.id)?.owner,
-      "btw",
-    );
-    assert.deepEqual(
-      scopedSubagentView(manager.view, "btw").get(snap.id)?.tools,
-      ["read"],
-    );
-
-    await runTool(runtime, manager.waitFor([snap.id]));
-    const released = await runTool(runtime, manager.release(snap.id));
-    assert.equal(released?.id, snap.id);
-    assert.equal(manager.view.get(snap.id), undefined);
-  });
-});
-
-test("only one concurrent release wins session ownership", async () => {
-  await withManager(async (manager, runtime) => {
-    const snap = await runTool(
-      runtime,
-      manager.spawn("claude", task("Transfer me")),
-    );
-    await runTool(runtime, manager.waitFor([snap.id]));
-    const [first, second] = await Promise.all([
-      runTool(runtime, manager.release(snap.id)),
-      runTool(runtime, manager.release(snap.id)),
-    ]);
-    assert.equal([first, second].filter(Boolean).length, 1);
-    assert.equal(manager.view.get(snap.id), undefined);
   });
 });
 
@@ -321,5 +323,81 @@ test("send steers an idle subagent into another turn", async () => {
     const afterSecond = manager.view.get(snap.id);
     assert.equal(afterSecond?.status, "done");
     assert.match(afterSecond?.finalText ?? "", /Second turn/);
+  });
+});
+
+test("parent-facing view hides client-correlated jobs while the full view retains them", async () => {
+  await withManager(async (manager, runtime) => {
+    const parentRun = await runTool(
+      runtime,
+      manager.spawn("claude", task("parent-owned task")),
+    );
+    const clientRun = await runTool(
+      runtime,
+      manager.spawn("claude", {
+        ...task("client-owned task"),
+        owner: "client-owner",
+        resultDelivery: "client",
+        client: { id: "client-owner", correlationId: "run-1" },
+      }),
+    );
+
+    const parentView = parentSubagentView(manager.view);
+    assert.deepEqual(
+      parentView.list().map((snapshot) => snapshot.id),
+      [parentRun.id],
+    );
+    assert.equal(parentView.get(clientRun.id), undefined);
+    assert.equal(manager.view.get(clientRun.id)?.client?.id, "client-owner");
+
+    await runTool(runtime, manager.cancel([parentRun.id, clientRun.id]));
+  });
+});
+
+test("manager settlement seam never sends client jobs through the parent coordinator", async () => {
+  await withManager(async (manager, runtime) => {
+    const sessionManager: ParentSessionManager = {
+      getSessionFile: () => "/parent/session.jsonl",
+      getLeafId: () => "leaf-1",
+      getBranch: () => [{ id: "root" }, { id: "leaf-1" }],
+    };
+    const context = { sessionManager, isIdle: () => true };
+    const sent: string[] = [];
+    const coordinator = createParentResultCoordinator({
+      sendBatch: (batch) => sent.push(...batch.map((result) => result.id)),
+    });
+    coordinator.startSession(context, 12);
+    manager.view.setOnSettled((snapshot, consumed) =>
+      coordinator.onSettled(snapshot, consumed),
+    );
+
+    const parentRef = {
+      epoch: 12,
+      sessionFile: "/parent/session.jsonl",
+      leafId: "leaf-1",
+    } as const;
+    const parentRun = await runTool(
+      runtime,
+      manager.spawn("claude", {
+        ...task("parent result"),
+        parentRef,
+      }),
+    );
+    const clientRun = await runTool(
+      runtime,
+      manager.spawn("claude", {
+        ...task("client result"),
+        resultDelivery: "client",
+        client: { id: "client-owner", correlationId: "run-2" },
+        parentRef,
+      }),
+    );
+
+    await waitForSettlement(manager, parentRun.id);
+    assert.equal(coordinator.flush(context), true);
+    await waitForSettlement(manager, clientRun.id);
+    assert.equal(coordinator.flush(context), false);
+    assert.deepEqual(sent, [parentRun.id]);
+    assert.equal(coordinator.mailbox.size(), 0);
   });
 });

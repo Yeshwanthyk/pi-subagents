@@ -4,27 +4,42 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Compile } from "typebox/compile";
+import { Type, type Static } from "typebox";
 import {
   BACKEND_NAMES,
-  isReasoningEffort,
-  type BackendName,
+  REASONING_EFFORTS,
   type SubagentSnapshot,
 } from "./domain.ts";
-import type { SubagentManagerShape } from "./manager.ts";
+import type { SubagentManagerApi } from "./manager.ts";
 import {
   SUBAGENT_CLIENT_CHANNELS,
   SUBAGENT_CLIENT_PROTOCOL_VERSION,
+  type SubagentClientCancelRequest,
+  type SubagentClientListRequest,
   type SubagentClientReply,
   type SubagentClientSettledEvent,
   type SubagentClientSnapshot,
+  type SubagentClientSpawnRequest,
 } from "./client-protocol.ts";
 import { runTool, type SubagentRuntime } from "./runtime.ts";
+import { captureParentRef, type ParentSessionManager } from "./parent-ref.ts";
+
+export interface SubagentClientSessionContext {
+  readonly cwd: string;
+  readonly sessionManager: ParentSessionManager;
+  readonly model: ExtensionContext["model"];
+  readonly modelRegistry: ExtensionContext["modelRegistry"];
+  isProjectTrusted(): boolean;
+}
 
 export interface SubagentClientApiOptions {
   pi: ExtensionAPI;
-  getManager(): Promise<SubagentManagerShape>;
+  getManager(): Promise<SubagentManagerApi>;
   getRuntime(): SubagentRuntime;
-  getSessionContext(): ExtensionContext | undefined;
+  getSessionContext(): SubagentClientSessionContext | undefined;
+  /** Current extension session epoch, generated at session_start. */
+  getParentEpoch(): number;
   resolveChildProjectTrust(options: {
     parentCwd: string;
     childCwd: string;
@@ -32,18 +47,111 @@ export interface SubagentClientApiOptions {
   }): boolean;
 }
 
+/**
+ * Wire schemas for the client event protocol. Each channel payload is decoded
+ * at the event boundary: the raw event-bus value is validated against the
+ * schema before any handler observes a field.
+ */
+const ClientPingRequestSchema = Type.Object({
+  requestId: Type.Optional(Type.String()),
+});
+const ClientSpawnRequestSchema = Type.Object({
+  requestId: Type.String(),
+  clientId: Type.String(),
+  correlationId: Type.String(),
+  harness: Type.Union(BACKEND_NAMES.map((name) => Type.Literal(name))),
+  name: Type.String(),
+  prompt: Type.String(),
+  cwd: Type.Optional(Type.String()),
+  model: Type.Optional(Type.String()),
+  reasoningEffort: Type.Optional(
+    Type.Union(REASONING_EFFORTS.map((effort) => Type.Literal(effort))),
+  ),
+});
+const ClientCancelRequestSchema = Type.Object({
+  requestId: Type.String(),
+  clientId: Type.String(),
+  agentId: Type.String(),
+});
+const ClientListRequestSchema = Type.Object({
+  requestId: Type.String(),
+  clientId: Type.String(),
+});
+
+const PingRequestValidator = Compile(ClientPingRequestSchema);
+const SpawnRequestValidator = Compile(ClientSpawnRequestSchema);
+const CancelRequestValidator = Compile(ClientCancelRequestSchema);
+const ListRequestValidator = Compile(ClientListRequestSchema);
+
+/** Decoded wire payloads accepted on the client request channels. */
+export type ClientRequestBoundary =
+  | Static<typeof ClientPingRequestSchema>
+  | Static<typeof ClientSpawnRequestSchema>
+  | Static<typeof ClientCancelRequestSchema>
+  | Static<typeof ClientListRequestSchema>;
+
+export interface SubagentClientPingRequest {
+  requestId?: string;
+}
+
+export function decodeClientPingRequest(
+  value: ClientRequestBoundary,
+): SubagentClientPingRequest {
+  if (!PingRequestValidator.Check(value)) {
+    throw new Error("Invalid subagents client ping request.");
+  }
+  return value;
+}
+
+export function decodeClientSpawnRequest(
+  value: ClientRequestBoundary,
+): SubagentClientSpawnRequest {
+  if (!SpawnRequestValidator.Check(value)) {
+    throw new Error("Invalid subagents client spawn request.");
+  }
+  return value;
+}
+
+export function decodeClientCancelRequest(
+  value: ClientRequestBoundary,
+): SubagentClientCancelRequest {
+  if (!CancelRequestValidator.Check(value)) {
+    throw new Error("Invalid subagents client cancel request.");
+  }
+  return value;
+}
+
+export function decodeClientListRequest(
+  value: ClientRequestBoundary,
+): SubagentClientListRequest {
+  if (!ListRequestValidator.Check(value)) {
+    throw new Error("Invalid subagents client list request.");
+  }
+  return value;
+}
+
+/**
+ * Best-effort request correlation for error replies whose full request decode
+ * failed: only a string requestId can route a reply, and any other value is
+ * dropped exactly like the previous boundary guard.
+ */
+function errorRequestId(payload: ClientRequestBoundary): string | undefined {
+  if (!PingRequestValidator.Check(payload)) return undefined;
+  return payload.requestId;
+}
+
 function reply<T>(
   pi: ExtensionAPI,
   channel: string,
-  requestId: unknown,
+  requestId: string | undefined,
   value: SubagentClientReply<T>,
 ) {
-  if (typeof requestId !== "string" || requestId.length === 0) return;
+  if (requestId === undefined || requestId.length === 0) return;
   pi.events.emit(`${channel}:reply:${requestId}`, value);
 }
 
-function requiredString(value: unknown, name: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
+function requiredString(value: string, name: string): string {
+  if (value.trim().length === 0) {
     throw new Error(`${name} is required.`);
   }
   return value.trim();
@@ -100,24 +208,38 @@ export function registerSubagentClientApi(
 ): () => void {
   const { pi } = options;
   const unsubscribers: Array<() => void> = [];
-  const on = (channel: string, handler: (raw: unknown) => void) => {
-    unsubscribers.push(pi.events.on(channel, handler));
+  const on = (
+    channel: string,
+    handler: (payload: ClientRequestBoundary) => Promise<void> | void,
+  ) => {
+    unsubscribers.push(
+      pi.events.on(channel, (raw) => {
+        // SAFETY: each handler decodes the raw event payload against its
+        // client protocol schema before reading request fields. Malformed
+        // payloads may be ignored when no valid request id can be recovered.
+        void handler(raw as ClientRequestBoundary);
+      }),
+    );
   };
 
-  on(SUBAGENT_CLIENT_CHANNELS.ping, (raw) => {
-    const requestId = (raw as { requestId?: unknown })?.requestId;
-    reply(pi, SUBAGENT_CLIENT_CHANNELS.ping, requestId, {
-      success: true,
-      data: {
-        version: SUBAGENT_CLIENT_PROTOCOL_VERSION,
-        harnesses: [...BACKEND_NAMES],
-      },
-    });
+  on(SUBAGENT_CLIENT_CHANNELS.ping, (payload) => {
+    try {
+      const request = decodeClientPingRequest(payload);
+      reply(pi, SUBAGENT_CLIENT_CHANNELS.ping, request.requestId, {
+        success: true,
+        data: {
+          version: SUBAGENT_CLIENT_PROTOCOL_VERSION,
+          harnesses: [...BACKEND_NAMES],
+        },
+      });
+    } catch {
+      // Malformed ping payloads are ignored; a well-behaved client re-pings.
+    }
   });
 
-  on(SUBAGENT_CLIENT_CHANNELS.spawn, async (raw) => {
-    const request = raw as Record<string, unknown>;
+  on(SUBAGENT_CLIENT_CHANNELS.spawn, async (payload) => {
     try {
+      const request = decodeClientSpawnRequest(payload);
       const sessionContext = options.getSessionContext();
       if (!sessionContext) throw new Error("No active parent session.");
       const clientId = requiredString(request.clientId, "clientId");
@@ -127,20 +249,6 @@ export function registerSubagentClientApi(
       );
       const name = requiredString(request.name, "name").slice(0, 160);
       const prompt = requiredString(request.prompt, "prompt");
-      if (
-        typeof request.harness !== "string" ||
-        !BACKEND_NAMES.includes(request.harness as BackendName)
-      ) {
-        throw new Error(`Unsupported harness: ${String(request.harness)}.`);
-      }
-      if (
-        request.reasoningEffort !== undefined &&
-        !isReasoningEffort(request.reasoningEffort)
-      ) {
-        throw new Error(
-          `Unsupported reasoning effort: ${String(request.reasoningEffort)}.`,
-        );
-      }
       const manager = await options.getManager();
       const duplicate = manager.view
         .list()
@@ -157,27 +265,26 @@ export function registerSubagentClientApi(
         return;
       }
 
-      const cwd = path.resolve(
-        sessionContext.cwd,
-        typeof request.cwd === "string" ? request.cwd : ".",
-      );
+      const cwd = path.resolve(sessionContext.cwd, request.cwd ?? ".");
       if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
         throw new Error(`cwd is not a directory: ${cwd}`);
       }
+      const parentRef = captureParentRef(
+        options.getParentEpoch(),
+        sessionContext.sessionManager,
+      );
       const snapshot = await runTool(
         options.getRuntime(),
-        manager.spawn(request.harness as BackendName, {
+        manager.spawn(request.harness, {
           title: name,
           prompt,
           cwd,
           owner: clientId,
-          visibility: "standard",
           resultDelivery: "client",
           client: { id: clientId, correlationId },
-          model: typeof request.model === "string" ? request.model : undefined,
-          reasoningEffort: isReasoningEffort(request.reasoningEffort)
-            ? request.reasoningEffort
-            : undefined,
+          parentRef,
+          model: request.model,
+          reasoningEffort: request.reasoningEffort,
           parent: {
             parentCwd: sessionContext.cwd,
             projectTrusted: options.resolveChildProjectTrust({
@@ -201,16 +308,16 @@ export function registerSubagentClientApi(
         data: clientSnapshot(snapshot),
       });
     } catch (error) {
-      reply(pi, SUBAGENT_CLIENT_CHANNELS.spawn, request.requestId, {
+      reply(pi, SUBAGENT_CLIENT_CHANNELS.spawn, errorRequestId(payload), {
         success: false,
         error: error instanceof Error ? error.message : String(error),
       });
     }
   });
 
-  on(SUBAGENT_CLIENT_CHANNELS.cancel, async (raw) => {
-    const request = raw as Record<string, unknown>;
+  on(SUBAGENT_CLIENT_CHANNELS.cancel, async (payload) => {
     try {
+      const request = decodeClientCancelRequest(payload);
       const clientId = requiredString(request.clientId, "clientId");
       const agentId = requiredString(request.agentId, "agentId");
       const manager = await options.getManager();
@@ -227,16 +334,16 @@ export function registerSubagentClientApi(
         data: result,
       });
     } catch (error) {
-      reply(pi, SUBAGENT_CLIENT_CHANNELS.cancel, request.requestId, {
+      reply(pi, SUBAGENT_CLIENT_CHANNELS.cancel, errorRequestId(payload), {
         success: false,
         error: error instanceof Error ? error.message : String(error),
       });
     }
   });
 
-  on(SUBAGENT_CLIENT_CHANNELS.list, async (raw) => {
-    const request = raw as Record<string, unknown>;
+  on(SUBAGENT_CLIENT_CHANNELS.list, async (payload) => {
     try {
+      const request = decodeClientListRequest(payload);
       const clientId = requiredString(request.clientId, "clientId");
       const manager = await options.getManager();
       const snapshots = manager.view
@@ -248,7 +355,7 @@ export function registerSubagentClientApi(
         data: snapshots,
       });
     } catch (error) {
-      reply(pi, SUBAGENT_CLIENT_CHANNELS.list, request.requestId, {
+      reply(pi, SUBAGENT_CLIENT_CHANNELS.list, errorRequestId(payload), {
         success: false,
         error: error instanceof Error ? error.message : String(error),
       });

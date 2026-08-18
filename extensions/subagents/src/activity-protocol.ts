@@ -1,3 +1,8 @@
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+type ActiveWorkItemDraft = Mutable<ActiveWorkItem>;
+
+import { Compile } from "typebox/compile";
+import { Type, type Static } from "typebox";
 import type { SubagentSnapshot } from "./domain.ts";
 
 export const ACTIVE_WORK_CHANNELS = {
@@ -37,6 +42,68 @@ export interface ActiveWorkRemoval {
   readonly settledAt?: number;
 }
 
+const ActiveWorkItemSchema = Type.Object({
+  version: Type.Literal(1),
+  key: Type.String(),
+  kind: Type.Union([Type.Literal("subagent"), Type.Literal("workflow")]),
+  label: Type.String(),
+  status: Type.Union([Type.Literal("running"), Type.Literal("quiet")]),
+  summary: Type.String(),
+  currentOperation: Type.Optional(Type.String()),
+  runningProcesses: Type.Number(),
+  startedAt: Type.Number(),
+  lastActivityAt: Type.Number(),
+  modelLabel: Type.Optional(Type.String()),
+  contextPercent: Type.Optional(Type.Number()),
+  completedOperations: Type.Optional(Type.Number()),
+});
+const ActiveWorkRemovalSchema = Type.Object({
+  version: Type.Literal(1),
+  key: Type.String(),
+  status: Type.Optional(
+    Type.Union([Type.Literal("done"), Type.Literal("error")]),
+  ),
+  title: Type.Optional(Type.String()),
+  ops: Type.Optional(Type.Number()),
+  settledAt: Type.Optional(Type.Number()),
+});
+const ActiveWorkItemValidator = Compile(ActiveWorkItemSchema);
+const ActiveWorkRemovalValidator = Compile(ActiveWorkRemovalSchema);
+export type ActivityProtocolBoundary =
+  Static<typeof ActiveWorkItemSchema> | Static<typeof ActiveWorkRemovalSchema>;
+export function parseActiveWorkItem(
+  value: ActivityProtocolBoundary,
+): ActiveWorkItem | undefined {
+  if (
+    !ActiveWorkItemValidator.Check(value) ||
+    !value.key.startsWith(`${value.kind}:`)
+  )
+    return undefined;
+  // SAFETY: the validator and prefix branch establish the protocol key contract.
+  const key = (
+    value.key.startsWith("subagent:")
+      ? `subagent:${value.key.slice(9)}`
+      : `workflow:${value.key.slice(9)}`
+  ) as ActiveWorkItem["key"];
+  return { ...value, key };
+}
+export function parseActiveWorkRemoval(
+  value: ActivityProtocolBoundary,
+): ActiveWorkRemoval | undefined {
+  if (
+    !ActiveWorkRemovalValidator.Check(value) ||
+    (!value.key.startsWith("subagent:") && !value.key.startsWith("workflow:"))
+  )
+    return undefined;
+  // SAFETY: the validator and prefix branch establish the protocol key contract.
+  const key = (
+    value.key.startsWith("subagent:")
+      ? `subagent:${value.key.slice(9)}`
+      : `workflow:${value.key.slice(9)}`
+  ) as ActiveWorkItem["key"];
+  return { ...value, key };
+}
+
 function singleLine(text: string) {
   return text
     .replace(/[\r\n]+/g, " ")
@@ -62,7 +129,7 @@ export function subagentActiveWorkItem(
         `${current.name}${current.argsPreview ? ` ${current.argsPreview}` : ""}`,
       )
     : undefined;
-  return {
+  const item: ActiveWorkItemDraft = {
     version: 1,
     key: `subagent:${snapshot.id}`,
     kind: "subagent",
@@ -70,32 +137,31 @@ export function subagentActiveWorkItem(
     status: quiet ? "quiet" : "running",
     summary:
       operation ?? (quiet ? "quiet · no recent events" : "model working"),
-    ...(operation ? { currentOperation: operation } : {}),
     runningProcesses: 0,
     startedAt: snapshot.createdAt,
     lastActivityAt: snapshot.lastActivityAt,
-    ...(snapshot.meta.modelLabel
-      ? { modelLabel: bounded(snapshot.meta.modelLabel, 28) }
-      : {}),
-    ...(typeof snapshot.usage.tokens === "number" &&
-    typeof snapshot.usage.contextWindow === "number" &&
-    snapshot.usage.contextWindow > 0
-      ? {
-          contextPercent: Math.round(
-            Math.min(
-              100,
-              Math.max(
-                0,
-                (snapshot.usage.tokens / snapshot.usage.contextWindow) * 100,
-              ),
-            ),
-          ),
-        }
-      : {}),
-    ...(snapshot.completedOperations > 0
-      ? { completedOperations: snapshot.completedOperations }
-      : {}),
   };
+  if (operation) item.currentOperation = operation;
+  if (snapshot.meta.modelLabel)
+    item.modelLabel = bounded(snapshot.meta.modelLabel, 28);
+  if (
+    snapshot.usage.tokens !== undefined &&
+    snapshot.usage.contextWindow !== undefined &&
+    snapshot.usage.contextWindow > 0
+  ) {
+    item.contextPercent = Math.round(
+      Math.min(
+        100,
+        Math.max(
+          0,
+          (snapshot.usage.tokens / snapshot.usage.contextWindow) * 100,
+        ),
+      ),
+    );
+  }
+  if (snapshot.completedOperations > 0)
+    item.completedOperations = snapshot.completedOperations;
+  return item;
 }
 
 export function subagentActiveWorkRemoval(

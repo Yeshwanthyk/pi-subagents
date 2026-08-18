@@ -1,20 +1,15 @@
-export function createDeferredResultDelivery<T extends { id: string }>() {
-  const pending = new Map<string, T>();
-
-  return {
-    defer(result: T) {
-      pending.set(result.id, result);
-    },
-    consume(ids: Iterable<string>) {
-      for (const id of ids) pending.delete(id);
-    },
-    drain() {
-      const results = [...pending.values()];
-      pending.clear();
-      return results;
-    },
-    clear() {
-      pending.clear();
-    },
-  };
-}
+/**
+ * Compatibility exports for the parent-linked result delivery module.
+ *
+ * Parent results are owned by `parent-mailbox.ts`; this module intentionally
+ * contains no independent delivery state.
+ */
+export {
+  createParentMailbox,
+  DEFAULT_PARENT_MAILBOX_LIMITS,
+  PARENT_RESULT_LIMITS,
+  parentResultEnvelope,
+  type ParentMailbox,
+  type ParentMailboxLimits,
+  type ParentResultEnvelope,
+} from "./parent-mailbox.ts";

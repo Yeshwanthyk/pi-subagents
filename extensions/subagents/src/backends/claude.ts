@@ -19,11 +19,14 @@ import {
   type SDKMessage,
   type SDKResultMessage,
   type SDKUserMessage,
+  type Options,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Cause, Scope } from "effect";
 import { Effect, Queue, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
+
 import type {
+  BackendName,
   QueuedMessage,
   ReasoningEffort,
   RunOutcome,
@@ -33,6 +36,20 @@ import type {
   TranscriptPart,
 } from "../domain.ts";
 import { SendError, SpawnError } from "../domain.ts";
+
+/**
+ * Mutable per-session metadata. The manager's view is the readonly
+ * `SubagentMeta` owner type; this name-typed contract is what the backend
+ * accumulates in place before snapshots are emitted.
+ */
+interface SessionMeta {
+  backend: BackendName;
+  modelLabel?: string;
+  reasoningEffort?: ReasoningEffort;
+  contextWindow?: number;
+  sessionFilePath?: string;
+  nativeSessionId?: string;
+}
 
 const CLAUDE_CONTEXT_WINDOW = 200_000;
 const INTERRUPT_TIMEOUT_MS = 2_000;
@@ -165,11 +182,9 @@ export function claudeThinkingConfig(
   };
 }
 
-function boundedError(error: unknown) {
-  return (error instanceof Error ? error.message : String(error)).slice(
-    0,
-    4_096,
-  );
+function boundedError(error: Error | string) {
+  const text = error instanceof Error ? error.message : error;
+  return text.slice(0, 4_096);
 }
 
 function singleLine(text: string) {
@@ -177,7 +192,34 @@ function singleLine(text: string) {
   return flattened ? flattened.slice(0, PREVIEW_MAX_LENGTH) : undefined;
 }
 
-function safeJson(value: unknown) {
+/**
+ * Decoded preview JSON. Tool-call inputs are model-emitted JSON trees, so
+ * preview rendering reads a named JsonValue contract instead of ad-hoc typeof
+ * parsing over the SDK's `unknown` tool input.
+ */
+export type JsonValue =
+  string | number | boolean | null | JsonValue[] | JsonObject;
+export interface JsonObject {
+  [key: string]: JsonValue;
+}
+
+/** Text block inside a tool result; the only block kind worth previewing. */
+interface ToolResultTextBlock {
+  readonly type: "text";
+  readonly text: string;
+}
+
+/**
+ * Tool-result content as delivered by the Agent SDK: either a whole string or
+ * a content-block array (text blocks plus non-text image/doc/reference blocks).
+ */
+type ToolResultContent =
+  string | Array<ToolResultTextBlock | { readonly type: string }> | undefined;
+
+/** Anything renderable to a bounded JSON preview. */
+type JsonPreviewable = JsonValue | ToolResultContent;
+
+function safeJson(value: JsonPreviewable) {
   try {
     const text = JSON.stringify(value);
     if (!text || text === "{}") return undefined;
@@ -187,21 +229,15 @@ function safeJson(value: unknown) {
   }
 }
 
-function outputPreview(value: unknown): string | undefined {
-  if (typeof value === "string") return singleLine(value);
-  if (Array.isArray(value)) {
-    const text = value
-      .flatMap((part) => {
-        if (!part || typeof part !== "object") return [];
-        const record = part as { type?: unknown; text?: unknown };
-        return record.type === "text" && typeof record.text === "string"
-          ? [record.text]
-          : [];
-      })
+function outputPreview(content: ToolResultContent): string | undefined {
+  if (Array.isArray(content)) {
+    const text = content
+      .filter((part): part is ToolResultTextBlock => part.type === "text")
+      .map((part) => part.text)
       .join(" ");
-    return singleLine(text) ?? safeJson(value);
+    return singleLine(text) ?? safeJson(content);
   }
-  return safeJson(value);
+  return content === undefined ? undefined : singleLine(content);
 }
 
 function assistantParts(message: SDKAssistantMessage): TranscriptPart[] {
@@ -214,11 +250,14 @@ function assistantParts(message: SDKAssistantMessage): TranscriptPart[] {
     } else if (block.type === "redacted_thinking") {
       parts.push({ type: "thinking", text: "", redacted: true });
     } else if (block.type === "tool_use") {
+      // SAFETY: the model emits tool_use input as JSON, so the whole tree
+      // satisfies the JsonValue contract by construction.
+      const argsPreview = safeJson(block.input as JsonValue);
       parts.push({
         type: "toolCall",
         toolId: block.id,
         name: block.name,
-        argsPreview: safeJson(block.input),
+        argsPreview,
       });
     }
   }
@@ -257,9 +296,16 @@ export function contextOccupancyTokens(
     | null
     | undefined,
 ) {
-  if (!usage || typeof usage.input_tokens !== "number") return undefined;
+  if (
+    usage === null ||
+    usage === undefined ||
+    usage.input_tokens === null ||
+    usage.input_tokens === undefined
+  ) {
+    return undefined;
+  }
   const count = (value: number | null | undefined) =>
-    typeof value === "number" && Number.isFinite(value) ? value : 0;
+    value !== null && value !== undefined && Number.isFinite(value) ? value : 0;
   return (
     count(usage.input_tokens) +
     count(usage.cache_read_input_tokens) +
@@ -308,6 +354,19 @@ const makeClaudeSession = (
     };
 
     const thinking = claudeThinkingConfig(task.reasoningEffort);
+    const meta: SessionMeta = {
+      backend: "claude",
+      modelLabel: task.model,
+      // Claude models used by this backend currently expose 200k context;
+      // result.modelUsage replaces this fallback when the CLI knows better.
+      contextWindow: CLAUDE_CONTEXT_WINDOW,
+    };
+    if (thinking.reasoningEffort)
+      meta.reasoningEffort = thinking.reasoningEffort;
+
+    // SAFETY: the initial queue is empty, so it vacuously satisfies the
+    // NativeQueuedMessage contract; submit() only pushes entries that carry the
+    // interface's uuid/afterResponse fields.
     const state = {
       closed: false,
       activeRun: false,
@@ -321,16 +380,7 @@ const makeClaudeSession = (
       liveText: "",
       tools: new Map<string, string>(),
       settleWaiters: new Set<() => void>(),
-      meta: {
-        backend: "claude",
-        modelLabel: task.model,
-        ...(thinking.reasoningEffort
-          ? { reasoningEffort: thinking.reasoningEffort }
-          : {}),
-        // Claude models used by this backend currently expose 200k context;
-        // result.modelUsage replaces this fallback when the CLI knows better.
-        contextWindow: CLAUDE_CONTEXT_WINDOW,
-      } satisfies SubagentMeta as SubagentMeta,
+      meta,
     };
 
     const claudeBinary = resolveClaudeBinary();
@@ -338,29 +388,31 @@ const makeClaudeSession = (
       try: () =>
         query({
           prompt: input,
-          options: {
-            cwd: task.cwd,
-            // Headless children cannot answer approval prompts. The caller
-            // already chose to launch an autonomous subagent, so let it use
-            // its tools without interactive permission checks.
-            permissionMode: "bypassPermissions",
-            allowDangerouslySkipPermissions: true,
-            // For cwds pi marked untrusted, restrict to user-level settings so
-            // an untrusted project's config cannot reconfigure the child.
-            ...(task.parent.projectTrusted
-              ? {}
-              : { settingSources: ["user" as const] }),
-            includePartialMessages: true,
-            abortController,
-            ...(claudeBinary
-              ? { pathToClaudeCodeExecutable: claudeBinary }
-              : {}),
-            ...(task.model ? { model: task.model } : {}),
-            ...(thinking.thinking ? { thinking: thinking.thinking } : {}),
-            ...(thinking.effort ? { effort: thinking.effort } : {}),
-          },
+          options: (() => {
+            const options: Options = {
+              cwd: task.cwd,
+              // Headless children cannot answer approval prompts. The caller
+              // already chose to launch an autonomous subagent, so let it use
+              // its tools without interactive permission checks.
+              permissionMode: "bypassPermissions",
+              allowDangerouslySkipPermissions: true,
+              // For cwds pi marked untrusted, restrict to user-level settings so
+              // an untrusted project's config cannot reconfigure the child.
+              includePartialMessages: true,
+              abortController,
+            };
+            if (!task.parent.projectTrusted) options.settingSources = ["user"];
+            if (claudeBinary) options.pathToClaudeCodeExecutable = claudeBinary;
+            if (task.model) options.model = task.model;
+            if (thinking.thinking) options.thinking = thinking.thinking;
+            if (thinking.effort) options.effort = thinking.effort;
+            return options;
+          })(),
         }),
-      catch: (error) => new SpawnError({ message: boundedError(error) }),
+      catch: (error) =>
+        new SpawnError({
+          message: boundedError(error instanceof Error ? error : String(error)),
+        }),
     });
 
     let resolvePumpDone: (() => void) | undefined;
@@ -438,11 +490,13 @@ const makeClaudeSession = (
       for (const block of message.message.content) {
         if (block.type !== "tool_use") continue;
         state.tools.set(block.id, block.name);
+        // SAFETY: the model emits tool_use input as JSON, so the whole tree
+        // satisfies the JsonValue contract by construction.
         emit({
           _tag: "ToolStart",
           toolId: block.id,
           name: block.name,
-          argsPreview: safeJson(block.input),
+          argsPreview: safeJson(block.input as JsonValue),
         });
       }
     };
@@ -556,7 +610,9 @@ const makeClaudeSession = (
         for await (const message of nativeQuery) handleMessage(message);
       } catch (error) {
         if (!state.closed && !abortController.signal.aborted) {
-          failure = boundedError(error);
+          failure = boundedError(
+            error instanceof Error ? error : String(error),
+          );
         }
       } finally {
         if (!state.closed) {
@@ -678,7 +734,12 @@ const makeClaudeSession = (
             }
           } catch (error) {
             if (!state.closed) {
-              emit({ _tag: "BackendError", message: boundedError(error) });
+              emit({
+                _tag: "BackendError",
+                message: boundedError(
+                  error instanceof Error ? error : String(error),
+                ),
+              });
             }
           }
           await waitForVersion(version);

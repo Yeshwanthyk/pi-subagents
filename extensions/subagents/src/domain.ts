@@ -30,20 +30,30 @@ export const REASONING_EFFORTS = [
 ] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
-export function isReasoningEffort(value: unknown): value is ReasoningEffort {
+export function isReasoningEffort(
+  value: string | undefined,
+): value is ReasoningEffort {
   return (
-    typeof value === "string" &&
-    REASONING_EFFORTS.some((effort) => effort === value)
+    value !== undefined && REASONING_EFFORTS.some((effort) => effort === value)
   );
 }
 
 export type SubagentStatus = "running" | "done" | "error";
-export type SubagentVisibility = "standard" | "private";
-export type SubagentResultDelivery = "parent" | "client" | "none";
+export type SubagentResultDelivery = "parent" | "client";
 
 export interface SubagentClient {
   readonly id: string;
   readonly correlationId: string;
+}
+
+/** Runtime-only relationship to the parent session that spawned a task. */
+export interface ParentRef {
+  /** Extension runtime generation that captured this parent relationship. */
+  readonly epoch: number;
+  /** Normalized persisted parent session file; absent for in-memory sessions. */
+  readonly sessionFile?: string;
+  /** Parent leaf at spawn time; null means the session root is the capture point. */
+  readonly leafId: string | null;
 }
 
 /** Parent-session context resolved by the tool layer and passed opaquely. */
@@ -57,30 +67,18 @@ export interface ParentContext {
   readonly modelRegistry?: ModelRegistry;
 }
 
-export type SessionSeed =
-  | { readonly kind: "fresh"; readonly parentSession?: string }
-  | {
-      readonly kind: "fork";
-      readonly parentSessionFile: string;
-      readonly parentLeafId: string;
-    };
-
 export interface SpawnTask {
   readonly prompt: string;
   readonly title: string;
   readonly cwd: string;
   /** Logical namespace for the feature or extension that created the session. */
   readonly owner?: string;
-  /** Whether the session appears in the standard /subagents management surface. */
-  readonly visibility?: SubagentVisibility;
   /** Where terminal lifecycle output is delivered. */
   readonly resultDelivery?: SubagentResultDelivery;
   /** Correlation metadata for an extension client that owns task state. */
   readonly client?: SubagentClient;
-  /** Explicit active-tool allowlist for Pi children. Omitted keeps normal defaults. */
-  readonly tools?: ReadonlyArray<string>;
-  /** Initial persisted-session source for Pi children. */
-  readonly sessionSeed?: SessionSeed;
+  /** Runtime-only relationship to the parent session captured at spawn. */
+  readonly parentRef?: ParentRef;
   /**
    * Generic model hint, interpreted per backend:
    * pi: "provider/model-id" or bare model id; claude: model alias;
@@ -237,10 +235,10 @@ export interface SubagentSnapshot {
   readonly id: string;
   readonly backend: BackendName;
   readonly owner: string;
-  readonly visibility: SubagentVisibility;
   readonly resultDelivery: SubagentResultDelivery;
   readonly client?: SubagentClient;
-  readonly tools?: ReadonlyArray<string>;
+  /** Runtime-only relationship captured at spawn; never persisted in message details. */
+  readonly parentRef?: ParentRef;
   readonly title: string;
   readonly prompt: string;
   readonly cwd: string;

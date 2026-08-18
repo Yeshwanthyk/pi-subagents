@@ -79,6 +79,9 @@ const makeStubSession = (
     const sessionFile = path.join(STUB_DIR, `${sessionId}.jsonl`);
 
     const state = {
+      // SAFETY: `satisfies SubagentMeta` already checks this literal against
+      // the domain interface; the assertion only widens the literal's
+      // inferred type so `state.meta` reads as SubagentMeta.
       meta: {
         backend: profile.backend,
         modelLabel: task.model ?? profile.defaultModelLabel,
@@ -87,6 +90,8 @@ const makeStubSession = (
         sessionFilePath: sessionFile,
         nativeSessionId: sessionId,
       } satisfies SubagentMeta as SubagentMeta,
+      // SAFETY: `pending` is only appended via submit(text: string) and
+      // cleared wholesale, so the empty literal is a string[].
       pending: [] as string[],
       turnCount: 0,
       closed: false,

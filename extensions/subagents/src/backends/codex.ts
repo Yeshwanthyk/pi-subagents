@@ -12,6 +12,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Compile } from "typebox/compile";
+import { Type } from "typebox";
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
 import type { Cause, Scope } from "effect";
 import { Effect, Queue, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
@@ -33,10 +37,39 @@ const PREVIEW_MAX_LENGTH = 1_024;
 /** A protocol line larger than this without a newline means a broken peer. */
 const STDOUT_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
 
-type JsonRecord = Record<string, unknown>;
+/**
+ * Decoded app-server JSON. Every protocol value is narrowed field-by-field
+ * through the checked accessors below; nothing is trusted wholesale. JSON
+ * values are exactly primitives, arrays, and plain objects, so every field
+ * of a `JsonObject` is itself a `JsonValue`.
+ */
+export type JsonValue =
+  string | number | boolean | null | JsonValue[] | JsonObject;
+/**
+ * Decoded JSON object; read fields only through the checked accessors. The
+ * index signature is intentionally mutable so outbound request params can be
+ * built incrementally (`params.effort = ...`), exactly like the hand-written
+ * object literals they replaced.
+ */
+export interface JsonObject {
+  [key: string]: JsonValue;
+}
+
+/**
+ * Compiled JSON guards — the boundary decoders. `Check` is a runtime type
+ * guard over the decoded `JsonValue` tree, so downstream branches are on
+ * concrete JSON kinds instead of `typeof` checks over unparsed input.
+ */
+const STRING_CHECK = Compile(Type.String());
+const NUMBER_CHECK = Compile(Type.Number());
+const BOOLEAN_CHECK = Compile(Type.Boolean());
+const ARRAY_CHECK = Compile(Type.Array(Type.Any()));
+const OBJECT_CHECK = Compile(Type.Record(Type.String(), Type.Any()));
+/** A JSON-RPC id: JSON-RPC 2.0 allows only string or number ids. */
+const JSON_RPC_ID_CHECK = Compile(Type.Union([Type.String(), Type.Number()]));
 
 interface PendingRequest {
-  readonly resolve: (result: JsonRecord) => void;
+  readonly resolve: (result: JsonObject) => void;
   readonly reject: (error: Error) => void;
   readonly timer: ReturnType<typeof setTimeout>;
 }
@@ -44,6 +77,27 @@ interface PendingRequest {
 interface ToolState {
   readonly name: string;
   output: string;
+}
+
+/** Mutable per-session state; fields are only ever assigned validated values. */
+interface SessionState {
+  closed: boolean;
+  closing: boolean;
+  exited: boolean;
+  activeRun: boolean;
+  dispatching: boolean;
+  interruptRequested: boolean;
+  effort: CodexReasoningEffort | undefined;
+  runSerial: number;
+  activeTurnId: string | undefined;
+  runError: string | undefined;
+  finalText: string;
+  lastAssistantText: string;
+  pendingPrompts: string[];
+  nextRequestId: number;
+  stderr: string;
+  meta: SubagentMeta;
+  interruptTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 // --- Binary + protocol helpers -----------------------------------------------
@@ -78,39 +132,58 @@ function resolveCodexBinary() {
   return undefined;
 }
 
-function record(value: unknown): JsonRecord | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as JsonRecord)
-    : undefined;
+/**
+ * Decode one protocol line at the I/O boundary. `undefined` means the line
+ * is not valid JSON — the caller reports it as a protocol error. A valid
+ * non-object line is ignored, exactly like the previous lenient parse.
+ */
+function decodeJson(line: string): JsonValue | undefined {
+  try {
+    // SAFETY: JSON.parse emits exactly JSON values — primitives, arrays, and
+    // plain objects — so its `any` result satisfies the JsonValue contract
+    // by construction without a runtime check.
+    const parsed: JsonValue = JSON.parse(line);
+    return parsed;
+  } catch {
+    return undefined;
+  }
 }
 
-function stringValue(value: unknown) {
-  return typeof value === "string" ? value : undefined;
+/** Read one decoded JSON object; a non-object or absent value yields undefined. */
+function record(value: JsonValue | undefined): JsonObject | undefined {
+  // SAFETY: OBJECT_CHECK verifies the runtime value is a plain JSON object
+  // (rejecting primitives, null, and arrays), so only the JsonObject member
+  // of the union survives the guard.
+  return OBJECT_CHECK.Check(value) ? (value as JsonObject) : undefined;
 }
 
-function numberValue(value: unknown) {
-  return typeof value === "number" && Number.isFinite(value)
+function stringValue(value: JsonValue | undefined): string | undefined {
+  return STRING_CHECK.Check(value) ? value : undefined;
+}
+
+function numberValue(value: JsonValue | undefined): number | undefined {
+  return NUMBER_CHECK.Check(value) && Number.isFinite(value)
     ? value
     : undefined;
 }
 
-function booleanValue(value: unknown) {
-  return typeof value === "boolean" ? value : undefined;
+function booleanValue(value: JsonValue | undefined): boolean | undefined {
+  return BOOLEAN_CHECK.Check(value) ? value : undefined;
 }
 
-function records(value: unknown) {
-  return Array.isArray(value)
-    ? value.map(record).filter((item): item is JsonRecord => item !== undefined)
-    : [];
+function records(value: JsonValue | undefined): JsonObject[] {
+  if (!ARRAY_CHECK.Check(value)) return [];
+  return value
+    .map((item) => record(item))
+    .filter((item): item is JsonObject => item !== undefined);
 }
 
-function strings(value: unknown) {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-    : [];
+function strings(value: JsonValue | undefined): string[] {
+  if (!ARRAY_CHECK.Check(value)) return [];
+  return value.filter((item): item is string => STRING_CHECK.Check(item));
 }
 
-function safeJson(value: unknown) {
+function safeJson(value: JsonValue): string | undefined {
   try {
     const text = JSON.stringify(value);
     return text === undefined ? undefined : text.slice(0, PREVIEW_MAX_LENGTH);
@@ -119,20 +192,23 @@ function safeJson(value: unknown) {
   }
 }
 
-function firstLine(value: unknown) {
-  if (typeof value !== "string") return undefined;
+function firstLine(value: JsonValue | undefined): string | undefined {
+  if (!STRING_CHECK.Check(value)) return undefined;
   const line = value.split("\n").find((candidate) => candidate.trim());
   return line?.trim().slice(0, PREVIEW_MAX_LENGTH);
 }
 
-function boundedError(error: unknown) {
-  return (error instanceof Error ? error.message : String(error)).slice(
-    0,
-    4096,
-  );
+/**
+ * Render a thrown value or protocol error payload as bounded text. Callers at
+ * a JS catch boundary narrow with `instanceof Error` first; the JsonValue
+ * branch stringifies, preserving the previous `String(error)` fallback.
+ */
+function boundedError(error: Error | JsonValue): string {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.slice(0, 4096);
 }
 
-function protocolError(value: unknown) {
+function protocolError(value: JsonValue): string {
   const error = record(value);
   const message = stringValue(error?.message);
   return boundedError(
@@ -150,9 +226,11 @@ const CODEX_REASONING_EFFORTS = [
 ] as const;
 type CodexReasoningEffort = (typeof CODEX_REASONING_EFFORTS)[number];
 
-function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
+function isCodexReasoningEffort(
+  value: JsonValue | undefined,
+): value is CodexReasoningEffort {
   return (
-    typeof value === "string" &&
+    STRING_CHECK.Check(value) &&
     CODEX_REASONING_EFFORTS.some((effort) => effort === value)
   );
 }
@@ -179,7 +257,7 @@ function preferredCodexEffort(
 
 function codexCatalogModel(
   modelLabel: string | undefined,
-  modelList: JsonRecord | undefined,
+  modelList: JsonObject | undefined,
 ) {
   const models = records(modelList?.data);
   const exact = models.find(
@@ -192,7 +270,7 @@ function codexCatalogModel(
     : exact;
 }
 
-function modelSupportedCodexEfforts(model: JsonRecord | undefined) {
+function modelSupportedCodexEfforts(model: JsonObject | undefined) {
   return records(model?.supportedReasoningEfforts)
     .map((option) => option.reasoningEffort)
     .filter(isCodexReasoningEffort);
@@ -202,7 +280,7 @@ function modelSupportedCodexEfforts(model: JsonRecord | undefined) {
 function supportedCodexEffort(
   effort: ReasoningEffort | undefined,
   modelLabel: string | undefined,
-  modelList: JsonRecord | undefined,
+  modelList: JsonObject | undefined,
 ): CodexReasoningEffort | undefined {
   const preferred = preferredCodexEffort(effort);
   if (!preferred) return undefined;
@@ -236,15 +314,10 @@ function normalizeCodexEffort(
 export function negotiateCodexReasoningEffort(
   effort: ReasoningEffort | undefined,
   modelLabel: string | undefined,
-  modelList: unknown,
+  modelList: JsonObject | undefined,
 ) {
-  const parsedModelList = record(modelList);
-  const model = codexCatalogModel(modelLabel, parsedModelList);
-  const nativeEffort = supportedCodexEffort(
-    effort,
-    modelLabel,
-    parsedModelList,
-  );
+  const model = codexCatalogModel(modelLabel, modelList);
+  const nativeEffort = supportedCodexEffort(effort, modelLabel, modelList);
   return {
     nativeEffort,
     // Without exact catalog capabilities this is only a preferred request, not
@@ -260,24 +333,20 @@ export function applyCodexMetadataNotification(
   current: SubagentMeta,
   currentEffort: CodexReasoningEffort | undefined,
   method: "thread/settings/updated" | "model/rerouted",
-  params: unknown,
+  params: JsonObject,
   requestedEffort: ReasoningEffort | undefined,
-  modelList: unknown,
+  modelList: JsonObject | undefined,
 ) {
-  const parsedParams = record(params) ?? {};
   if (method === "thread/settings/updated") {
-    const settings = record(parsedParams.threadSettings);
+    const settings = record(params.threadSettings);
     const modelLabel = stringValue(settings?.model);
     const hasEffort = settings !== undefined && "effort" in settings;
     const nativeEffort = isCodexReasoningEffort(settings?.effort)
       ? settings.effort
       : undefined;
-    const patch: Partial<SubagentMeta> = {
-      ...(modelLabel ? { modelLabel } : {}),
-      ...(hasEffort
-        ? { reasoningEffort: normalizeCodexEffort(nativeEffort) }
-        : {}),
-    };
+    const patch: Mutable<Partial<SubagentMeta>> = {};
+    if (modelLabel) patch.modelLabel = modelLabel;
+    if (hasEffort) patch.reasoningEffort = normalizeCodexEffort(nativeEffort);
     return {
       meta: { ...current, ...patch },
       effort: hasEffort ? nativeEffort : currentEffort,
@@ -285,7 +354,7 @@ export function applyCodexMetadataNotification(
     };
   }
 
-  const modelLabel = stringValue(parsedParams.toModel);
+  const modelLabel = stringValue(params.toModel);
   if (!modelLabel) return undefined;
   const negotiated = negotiateCodexReasoningEffort(
     requestedEffort ??
@@ -320,8 +389,8 @@ function textInput(text: string) {
  * `tokenUsage.last` is the most recent request, whose totalTokens is what
  * codex-rs itself uses as `tokens_in_context_window()`.
  */
-export function parseThreadTokenUsage(params: unknown) {
-  const usage = record(record(params)?.tokenUsage);
+export function parseThreadTokenUsage(params: JsonObject) {
+  const usage = record(params.tokenUsage);
   const last = record(usage?.last);
   return {
     tokens: numberValue(last?.totalTokens),
@@ -331,7 +400,7 @@ export function parseThreadTokenUsage(params: unknown) {
 
 // --- Item translation --------------------------------------------------------
 
-function fileChangePreview(item: JsonRecord) {
+function fileChangePreview(item: JsonObject) {
   const paths = records(item.changes)
     .map((change) => stringValue(change.path))
     .filter((value): value is string => value !== undefined);
@@ -341,7 +410,7 @@ function fileChangePreview(item: JsonRecord) {
 }
 
 function toolDescription(
-  item: JsonRecord,
+  item: JsonObject,
 ): { id: string; name: string; args?: string } | undefined {
   const id = stringValue(item.id);
   const type = stringValue(item.type);
@@ -376,7 +445,7 @@ function toolDescription(
   }
 }
 
-function toolOutput(item: JsonRecord, buffered: string) {
+function toolOutput(item: JsonObject, buffered: string) {
   switch (stringValue(item.type)) {
     case "commandExecution":
       return stringValue(item.aggregatedOutput) ?? buffered;
@@ -398,7 +467,7 @@ function toolOutput(item: JsonRecord, buffered: string) {
   }
 }
 
-function toolFailed(item: JsonRecord) {
+function toolFailed(item: JsonObject) {
   const status = stringValue(item.status);
   const exitCode = numberValue(item.exitCode);
   const success = booleanValue(item.success);
@@ -440,11 +509,14 @@ const makeCodexSession = (
           // shell command it spawned.
           detached: process.platform !== "win32",
         }),
-      catch: (error) => new SpawnError({ message: boundedError(error) }),
+      catch: (error) =>
+        new SpawnError({
+          message: boundedError(error instanceof Error ? error : String(error)),
+        }),
     });
 
-    let modelList: JsonRecord | undefined;
-    const state = {
+    let modelList: JsonObject | undefined;
+    const state: SessionState = {
       closed: false,
       closing: false,
       exited: false,
@@ -453,25 +525,25 @@ const makeCodexSession = (
       interruptRequested: false,
       effort: preferredCodexEffort(task.reasoningEffort),
       runSerial: 0,
-      activeTurnId: undefined as string | undefined,
-      runError: undefined as string | undefined,
+      activeTurnId: undefined,
+      runError: undefined,
       finalText: "",
       lastAssistantText: "",
-      pendingPrompts: [] as string[],
+      pendingPrompts: [],
       nextRequestId: 0,
       stderr: "",
       meta: {
         backend: "codex",
         modelLabel: task.model,
-      } satisfies SubagentMeta as SubagentMeta,
-      interruptTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+      },
+      interruptTimer: undefined,
     };
     const pendingRequests = new Map<number, PendingRequest>();
     const tools = new Map<string, ToolState>();
     /** Turns locally settled by the interrupt fallback may still emit late events. */
     const ignoredTurnIds = new Set<string>();
 
-    const writeMessage = (message: JsonRecord) => {
+    const writeMessage = (message: JsonObject) => {
       if (state.closed || !child.stdin.writable) return false;
       child.stdin.write(`${JSON.stringify(message)}\n`);
       return true;
@@ -479,10 +551,10 @@ const makeCodexSession = (
 
     const request = (
       method: string,
-      params: JsonRecord,
+      params: JsonObject,
       timeoutMs = REQUEST_TIMEOUT_MS,
     ) =>
-      new Promise<JsonRecord>((resolve, reject) => {
+      new Promise<JsonObject>((resolve, reject) => {
         if (state.closed) {
           reject(new Error("Codex app-server is closed."));
           return;
@@ -554,7 +626,12 @@ const makeCodexSession = (
         INTERRUPT_FALLBACK_MS,
       ).catch((error) => {
         if (state.activeRun && serial === state.runSerial) {
-          emit({ _tag: "BackendError", message: boundedError(error) });
+          emit({
+            _tag: "BackendError",
+            message: boundedError(
+              error instanceof Error ? error : String(error),
+            ),
+          });
         }
       });
     };
@@ -574,11 +651,11 @@ const makeCodexSession = (
       emit({ _tag: "UserMessage", text });
       emit({ _tag: "RunStarted" });
 
-      const params: JsonRecord = {
+      const params: JsonObject = {
         threadId,
         input: [textInput(text)],
-        ...(state.effort ? { effort: state.effort } : {}),
       };
+      if (state.effort) params.effort = state.effort;
       void request("turn/start", params).then(
         (result) => {
           const turn = record(result.turn);
@@ -603,7 +680,9 @@ const makeCodexSession = (
         },
         (error) => {
           if (!state.activeRun || serial !== state.runSerial) return;
-          const errorText = boundedError(error);
+          const errorText = boundedError(
+            error instanceof Error ? error : String(error),
+          );
           settleRun(
             state.interruptRequested
               ? {
@@ -628,7 +707,7 @@ const makeCodexSession = (
       );
     }
 
-    const emitToolStart = (item: JsonRecord) => {
+    const emitToolStart = (item: JsonObject) => {
       const tool = toolDescription(item);
       if (!tool || tools.has(tool.id)) return;
       tools.set(tool.id, { name: tool.name, output: "" });
@@ -647,7 +726,7 @@ const makeCodexSession = (
       });
     };
 
-    const emitToolEnd = (item: JsonRecord) => {
+    const emitToolEnd = (item: JsonObject) => {
       const description = toolDescription(item);
       if (!description) return;
       if (!tools.has(description.id)) emitToolStart(item);
@@ -663,7 +742,7 @@ const makeCodexSession = (
       });
     };
 
-    const handleItemCompleted = (item: JsonRecord) => {
+    const handleItemCompleted = (item: JsonObject) => {
       const type = stringValue(item.type);
       if (type === "agentMessage") {
         const text = stringValue(item.text) ?? "";
@@ -691,7 +770,7 @@ const makeCodexSession = (
       emitToolEnd(item);
     };
 
-    const handleNotification = (message: JsonRecord) => {
+    const handleNotification = (message: JsonObject) => {
       if (state.closed) return;
       const method = stringValue(message.method);
       const params = record(message.params) ?? {};
@@ -867,9 +946,9 @@ const makeCodexSession = (
       }
     };
 
-    const handleServerRequest = (message: JsonRecord) => {
+    const handleServerRequest = (message: JsonObject) => {
       const id = message.id;
-      if (typeof id !== "number" && typeof id !== "string") return;
+      if (!JSON_RPC_ID_CHECK.Check(id)) return;
       const method = stringValue(message.method);
       if (
         method === "item/commandExecution/requestApproval" ||
@@ -889,10 +968,8 @@ const makeCodexSession = (
 
     const handleLine = (line: string) => {
       if (!line.trim()) return;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
+      const parsed = decodeJson(line);
+      if (parsed === undefined) {
         emit({
           _tag: "BackendError",
           message: `Invalid Codex protocol line: ${line.slice(0, 512)}`,
@@ -901,11 +978,11 @@ const makeCodexSession = (
       }
       const message = record(parsed);
       if (!message) return;
-      const id = numberValue(message.id);
-      if (id !== undefined && pendingRequests.has(id)) {
-        const pending = pendingRequests.get(id);
+      const responseId = numberValue(message.id);
+      if (responseId !== undefined && pendingRequests.has(responseId)) {
+        const pending = pendingRequests.get(responseId);
         if (!pending) return;
-        pendingRequests.delete(id);
+        pendingRequests.delete(responseId);
         clearTimeout(pending.timer);
         if (message.error !== undefined)
           pending.reject(new Error(protocolError(message.error)));
@@ -1003,15 +1080,19 @@ const makeCodexSession = (
         // Headless children cannot answer approval prompts. The caller
         // already chose to launch an autonomous subagent, so give the thread
         // full workspace access without interactive approval requests.
-        return request("thread/start", {
+        const params: JsonObject = {
           cwd: task.cwd,
           approvalPolicy: "never",
           sandbox: "danger-full-access",
           ephemeral: false,
-          ...(task.model ? { model: task.model } : {}),
-        });
+        };
+        if (task.model) params.model = task.model;
+        return request("thread/start", params);
       },
-      catch: (error) => new SpawnError({ message: boundedError(error) }),
+      catch: (error) =>
+        new SpawnError({
+          message: boundedError(error instanceof Error ? error : String(error)),
+        }),
     });
 
     const thread = record(threadResult.thread);

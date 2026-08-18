@@ -1,3 +1,7 @@
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+import { Compile } from "typebox/compile";
+import { Type, type Static } from "typebox";
+
 import type {
   BackendName,
   LiveToolState,
@@ -115,13 +119,145 @@ export type PublicSubagentSnapshot = BrowserActivityChildSnapshot;
 export type PublicSubagentToolSnapshot = BrowserActivityToolSnapshot;
 export type PublicTranscriptItem = BrowserActivityTranscriptItem;
 export type PublicActivitySnapshot = BrowserActivitySnapshot;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
+type MutableToolSnapshot = Mutable<BrowserActivityToolSnapshot>;
+type MutableThinkingItem = Mutable<
+  Extract<BrowserActivityTranscriptItem, { kind: "thinking" }>
+>;
+type MutableToolItem = Mutable<
+  Extract<BrowserActivityTranscriptItem, { kind: "tool" }>
+>;
+type MutableChildSnapshot = Mutable<BrowserActivityChildSnapshot>;
+type MutableSnapshot = Mutable<BrowserActivitySnapshot>;
+type MutableTerminalSnapshot = Mutable<BrowserActivityTerminalSnapshot>;
+const Text = (maxLength: number) => Type.String({ maxLength });
+const ToolSchema = Type.Object({
+  name: Text(BROWSER_ACTIVITY_LIMITS.maxToolNameLength),
+  args: Type.Optional(Text(BROWSER_ACTIVITY_LIMITS.maxToolArgsLength)),
+  output: Type.Optional(Text(BROWSER_ACTIVITY_LIMITS.maxToolOutputLength)),
+  startedAt: Type.Number(),
+  updatedAt: Type.Number(),
+  isError: Type.Optional(Type.Boolean()),
+});
+const TranscriptSchema = Type.Union([
+  Type.Object({
+    kind: Type.Literal("user"),
+    text: Text(BROWSER_ACTIVITY_LIMITS.maxTranscriptTextLength),
+  }),
+  Type.Object({
+    kind: Type.Literal("assistant"),
+    text: Text(BROWSER_ACTIVITY_LIMITS.maxTranscriptTextLength),
+  }),
+  Type.Object({
+    kind: Type.Literal("thinking"),
+    text: Text(BROWSER_ACTIVITY_LIMITS.maxTranscriptTextLength),
+    redacted: Type.Optional(Type.Boolean()),
+  }),
+  Type.Object({
+    kind: Type.Literal("tool"),
+    name: Text(BROWSER_ACTIVITY_LIMITS.maxToolNameLength),
+    args: Type.Optional(Text(BROWSER_ACTIVITY_LIMITS.maxToolArgsLength)),
+    output: Type.Optional(Text(BROWSER_ACTIVITY_LIMITS.maxToolOutputLength)),
+    isError: Type.Optional(Type.Boolean()),
+  }),
+]);
+const QueuedSchema = Type.Object({
+  kind: Type.Union([Type.Literal("steer"), Type.Literal("follow-up")]),
+  text: Text(BROWSER_ACTIVITY_LIMITS.maxQueuedTextLength),
+});
+const UsageSchema = Type.Object({
+  tokens: Type.Optional(Type.Number({ minimum: 0 })),
+  contextWindow: Type.Optional(Type.Number({ minimum: 0 })),
+});
+const ChildSchema = Type.Object({
+  id: Type.String({ maxLength: BROWSER_ACTIVITY_LIMITS.maxChildIdLength }),
+  backend: Type.Union([
+    Type.Literal("pi"),
+    Type.Literal("claude"),
+    Type.Literal("codex"),
+  ]),
+  model: Type.Optional(Text(BROWSER_ACTIVITY_LIMITS.maxModelLength)),
+  reasoningEffort: Type.Optional(
+    Type.Union([
+      Type.Literal("off"),
+      Type.Literal("minimal"),
+      Type.Literal("low"),
+      Type.Literal("medium"),
+      Type.Literal("high"),
+      Type.Literal("xhigh"),
+      Type.Literal("max"),
+    ]),
+  ),
+  title: Text(BROWSER_ACTIVITY_LIMITS.maxTitleLength),
+  status: Type.Literal("running"),
+  prompt: Text(BROWSER_ACTIVITY_LIMITS.maxPromptLength),
+  output: Text(BROWSER_ACTIVITY_LIMITS.maxOutputLength),
+  failure: Type.Optional(Text(BROWSER_ACTIVITY_LIMITS.maxFailureLength)),
+  transcript: Type.Array(TranscriptSchema, {
+    maxItems: BROWSER_ACTIVITY_LIMITS.maxTranscriptItems,
+  }),
+  tools: Type.Array(ToolSchema, {
+    maxItems: BROWSER_ACTIVITY_LIMITS.maxToolCount,
+  }),
+  queued: Type.Array(QueuedSchema, {
+    maxItems: BROWSER_ACTIVITY_LIMITS.maxQueuedItems,
+  }),
+  startedAt: Type.Number(),
+  lastActivityAt: Type.Number(),
+  settledAt: Type.Optional(Type.Number()),
+  usage: Type.Optional(UsageSchema),
+});
+const TerminalSchema = Type.Object({
+  id: Type.String({ maxLength: BROWSER_ACTIVITY_LIMITS.maxChildIdLength }),
+  title: Text(BROWSER_ACTIVITY_LIMITS.maxTitleLength),
+  status: Type.Union([Type.Literal("done"), Type.Literal("error")]),
+  output: Text(BROWSER_ACTIVITY_LIMITS.maxOutputLength),
+  failure: Type.Optional(Text(BROWSER_ACTIVITY_LIMITS.maxFailureLength)),
+  settledAt: Type.Number(),
+});
+const SnapshotSchema = Type.Object({
+  version: Type.Literal(BROWSER_ACTIVITY_PROTOCOL_VERSION),
+  revision: Type.Integer({ minimum: 0 }),
+  generatedAt: Type.Number(),
+  children: Type.Array(ChildSchema, {
+    maxItems: BROWSER_ACTIVITY_LIMITS.maxRunningChildren,
+  }),
+  terminal: Type.Optional(TerminalSchema),
+});
+const SnapshotValidator = Compile(SnapshotSchema);
+const BoundarySchema = Type.Union([
+  Type.String(),
+  Type.Array(Type.String()),
+  Type.Number(),
+  Type.Boolean(),
+  Type.Null(),
+  Type.Partial(SnapshotSchema),
+]);
+export type BrowserActivityBoundary =
+  | BrowserActivitySnapshot
+  | ReadonlyArray<string>
+  | string
+  | number
+  | boolean
+  | null
+  | Partial<BrowserActivitySnapshot>;
+const BoundaryValidator = Compile(BoundarySchema);
+type UsageContract = { tokens?: number; contextWindow?: number };
+const StringValidator = Compile(Type.String());
+const ArrayValidator = Compile(Type.Array(Type.String()));
 
 function clean(text: string) {
-  return text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+  return Array.from(text)
+    .filter((character) => {
+      const code = character.charCodeAt(0);
+      return !(
+        code <= 0x08 ||
+        code === 0x0b ||
+        code === 0x0c ||
+        (code >= 0x0e && code <= 0x1f) ||
+        code === 0x7f
+      );
+    })
+    .join("");
 }
 
 function bounded(text: string, maxLength: number) {
@@ -157,14 +293,13 @@ function line(text: string, maxLength: number) {
   );
 }
 
-function number(value: unknown, fallback = 0) {
-  return typeof value === "number" && Number.isFinite(value)
+function number(value: number | undefined, fallback = 0) {
+  return value !== undefined && Number.isFinite(value)
     ? Math.max(0, Math.floor(value))
     : fallback;
 }
 
-function id(value: unknown): PublicChildId | undefined {
-  if (typeof value !== "string") return undefined;
+function id(value: string): PublicChildId | undefined {
   const result = line(value, BROWSER_ACTIVITY_LIMITS.maxChildIdLength);
   return result.length > 0 &&
     result.length <= BROWSER_ACTIVITY_LIMITS.maxChildIdLength &&
@@ -173,7 +308,7 @@ function id(value: unknown): PublicChildId | undefined {
     : undefined;
 }
 
-export function toPublicChildId(value: unknown): PublicChildId | undefined {
+export function toPublicChildId(value: string): PublicChildId | undefined {
   return id(value);
 }
 
@@ -192,20 +327,25 @@ function transcriptPart(
       part.text,
       BROWSER_ACTIVITY_LIMITS.maxTranscriptTextLength,
     );
-    return text
-      ? {
-          kind: "thinking",
-          text,
-          ...(part.redacted === undefined ? {} : { redacted: part.redacted }),
-        }
-      : undefined;
+    if (!text) return undefined;
+    const result: MutableThinkingItem = {
+      kind: "thinking",
+      text,
+    };
+    if (part.redacted !== undefined) result.redacted = part.redacted;
+    return result;
   }
   const name = line(part.name, BROWSER_ACTIVITY_LIMITS.maxToolNameLength);
   if (!name) return undefined;
   const args = part.argsPreview
     ? bounded(part.argsPreview, BROWSER_ACTIVITY_LIMITS.maxToolArgsLength)
     : undefined;
-  return { kind: "tool", name, ...(args ? { args } : {}) };
+  const result: MutableToolItem = {
+    kind: "tool",
+    name,
+  };
+  if (args) result.args = args;
+  return result;
 }
 
 function transcriptItem(
@@ -228,14 +368,13 @@ function transcriptItem(
   const output = item.outputPreview
     ? bounded(item.outputPreview, BROWSER_ACTIVITY_LIMITS.maxToolOutputLength)
     : undefined;
-  return [
-    {
-      kind: "tool",
-      name,
-      ...(output ? { output } : {}),
-      isError: item.isError,
-    },
-  ];
+  const result: MutableToolItem = {
+    kind: "tool",
+    name,
+    isError: item.isError,
+  };
+  if (output) result.output = output;
+  return [result];
 }
 
 function publicTool(tool: LiveToolState): BrowserActivityToolSnapshot {
@@ -245,14 +384,15 @@ function publicTool(tool: LiveToolState): BrowserActivityToolSnapshot {
   const output = tool.outputPreview
     ? bounded(tool.outputPreview, BROWSER_ACTIVITY_LIMITS.maxToolOutputLength)
     : undefined;
-  return {
+  const result: MutableToolSnapshot = {
     name: line(tool.name, BROWSER_ACTIVITY_LIMITS.maxToolNameLength),
-    ...(args ? { args } : {}),
-    ...(output ? { output } : {}),
     startedAt: number(tool.startedAt),
     updatedAt: number(tool.updatedAt),
-    ...(tool.isError === undefined ? {} : { isError: tool.isError }),
   };
+  if (args) result.args = args;
+  if (output) result.output = output;
+  if (tool.isError !== undefined) result.isError = tool.isError;
+  return result;
 }
 
 function publicQueued(snapshot: SubagentSnapshot) {
@@ -267,12 +407,11 @@ function publicQueued(snapshot: SubagentSnapshot) {
 function usage(snapshot: SubagentSnapshot) {
   const tokens = number(snapshot.usage.tokens);
   const contextWindow = number(snapshot.usage.contextWindow);
-  return tokens || contextWindow
-    ? {
-        ...(tokens ? { tokens } : {}),
-        ...(contextWindow ? { contextWindow } : {}),
-      }
-    : undefined;
+  if (!tokens && !contextWindow) return undefined;
+  const result: UsageContract = {};
+  if (tokens) result.tokens = tokens;
+  if (contextWindow) result.contextWindow = contextWindow;
+  return result;
 }
 
 function projectChild(
@@ -288,16 +427,13 @@ function projectChild(
   const reasoningEffort = snapshot.meta.reasoningEffort;
   const queued = publicQueued(snapshot);
   const childUsage = usage(snapshot);
-  return {
+  const result: MutableChildSnapshot = {
     id: id(snapshot.id) ?? "unknown",
     backend: snapshot.backend,
-    ...(model ? { model } : {}),
-    ...(reasoningEffort ? { reasoningEffort } : {}),
     title: line(snapshot.title, BROWSER_ACTIVITY_LIMITS.maxTitleLength),
     status: "running",
     prompt: bounded(snapshot.prompt, BROWSER_ACTIVITY_LIMITS.maxPromptLength),
     output: bounded(output, BROWSER_ACTIVITY_LIMITS.maxOutputLength),
-    ...(failure ? { failure } : {}),
     transcript: snapshot.transcript
       .flatMap(transcriptItem)
       .slice(-BROWSER_ACTIVITY_LIMITS.maxTranscriptItems),
@@ -307,25 +443,27 @@ function projectChild(
     queued,
     startedAt: number(snapshot.createdAt),
     lastActivityAt: number(snapshot.lastActivityAt),
-    ...(snapshot.settledAt === undefined
-      ? {}
-      : { settledAt: number(snapshot.settledAt) }),
-    ...(childUsage ? { usage: childUsage } : {}),
   };
+  if (model) result.model = model;
+  if (reasoningEffort) result.reasoningEffort = reasoningEffort;
+  if (failure) result.failure = failure;
+  if (snapshot.settledAt !== undefined)
+    result.settledAt = number(snapshot.settledAt);
+  if (childUsage) result.usage = childUsage;
+  return result;
 }
 
 /** Project one terminal transition without exposing manager/session metadata. */
 export function projectBrowserTerminal(
   snapshot: SubagentSnapshot,
 ): BrowserActivityTerminalSnapshot | undefined {
-  if (snapshot.visibility !== "standard" || snapshot.status === "running")
-    return undefined;
+  if (snapshot.status === "running") return undefined;
   const childId = id(snapshot.id);
   if (!childId) return undefined;
   const failure = snapshot.errorText
     ? bounded(snapshot.errorText, BROWSER_ACTIVITY_LIMITS.maxFailureLength)
     : undefined;
-  return {
+  const result: MutableTerminalSnapshot = {
     id: childId,
     title: line(snapshot.title, BROWSER_ACTIVITY_LIMITS.maxTitleLength),
     status: snapshot.status,
@@ -333,12 +471,13 @@ export function projectBrowserTerminal(
       snapshot.finalText,
       BROWSER_ACTIVITY_LIMITS.maxOutputLength,
     ),
-    ...(failure ? { failure } : {}),
     settledAt: number(snapshot.settledAt ?? snapshot.lastActivityAt),
   };
+  if (failure) result.failure = failure;
+  return result;
 }
 
-/** Project live standard children; terminal history is passed separately once. */
+/** Project live children; terminal history is passed separately once. */
 export function projectBrowserActivity(
   snapshots: ReadonlyArray<SubagentSnapshot>,
   revision: number,
@@ -348,9 +487,7 @@ export function projectBrowserActivity(
   const children = snapshots
     .filter(
       (snapshot) =>
-        snapshot.visibility === "standard" &&
-        snapshot.status === "running" &&
-        id(snapshot.id) !== undefined,
+        snapshot.status === "running" && id(snapshot.id) !== undefined,
     )
     .sort(
       (left, right) =>
@@ -361,24 +498,18 @@ export function projectBrowserActivity(
   const terminalSnapshot = terminal
     ? projectBrowserTerminal(terminal)
     : undefined;
-  return {
+  const result: MutableSnapshot = {
     version: BROWSER_ACTIVITY_PROTOCOL_VERSION,
     revision: number(revision),
     generatedAt: number(now),
     children,
-    ...(terminalSnapshot ? { terminal: terminalSnapshot } : {}),
   };
+  if (terminalSnapshot) result.terminal = terminalSnapshot;
+  return result;
 }
 
 export const projectBrowserSnapshot = projectBrowserActivity;
 
-const TOP_LEVEL_KEYS = [
-  "version",
-  "revision",
-  "generatedAt",
-  "children",
-  "terminal",
-] as const;
 const CHILD_KEYS = [
   "id",
   "backend",
@@ -397,6 +528,16 @@ const CHILD_KEYS = [
   "settledAt",
   "usage",
 ] as const;
+const TRANSCRIPT_USER_KEYS = ["kind", "text"] as const;
+const TRANSCRIPT_ASSISTANT_KEYS = ["kind", "text"] as const;
+const TRANSCRIPT_THINKING_KEYS = ["kind", "text", "redacted"] as const;
+const TRANSCRIPT_TOOL_KEYS = [
+  "kind",
+  "name",
+  "args",
+  "output",
+  "isError",
+] as const;
 const TOOL_KEYS = [
   "name",
   "args",
@@ -413,170 +554,145 @@ const TERMINAL_KEYS = [
   "failure",
   "settledAt",
 ] as const;
-
-function only(value: Record<string, unknown>, keys: readonly string[]) {
+const SNAPSHOT_KEYS = [
+  "version",
+  "revision",
+  "generatedAt",
+  "children",
+  "terminal",
+] as const;
+type ProtocolObject =
+  | Static<typeof SnapshotSchema>
+  | Static<typeof ChildSchema>
+  | Static<typeof ToolSchema>
+  | Static<typeof TerminalSchema>
+  | Static<typeof TranscriptSchema>
+  | Static<typeof QueuedSchema>
+  | Static<typeof UsageSchema>;
+function onlyKeys(value: ProtocolObject, keys: readonly string[]) {
   return Object.keys(value).every((key) => keys.includes(key));
 }
 
-function text(value: unknown, maxLength: number) {
-  return typeof value === "string" && Array.from(value).length <= maxLength;
+function validText(value: string, maxLength: number) {
+  return Array.from(value).length <= maxLength;
 }
 
-function validTool(value: unknown): value is BrowserActivityToolSnapshot {
+function validChild(value: Static<typeof ChildSchema>): boolean {
   return (
-    isRecord(value) &&
-    only(value, TOOL_KEYS) &&
-    text(value.name, BROWSER_ACTIVITY_LIMITS.maxToolNameLength) &&
-    (value.args === undefined ||
-      text(value.args, BROWSER_ACTIVITY_LIMITS.maxToolArgsLength)) &&
-    (value.output === undefined ||
-      text(value.output, BROWSER_ACTIVITY_LIMITS.maxToolOutputLength)) &&
-    typeof value.startedAt === "number" &&
-    Number.isFinite(value.startedAt) &&
-    typeof value.updatedAt === "number" &&
-    Number.isFinite(value.updatedAt) &&
-    (value.isError === undefined || typeof value.isError === "boolean")
-  );
-}
-
-function validTranscript(
-  value: unknown,
-): value is BrowserActivityTranscriptItem {
-  if (!isRecord(value) || typeof value.kind !== "string") return false;
-  if (value.kind === "user" || value.kind === "assistant") {
-    return (
-      only(value, ["kind", "text"]) &&
-      text(value.text, BROWSER_ACTIVITY_LIMITS.maxTranscriptTextLength)
-    );
-  }
-  if (value.kind === "thinking") {
-    return (
-      only(value, ["kind", "text", "redacted"]) &&
-      text(value.text, BROWSER_ACTIVITY_LIMITS.maxTranscriptTextLength) &&
-      (value.redacted === undefined || typeof value.redacted === "boolean")
-    );
-  }
-  return (
-    value.kind === "tool" &&
-    only(value, ["kind", "name", "args", "output", "isError"]) &&
-    text(value.name, BROWSER_ACTIVITY_LIMITS.maxToolNameLength) &&
-    (value.args === undefined ||
-      text(value.args, BROWSER_ACTIVITY_LIMITS.maxToolArgsLength)) &&
-    (value.output === undefined ||
-      text(value.output, BROWSER_ACTIVITY_LIMITS.maxToolOutputLength)) &&
-    (value.isError === undefined || typeof value.isError === "boolean")
-  );
-}
-
-function validUsage(value: unknown) {
-  return (
-    isRecord(value) &&
-    only(value, ["tokens", "contextWindow"]) &&
-    (value.tokens === undefined ||
-      (typeof value.tokens === "number" &&
-        Number.isFinite(value.tokens) &&
-        value.tokens >= 0)) &&
-    (value.contextWindow === undefined ||
-      (typeof value.contextWindow === "number" &&
-        Number.isFinite(value.contextWindow) &&
-        value.contextWindow >= 0))
-  );
-}
-
-function validQueued(value: unknown) {
-  return (
-    isRecord(value) &&
-    only(value, ["kind", "text"]) &&
-    (value.kind === "steer" || value.kind === "follow-up") &&
-    text(value.text, BROWSER_ACTIVITY_LIMITS.maxQueuedTextLength)
-  );
-}
-
-function validChild(value: unknown): value is BrowserActivityChildSnapshot {
-  return (
-    isRecord(value) &&
-    only(value, CHILD_KEYS) &&
+    onlyKeys(value, CHILD_KEYS) &&
     id(value.id) === value.id &&
-    (value.backend === "pi" ||
-      value.backend === "claude" ||
-      value.backend === "codex") &&
-    (value.model === undefined ||
-      text(value.model, BROWSER_ACTIVITY_LIMITS.maxModelLength)) &&
-    (value.reasoningEffort === undefined ||
-      value.reasoningEffort === "off" ||
-      value.reasoningEffort === "minimal" ||
-      value.reasoningEffort === "low" ||
-      value.reasoningEffort === "medium" ||
-      value.reasoningEffort === "high" ||
-      value.reasoningEffort === "xhigh" ||
-      value.reasoningEffort === "max") &&
-    text(value.title, BROWSER_ACTIVITY_LIMITS.maxTitleLength) &&
-    value.status === "running" &&
-    text(value.prompt, BROWSER_ACTIVITY_LIMITS.maxPromptLength) &&
-    text(value.output, BROWSER_ACTIVITY_LIMITS.maxOutputLength) &&
-    (value.failure === undefined ||
-      text(value.failure, BROWSER_ACTIVITY_LIMITS.maxFailureLength)) &&
-    Array.isArray(value.transcript) &&
-    value.transcript.length <= BROWSER_ACTIVITY_LIMITS.maxTranscriptItems &&
     value.transcript.every(validTranscript) &&
-    Array.isArray(value.tools) &&
-    value.tools.length <= BROWSER_ACTIVITY_LIMITS.maxToolCount &&
     value.tools.every(validTool) &&
-    Array.isArray(value.queued) &&
-    value.queued.length <= BROWSER_ACTIVITY_LIMITS.maxQueuedItems &&
     value.queued.every(validQueued) &&
-    typeof value.startedAt === "number" &&
     Number.isFinite(value.startedAt) &&
-    typeof value.lastActivityAt === "number" &&
     Number.isFinite(value.lastActivityAt) &&
-    (value.settledAt === undefined ||
-      (typeof value.settledAt === "number" &&
-        Number.isFinite(value.settledAt))) &&
+    (value.settledAt === undefined || Number.isFinite(value.settledAt)) &&
     (value.usage === undefined || validUsage(value.usage))
   );
 }
 
-function validTerminal(
-  value: unknown,
-): value is BrowserActivityTerminalSnapshot {
+function validTool(value: Static<typeof ToolSchema>): boolean {
   return (
-    isRecord(value) &&
-    only(value, TERMINAL_KEYS) &&
+    onlyKeys(value, TOOL_KEYS) &&
+    validText(value.name, BROWSER_ACTIVITY_LIMITS.maxToolNameLength) &&
+    (value.args === undefined ||
+      validText(value.args, BROWSER_ACTIVITY_LIMITS.maxToolArgsLength)) &&
+    (value.output === undefined ||
+      validText(value.output, BROWSER_ACTIVITY_LIMITS.maxToolOutputLength)) &&
+    Number.isFinite(value.startedAt) &&
+    Number.isFinite(value.updatedAt)
+  );
+}
+
+function validTranscript(value: Static<typeof TranscriptSchema>): boolean {
+  if (value.kind === "user")
+    return (
+      onlyKeys(value, TRANSCRIPT_USER_KEYS) &&
+      validText(value.text, BROWSER_ACTIVITY_LIMITS.maxTranscriptTextLength)
+    );
+  if (value.kind === "assistant")
+    return (
+      onlyKeys(value, TRANSCRIPT_ASSISTANT_KEYS) &&
+      validText(value.text, BROWSER_ACTIVITY_LIMITS.maxTranscriptTextLength)
+    );
+  if (value.kind === "thinking")
+    return (
+      onlyKeys(value, TRANSCRIPT_THINKING_KEYS) &&
+      validText(value.text, BROWSER_ACTIVITY_LIMITS.maxTranscriptTextLength)
+    );
+  return (
+    onlyKeys(value, TRANSCRIPT_TOOL_KEYS) &&
+    validText(value.name, BROWSER_ACTIVITY_LIMITS.maxToolNameLength) &&
+    (value.args === undefined ||
+      validText(value.args, BROWSER_ACTIVITY_LIMITS.maxToolArgsLength)) &&
+    (value.output === undefined ||
+      validText(value.output, BROWSER_ACTIVITY_LIMITS.maxToolOutputLength))
+  );
+}
+
+function validUsage(value: Static<typeof UsageSchema>) {
+  return (
+    onlyKeys(value, ["tokens", "contextWindow"]) &&
+    (value.tokens === undefined || Number.isFinite(value.tokens)) &&
+    (value.contextWindow === undefined || Number.isFinite(value.contextWindow))
+  );
+}
+
+function validQueued(value: Static<typeof QueuedSchema>) {
+  return (
+    onlyKeys(value, ["kind", "text"]) &&
+    validText(value.text, BROWSER_ACTIVITY_LIMITS.maxQueuedTextLength)
+  );
+}
+
+function withinSnapshotByteLimit(value: BrowserActivitySnapshot): boolean {
+  const serialized = JSON.stringify(value);
+  return (
+    serialized !== undefined &&
+    Buffer.byteLength(serialized, "utf8") <=
+      BROWSER_ACTIVITY_LIMITS.maxSnapshotBytes
+  );
+}
+
+function validTerminal(value: Static<typeof TerminalSchema>): boolean {
+  return (
+    onlyKeys(value, TERMINAL_KEYS) &&
     id(value.id) === value.id &&
-    text(value.title, BROWSER_ACTIVITY_LIMITS.maxTitleLength) &&
-    (value.status === "done" || value.status === "error") &&
-    text(value.output, BROWSER_ACTIVITY_LIMITS.maxOutputLength) &&
+    validText(value.title, BROWSER_ACTIVITY_LIMITS.maxTitleLength) &&
+    validText(value.output, BROWSER_ACTIVITY_LIMITS.maxOutputLength) &&
     (value.failure === undefined ||
-      text(value.failure, BROWSER_ACTIVITY_LIMITS.maxFailureLength)) &&
-    typeof value.settledAt === "number" &&
+      validText(value.failure, BROWSER_ACTIVITY_LIMITS.maxFailureLength)) &&
     Number.isFinite(value.settledAt)
   );
 }
 
 /** Runtime validation for both locally-produced and widget-decoded values. */
-export function isBrowserActivitySnapshot(
-  value: unknown,
+function isBrowserActivitySnapshotValue(
+  value: BrowserActivityBoundary,
+  enforceByteLimit: boolean,
 ): value is BrowserActivitySnapshot {
   if (
-    !isRecord(value) ||
-    !only(value, TOP_LEVEL_KEYS) ||
-    value.version !== BROWSER_ACTIVITY_PROTOCOL_VERSION ||
-    typeof value.revision !== "number" ||
-    !Number.isSafeInteger(value.revision) ||
-    value.revision < 0 ||
-    typeof value.generatedAt !== "number" ||
-    !Number.isFinite(value.generatedAt) ||
-    !Array.isArray(value.children) ||
-    value.children.length > BROWSER_ACTIVITY_LIMITS.maxRunningChildren ||
-    !value.children.every(validChild)
-  ) {
+    !BoundaryValidator.Check(value) ||
+    !SnapshotValidator.Check(value) ||
+    !onlyKeys(value, SNAPSHOT_KEYS)
+  )
     return false;
-  }
-  const ids = new Set(value.children.map((child) => child.id));
+  const snapshot = value;
+  const ids = new Set(snapshot.children.map((child) => child.id));
   return (
-    ids.size === value.children.length &&
-    (value.terminal === undefined || validTerminal(value.terminal))
+    Number.isSafeInteger(snapshot.revision) &&
+    snapshot.revision >= 0 &&
+    (!enforceByteLimit || withinSnapshotByteLimit(snapshot)) &&
+    ids.size === snapshot.children.length &&
+    snapshot.children.every(validChild) &&
+    (snapshot.terminal === undefined || validTerminal(snapshot.terminal))
   );
+}
+
+export function isBrowserActivitySnapshot(
+  value: BrowserActivityBoundary,
+): value is BrowserActivitySnapshot {
+  return isBrowserActivitySnapshotValue(value, true);
 }
 
 export const isValidBrowserActivitySnapshot = isBrowserActivitySnapshot;
@@ -594,35 +710,36 @@ function boundedForTransport(
   // Preserve identity and terminal status/output first when an unusually
   // large, manually-created public value reaches the encoder. The extra UTF-8
   // bounds keep this below Pi/Scotty's generic 16 KiB widget-line limit.
-  const compact = {
+  const compact: MutableSnapshot = {
     ...snapshot,
-    children: snapshot.children.map((child) => ({
-      ...child,
-      model: child.model ? boundedUtf8(child.model, 256) : undefined,
-      title: boundedUtf8(child.title, 256),
-      prompt: "",
-      output: boundedUtf8(child.output, 1_024),
-      ...(child.failure ? { failure: boundedUtf8(child.failure, 1_024) } : {}),
-      transcript: [],
-      tools: [],
-      queued: child.queued.slice(0, 1).map((message) => ({
-        kind: message.kind,
-        text: boundedUtf8(message.text, 128),
-      })),
-    })),
-    ...(snapshot.terminal
-      ? {
-          terminal: {
-            ...snapshot.terminal,
-            title: boundedUtf8(snapshot.terminal.title, 256),
-            output: boundedUtf8(snapshot.terminal.output, 1_024),
-            ...(snapshot.terminal.failure
-              ? { failure: boundedUtf8(snapshot.terminal.failure, 1_024) }
-              : {}),
-          },
-        }
-      : {}),
+    children: snapshot.children.map((child) => {
+      const result: MutableChildSnapshot = {
+        ...child,
+        model: child.model ? boundedUtf8(child.model, 256) : undefined,
+        title: boundedUtf8(child.title, 256),
+        prompt: "",
+        output: boundedUtf8(child.output, 1_024),
+        transcript: [],
+        tools: [],
+        queued: child.queued.slice(0, 1).map((message) => ({
+          kind: message.kind,
+          text: boundedUtf8(message.text, 128),
+        })),
+      };
+      if (child.failure) result.failure = boundedUtf8(child.failure, 1_024);
+      return result;
+    }),
   };
+  if (snapshot.terminal) {
+    const terminal: MutableTerminalSnapshot = {
+      ...snapshot.terminal,
+      title: boundedUtf8(snapshot.terminal.title, 256),
+      output: boundedUtf8(snapshot.terminal.output, 1_024),
+    };
+    if (snapshot.terminal.failure)
+      terminal.failure = boundedUtf8(snapshot.terminal.failure, 1_024);
+    compact.terminal = terminal;
+  }
   if (
     Buffer.byteLength(JSON.stringify(compact), "utf8") <=
     BROWSER_ACTIVITY_LIMITS.maxSnapshotBytes
@@ -632,36 +749,27 @@ function boundedForTransport(
 
   return {
     ...compact,
-    children: compact.children.map((child) => ({
-      ...child,
-      title: boundedUtf8(child.title, 128),
-      model: child.model ? boundedUtf8(child.model, 128) : undefined,
-      output: boundedUtf8(child.output, 256),
-      ...(child.failure ? { failure: boundedUtf8(child.failure, 256) } : {}),
-      queued:
-        child.queued.length > 0
-          ? [{ kind: child.queued[0]?.kind ?? "steer", text: "" }]
-          : [],
-    })),
-    ...(compact.terminal
-      ? {
-          terminal: {
-            ...compact.terminal,
-            title: boundedUtf8(compact.terminal.title, 128),
-            output: boundedUtf8(compact.terminal.output, 512),
-            ...(compact.terminal.failure
-              ? { failure: boundedUtf8(compact.terminal.failure, 512) }
-              : {}),
-          },
-        }
-      : {}),
+    children: compact.children.map((child) => {
+      const result: MutableChildSnapshot = {
+        ...child,
+        title: boundedUtf8(child.title, 128),
+        model: child.model ? boundedUtf8(child.model, 128) : undefined,
+        output: boundedUtf8(child.output, 256),
+        queued:
+          child.queued.length > 0
+            ? [{ kind: child.queued[0]?.kind ?? "steer", text: "" }]
+            : [],
+      };
+      if (child.failure) result.failure = boundedUtf8(child.failure, 256);
+      return result;
+    }),
   };
 }
 /** Encode one canonical JSON line for `ctx.ui.setWidget`. */
 export function encodeBrowserActivitySnapshot(
   snapshot: BrowserActivitySnapshot,
 ): string {
-  if (!isBrowserActivitySnapshot(snapshot)) {
+  if (!isBrowserActivitySnapshotValue(snapshot, false)) {
     throw new TypeError("Invalid browser activity snapshot");
   }
   return JSON.stringify(boundedForTransport(snapshot));
@@ -675,14 +783,14 @@ export function encodeBrowserActivityWidget(
 
 /** Decode one widget JSON line, rejecting malformed or unsafe public shapes. */
 export function decodeBrowserActivitySnapshot(
-  value: unknown,
+  value: BrowserActivityBoundary,
 ): BrowserActivitySnapshot | undefined {
-  let parsed: unknown = value;
-  if (Array.isArray(value)) {
-    if (value.length !== 1 || typeof value[0] !== "string") return undefined;
-    parsed = value[0];
+  let parsed: BrowserActivityBoundary = value;
+  if (ArrayValidator.Check(value)) {
+    if (value.length !== 1) return undefined;
+    parsed = value[0] ?? null;
   }
-  if (typeof parsed === "string") {
+  if (StringValidator.Check(parsed)) {
     if (
       Buffer.byteLength(parsed, "utf8") >
       BROWSER_ACTIVITY_LIMITS.maxSnapshotBytes
@@ -702,7 +810,7 @@ export const encodeBrowserActivity = encodeBrowserActivitySnapshot;
 export const decodeBrowserActivity = decodeBrowserActivitySnapshot;
 
 export function canonicalBrowserActivityJson(
-  value: unknown,
+  value: BrowserActivityBoundary,
 ): string | undefined {
   const snapshot = decodeBrowserActivitySnapshot(value);
   return snapshot ? encodeBrowserActivitySnapshot(snapshot) : undefined;

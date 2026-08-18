@@ -13,13 +13,13 @@ export interface ContextUtilization {
 }
 
 function usableTokens(value: number | null | undefined) {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
+  return value != null && Number.isFinite(value) && value >= 0
     ? value
     : undefined;
 }
 
 function usableCapacity(value: number | null | undefined) {
-  return typeof value === "number" && Number.isFinite(value) && value > 0
+  return value != null && Number.isFinite(value) && value > 0
     ? value
     : undefined;
 }

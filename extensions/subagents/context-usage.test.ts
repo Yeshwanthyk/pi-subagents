@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { contextOccupancyTokens } from "./src/backends/claude.ts";
-import { parseThreadTokenUsage } from "./src/backends/codex.ts";
+import { parseThreadTokenUsage, type JsonValue } from "./src/backends/codex.ts";
 
 // --- Claude: per-request occupancy, never the run aggregate ------------------
 
@@ -63,7 +63,7 @@ test("Claude occupancy from the last request stays below the window where the ru
 
 // --- Codex: last request's total, never the thread-cumulative total ----------
 
-const codexParams = (tokenUsage: unknown) => ({
+const codexParams = (tokenUsage: JsonValue) => ({
   threadId: "t",
   turnId: "u",
   tokenUsage,

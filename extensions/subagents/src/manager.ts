@@ -35,8 +35,8 @@ import type {
   SubagentResultDelivery,
   SubagentSnapshot,
   SubagentStatus,
-  SubagentVisibility,
   TranscriptItem,
+  ParentRef,
 } from "./domain.ts";
 import {
   BackendUnavailableError,
@@ -49,6 +49,7 @@ export const MAX_RUNNING = 4;
 export const MAX_TRACKED = 64;
 const STOP_TIMEOUT_MS = 5_000;
 const ERROR_TEXT_MAX_LENGTH = 4_096;
+const FALLBACK_PARENT_REF: ParentRef = { epoch: 0, leafId: null };
 
 function bounded(text: string) {
   return text.slice(0, ERROR_TEXT_MAX_LENGTH);
@@ -61,10 +62,9 @@ interface MutableSnapshot {
   id: string;
   backend: BackendName;
   owner: string;
-  visibility: SubagentVisibility;
   resultDelivery: SubagentResultDelivery;
   client?: SubagentClient;
-  tools?: ReadonlyArray<string>;
+  parentRef: ParentRef;
   title: string;
   prompt: string;
   cwd: string;
@@ -88,6 +88,7 @@ interface MutableSnapshot {
 }
 
 interface Entry {
+  parentRef: ParentRef;
   snapshot: MutableSnapshot;
   session: SubagentSession;
   scope: Scope.Closeable;
@@ -96,8 +97,6 @@ interface Entry {
   /** Idle restart dispatched but RunStarted not folded yet; counts as running
    * so concurrent restarts cannot race past the cap. */
   restarting?: boolean;
-  /** Ownership transfer has begun; no further sends or closes may race it. */
-  transferring?: boolean;
 }
 
 // --- Read model ----------------------------------------------------------------
@@ -125,24 +124,31 @@ export interface SubagentReadModel {
   ): void;
 }
 
-/** Predicate-filtered view used by standard and feature-specific dashboards. */
-export function filteredSubagentView(
-  view: SubagentReadModel,
-  includes: (snapshot: SubagentSnapshot) => boolean,
-): SubagentReadModel {
+/**
+ * Parent-facing read model. Client-correlated jobs remain in the manager's
+ * full view for the client API, but are absent from every parent tool/UI
+ * lookup and command path.
+ */
+export function parentSubagentView(view: SubagentReadModel): SubagentReadModel {
+  const isVisible = (snapshot: SubagentSnapshot) =>
+    snapshot.client === undefined;
   const included = (snapshot: SubagentSnapshot | undefined) =>
-    snapshot && includes(snapshot) ? snapshot : undefined;
+    snapshot !== undefined && isVisible(snapshot) ? snapshot : undefined;
+
   return {
-    list: () => view.list().filter(includes),
+    list: () => view.list().filter(isVisible),
     get: (id) => included(view.get(id)),
-    size: () => view.list().filter(includes).length,
+    size: () => view.list().filter(isVisible).length,
     subscribe: (listener) => view.subscribe(listener),
-    subscribeTo: (id, listener) => view.subscribeTo(id, listener),
+    subscribeTo: (id, listener) =>
+      view.subscribeTo(id, () => {
+        if (included(view.get(id)) !== undefined) listener();
+      }),
     requestSend: (id, text) => {
-      if (included(view.get(id))) view.requestSend(id, text);
+      if (included(view.get(id)) !== undefined) view.requestSend(id, text);
     },
     requestAbort: (id) => {
-      if (included(view.get(id))) view.requestAbort(id);
+      if (included(view.get(id)) !== undefined) view.requestAbort(id);
     },
     setOnSettled: () => {
       throw new Error("Filtered views cannot replace the manager settle hook.");
@@ -150,29 +156,11 @@ export function filteredSubagentView(
   };
 }
 
-export function scopedSubagentView(
-  view: SubagentReadModel,
-  owner: string,
-): SubagentReadModel {
-  return filteredSubagentView(view, (snapshot) => snapshot.owner === owner);
-}
-
+/** Compatibility name for the parent-owned subagent dashboard view. */
 export function standardSubagentView(
   view: SubagentReadModel,
 ): SubagentReadModel {
-  const standard = filteredSubagentView(
-    view,
-    (snapshot) => snapshot.visibility === "standard",
-  );
-  return {
-    ...standard,
-    requestSend: (id, text) => {
-      const snapshot = standard.get(id);
-      if (!snapshot || (snapshot.client && snapshot.status !== "running"))
-        return;
-      standard.requestSend(id, text);
-    },
-  };
+  return parentSubagentView(view);
 }
 
 // --- Service --------------------------------------------------------------------
@@ -184,7 +172,7 @@ export interface CancelResult {
   readonly cancelled: boolean;
 }
 
-export interface SubagentManagerShape {
+export interface SubagentManagerApi {
   spawn(
     backend: BackendName,
     task: SpawnTask,
@@ -206,10 +194,6 @@ export interface SubagentManagerShape {
   cancel(
     ids: ReadonlyArray<string>,
   ): Effect.Effect<ReadonlyArray<CancelResult>>;
-  /** Remove and dispose a session while preserving its persisted session file. */
-  close(id: string): Effect.Effect<SubagentSnapshot | undefined>;
-  /** Release an already-settled session for transfer to another process. */
-  release(id: string): Effect.Effect<SubagentSnapshot | undefined, SendError>;
   send(id: string, text: string): Effect.Effect<void, SendError>;
   get(id: string): Effect.Effect<SubagentSnapshot | undefined>;
   readonly list: Effect.Effect<ReadonlyArray<SubagentSnapshot>>;
@@ -219,7 +203,7 @@ export interface SubagentManagerShape {
 
 export class SubagentManager extends Context.Service<
   SubagentManager,
-  SubagentManagerShape
+  SubagentManagerApi
 >()("subagents/SubagentManager") {}
 
 // --- Implementation --------------------------------------------------------------
@@ -248,7 +232,7 @@ const makeManager = Effect.gen(function* () {
     const waiters = changeWaiters;
     changeWaiters = [];
     for (const waiter of waiters) waiter();
-    for (const listener of [...listeners]) {
+    for (const listener of Array.from(listeners)) {
       try {
         listener();
       } catch {
@@ -256,7 +240,7 @@ const makeManager = Effect.gen(function* () {
       }
     }
     if (id) {
-      for (const listener of idListeners.get(id) ?? []) {
+      for (const listener of Array.from(idListeners.get(id) ?? [])) {
         try {
           listener();
         } catch {
@@ -495,15 +479,18 @@ const makeManager = Effect.gen(function* () {
 
         const id = `sa-${++counter}`;
         const meta = yield* session.meta;
+        const parentRef: ParentRef = task.parentRef
+          ? { ...task.parentRef }
+          : { ...FALLBACK_PARENT_REF };
         const entry: Entry = {
+          parentRef,
           snapshot: {
             id,
             backend: backendName,
             owner: task.owner ?? "subagents",
-            visibility: task.visibility ?? "standard",
             resultDelivery: task.resultDelivery ?? "parent",
             client: task.client ? { ...task.client } : undefined,
-            tools: task.tools ? [...task.tools] : undefined,
+            parentRef,
             title: task.title,
             prompt: task.prompt,
             cwd: task.cwd,
@@ -546,6 +533,9 @@ const makeManager = Effect.gen(function* () {
         entry.pump = yield* Scope.provide(Effect.forkScoped(pump), scope);
 
         notify(id);
+        // SAFETY: the initial snapshot literal above supplies every
+        // SubagentSnapshot field, and the pump only mutates it in place, so
+        // the live object already satisfies the domain view being returned.
         return entry.snapshot as SubagentSnapshot;
       });
 
@@ -654,48 +644,10 @@ const makeManager = Effect.gen(function* () {
       );
     });
 
-  const close = (id: string) =>
-    Effect.gen(function* () {
-      const entry = entries.get(id);
-      if (!entry) return undefined;
-      if (entry.snapshot.status === "running") yield* abortEntry(entry);
-      entries.delete(id);
-      yield* closeEntryScope(entry).pipe(
-        Effect.timeout(STOP_TIMEOUT_MS),
-        Effect.ignore,
-      );
-      notify(id);
-      return entry.snapshot as SubagentSnapshot;
-    });
-
-  const release = (id: string) =>
-    Effect.gen(function* () {
-      const entry = entries.get(id);
-      if (!entry) return undefined;
-      if (entry.transferring) {
-        return yield* new SendError({
-          message: `Subagent "${id}" is already being transferred.`,
-        });
-      }
-      if (entry.snapshot.status === "running" || entry.restarting) {
-        return yield* new SendError({
-          message: `Subagent "${id}" must settle before it can be released.`,
-        });
-      }
-      entry.transferring = true;
-      entries.delete(id);
-      yield* closeEntryScope(entry).pipe(
-        Effect.timeout(STOP_TIMEOUT_MS),
-        Effect.ignore,
-      );
-      notify(id);
-      return entry.snapshot as SubagentSnapshot;
-    });
-
   const send = (id: string, text: string) =>
     Effect.suspend((): Effect.Effect<void, SendError> => {
       const entry = entries.get(id);
-      if (!entry || disposed || entry.transferring) {
+      if (!entry || disposed) {
         return new SendError({
           message: `Subagent "${id}" is no longer tracked.`,
         });
@@ -770,6 +722,12 @@ const makeManager = Effect.gen(function* () {
       };
     },
     requestSend: (id, text) => {
+      const entry = entries.get(id);
+      if (
+        !entry ||
+        (entry.snapshot.client && entry.snapshot.status !== "running")
+      )
+        return;
       runDetached(send(id, text).pipe(Effect.ignore));
     },
     requestAbort: (id) => {
@@ -792,8 +750,6 @@ const makeManager = Effect.gen(function* () {
     spawn,
     waitFor,
     cancel,
-    close,
-    release,
     send,
     get: (id) => Effect.sync(() => entries.get(id)?.snapshot),
     list: Effect.sync(() => [...entries.values()].map((e) => e.snapshot)),

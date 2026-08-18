@@ -112,7 +112,8 @@ test("Codex settings and reroutes replace stale effort metadata", () => {
 
 test("Pi metadata reads the runtime session thinking level on each update", () => {
   const runtime = { thinkingLevel: "low", sessionFile: "/tmp/pi.jsonl" };
-  const session = runtime as unknown as Pick<
+  // SAFETY: The runtime fixture supplies exactly the two AgentSession fields consumed here.
+  const session = runtime as Pick<
     AgentSession,
     "thinkingLevel" | "sessionFile"
   >;
@@ -127,7 +128,6 @@ test("dashboard and takeover metadata render the exact thinking label", () => {
     id: "sa-1",
     backend: "pi",
     owner: "subagents",
-    visibility: "standard",
     resultDelivery: "parent",
     title: "fixture",
     prompt: "test",
@@ -174,17 +174,17 @@ test("dashboard and takeover metadata render the exact thinking label", () => {
   );
 });
 
+// SAFETY: This fixture implements only the Theme methods exercised by width-constrained rendering.
 const plainTheme = {
   fg: (_color: string, text: string) => text,
   bold: (text: string) => text,
-} as unknown as Theme;
+} as Theme;
 
 test("dashboard rows and takeover headers stay within constrained widths", () => {
   const snap: SubagentSnapshot = {
     id: "sa-long-id",
     backend: "codex",
     owner: "subagents",
-    visibility: "standard",
     resultDelivery: "parent",
     title: "A deliberately long subagent title",
     prompt: "test",

@@ -11,11 +11,15 @@
  *   the child session_shutdown hook and disposes the session.
  */
 
-import { unlinkSync } from "node:fs";
-import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
+import type {
+  AssistantMessage,
+  Model,
+  UserMessage,
+} from "@earendil-works/pi-ai";
 import type {
   AgentSession,
   AgentSessionEvent,
+  AgentToolResult,
   ModelRegistry,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -60,7 +64,7 @@ type ThinkingLevel = NonNullable<
 
 export function resolvePiReasoningEffort(
   requested: ReasoningEffort | undefined,
-  inherited: unknown,
+  inherited: string | undefined,
 ): ReasoningEffort | undefined {
   return requested ?? (isReasoningEffort(inherited) ? inherited : undefined);
 }
@@ -115,7 +119,7 @@ function resolvePiModel(
   throw new Error(`Unknown model "${hint}".`);
 }
 
-// --- Child session helpers (ported from v1 shared/child-session.ts) -----------
+// --- Session resources -------------------------------------------------------
 
 /** Load normal global/package resources and trust-gated project resources. */
 async function createChildResources(cwd: string, projectTrusted: boolean) {
@@ -126,43 +130,6 @@ async function createChildResources(cwd: string, projectTrusted: boolean) {
   const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
   await loader.reload();
   return { loader, settingsManager };
-}
-
-export function createChildSessionManager(
-  task: SpawnTask,
-  sessionDir?: string,
-): SessionManager {
-  const seed = task.sessionSeed;
-  if (!seed || seed.kind === "fresh") {
-    return SessionManager.create(task.cwd, sessionDir, {
-      parentSession: seed?.parentSession,
-    });
-  }
-  const target = SessionManager.create(task.cwd, sessionDir);
-  const targetFile = target.getSessionFile();
-  const targetDir = target.getSessionDir();
-  const parent = SessionManager.open(
-    seed.parentSessionFile,
-    targetDir,
-    task.cwd,
-  );
-  const forkedPath = parent.createBranchedSession(seed.parentLeafId);
-  if (targetFile && targetFile !== forkedPath) {
-    try {
-      unlinkSync(targetFile);
-    } catch {
-      // The empty allocation file is best-effort cleanup only.
-    }
-  }
-  if (!forkedPath) {
-    throw new Error(
-      "Failed to create a persisted fork for the interactive child session.",
-    );
-  }
-  // createBranchedSession mutates `parent` to own the new target file. Return
-  // that live manager rather than reopening: Pi intentionally defers writing
-  // user-only branches until the first assistant response.
-  return parent;
 }
 
 function waitBounded(operation: Promise<unknown>, timeoutMs: number) {
@@ -265,11 +232,15 @@ function createToolCallTimeoutGuard(timeoutMs = CHILD_TOOL_CALL_TIMEOUT_MS) {
 
 // --- Event translation ----------------------------------------------------------
 
-function messageRole(msg: unknown): Message["role"] | undefined {
-  const role = (msg as { role?: string } | undefined)?.role;
-  if (role === "user" || role === "assistant" || role === "toolResult")
-    return role;
-  return undefined;
+/**
+ * Decoded preview JSON. Tool-call arguments are model-emitted JSON trees, so
+ * preview rendering reads a named JsonValue contract instead of ad-hoc typeof
+ * parsing over the SDK's `any`/`Record<string, any>` values.
+ */
+export type JsonValue =
+  string | number | boolean | null | JsonValue[] | JsonObject;
+export interface JsonObject {
+  [key: string]: JsonValue;
 }
 
 function lastAssistantMessage(
@@ -278,7 +249,7 @@ function lastAssistantMessage(
   const messages = session.messages;
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
-    if (messageRole(msg) === "assistant") return msg as AssistantMessage;
+    if (msg.role === "assistant") return msg;
   }
   return undefined;
 }
@@ -288,8 +259,8 @@ function finalOutput(session: AgentSession): string {
   const messages = session.messages;
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
-    if (messageRole(msg) !== "assistant") continue;
-    const text = (msg as AssistantMessage).content
+    if (msg.role !== "assistant") continue;
+    const text = msg.content
       .filter((part) => part.type === "text")
       .map((part) => part.text)
       .join("\n")
@@ -299,7 +270,7 @@ function finalOutput(session: AgentSession): string {
   return "";
 }
 
-function safeJson(value: unknown): string | undefined {
+function safeJson(value: JsonValue): string | undefined {
   try {
     const text = JSON.stringify(value);
     return text === "{}" ? undefined : text;
@@ -308,22 +279,15 @@ function safeJson(value: unknown): string | undefined {
   }
 }
 
-/** First non-empty line of a tool result-ish value (v1 liveToolPreview). */
-function toolPreview(value: unknown): string | undefined {
-  if (typeof value === "string") {
-    return value
-      .split("\n")
-      .find((line) => line.trim())
-      ?.trim();
-  }
-  if (!value || typeof value !== "object") return undefined;
-  const content = (value as { content?: unknown }).content;
-  if (!Array.isArray(content)) return undefined;
-  for (const part of content) {
-    if (!part || typeof part !== "object") continue;
-    const record = part as { type?: unknown; text?: unknown };
-    if (record.type !== "text" || typeof record.text !== "string") continue;
-    const firstLine = record.text.split("\n").find((line) => line.trim());
+/**
+ * First non-empty line of a text content part (v1 liveToolPreview). The SDK's
+ * tool events deliver `AgentToolResult` payloads, so the contract is the
+ * owner-typed shape rather than an unparsed value.
+ */
+function toolPreview(result: AgentToolResult<unknown>): string | undefined {
+  for (const part of result.content) {
+    if (part.type !== "text") continue;
+    const firstLine = part.text.split("\n").find((line) => line.trim());
     if (firstLine) return firstLine.trim();
   }
   return undefined;
@@ -341,39 +305,36 @@ function assistantParts(msg: AssistantMessage): TranscriptPart[] {
         redacted: part.redacted,
       });
     } else if (part.type === "toolCall") {
+      // SAFETY: pi parses tool-call arguments from model-emitted JSON, so the
+      // whole tree satisfies the JsonValue contract by construction.
+      const argsPreview = safeJson(part.arguments as JsonValue);
       parts.push({
         type: "toolCall",
         toolId: part.id,
         name: part.name,
-        argsPreview: safeJson(part.arguments),
+        argsPreview,
       });
     }
   }
   return parts;
 }
 
-function userText(msg: Message): string {
-  const content = (msg as { content: unknown }).content;
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter(
-      (part): part is { type: "text"; text: string } =>
-        !!part &&
-        typeof part === "object" &&
-        (part as { type?: unknown }).type === "text",
-    )
-    .map((part) => part.text)
-    .join("\n");
+function userText(message: UserMessage): string {
+  const content = message.content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("\n");
+  }
+  return content;
 }
 
 // --- The session ------------------------------------------------------------------
 
-function boundedError(error: unknown) {
-  return (error instanceof Error ? error.message : String(error)).slice(
-    0,
-    4096,
-  );
+function boundedError(error: Error | string) {
+  const text = error instanceof Error ? error.message : error;
+  return text.slice(0, 4096);
 }
 
 const makePiSession = (
@@ -390,7 +351,10 @@ const makePiSession = (
     const model = yield* Effect.try({
       try: () =>
         resolvePiModel(registry, task.model, task.parent.inheritedModel),
-      catch: (error) => new SpawnError({ message: boundedError(error) }),
+      catch: (error) =>
+        new SpawnError({
+          message: boundedError(error instanceof Error ? error : String(error)),
+        }),
     });
     // pi's thinking levels ARE the shared reasoning-effort scale.
     const thinkingLevel: ThinkingLevel | undefined = resolvePiReasoningEffort(
@@ -406,13 +370,12 @@ const makePiSession = (
         );
         const { session } = await createAgentSession({
           cwd: task.cwd,
-          sessionManager: createChildSessionManager(task),
+          sessionManager: SessionManager.create(task.cwd),
           settingsManager,
           resourceLoader: loader,
           modelRegistry: registry,
           model,
           thinkingLevel,
-          tools: task.tools ? [...task.tools] : undefined,
           excludeTools: [...CHILD_EXCLUDED_TOOL_NAMES],
         });
         // Start child extension session hooks/resources in headless mode.
@@ -420,30 +383,20 @@ const makePiSession = (
         // the scope finalizer that owns cleanup is only registered later.
         try {
           await session.bindExtensions({ mode: "print" });
-          if (task.tools) {
-            const active = session.getActiveToolNames();
-            const requested = new Set(task.tools);
-            const unexpected = active.filter((name) => !requested.has(name));
-            if (unexpected.length > 0) {
-              throw new Error(
-                `Pi child activated tools outside its allowlist: ${unexpected.join(", ")}`,
-              );
-            }
-            if (requested.has("read") && !active.includes("read")) {
-              throw new Error(
-                "Pi child could not activate the required read tool.",
-              );
-            }
-          }
         } catch (error) {
           await shutdownAndDisposeChildSession(session);
           throw error;
         }
         return session;
       },
-      catch: (error) => new SpawnError({ message: boundedError(error) }),
+      catch: (error) =>
+        new SpawnError({
+          message: boundedError(error instanceof Error ? error : String(error)),
+        }),
     });
 
+    // SAFETY: the initial run-error marker is the undefined member of
+    // `string | undefined`; prompt() rejections assign bounded strings to it.
     const state = {
       closed: false,
       /** prompt() rejection for the active run; folded into RunSettled. */
@@ -555,14 +508,14 @@ const makePiSession = (
           break;
         }
         case "message_end": {
-          const role = messageRole(event.message);
-          if (role === "user") {
-            const text = userText(event.message as Message);
+          const message = event.message;
+          if (message.role === "user") {
+            const text = userText(message);
             if (text.trim()) emit({ _tag: "UserMessage", text });
-          } else if (role === "assistant") {
+          } else if (message.role === "assistant") {
             emit({
               _tag: "AssistantMessage",
-              parts: assistantParts(event.message as AssistantMessage),
+              parts: assistantParts(message),
             });
             emitUsage();
             emit({ _tag: "MetaChanged", meta: currentMeta() });
@@ -571,11 +524,13 @@ const makePiSession = (
           break;
         }
         case "tool_execution_start":
+          // SAFETY: tool-call arguments are model-emitted JSON, so the whole
+          // tree satisfies the JsonValue contract by construction.
           emit({
             _tag: "ToolStart",
             toolId: event.toolCallId,
             name: event.toolName,
-            argsPreview: safeJson(event.args),
+            argsPreview: safeJson(event.args as JsonValue),
           });
           break;
         case "tool_execution_update":
@@ -637,7 +592,9 @@ const makePiSession = (
       state.settled = false;
       emit({ _tag: "RunStarted" });
       void session.prompt(text).catch((error) => {
-        state.runError = boundedError(error);
+        state.runError = boundedError(
+          error instanceof Error ? error : String(error),
+        );
         // Preflight failures may never start the agent lifecycle, so no
         // agent_settled will arrive for them.
         if (!session.isStreaming) settle();
@@ -668,7 +625,12 @@ const makePiSession = (
             // rejected steer is a real send failure, not a diagnostic.
             return Effect.tryPromise({
               try: () => session.steer(text),
-              catch: (error) => new SendError({ message: boundedError(error) }),
+              catch: (error) =>
+                new SendError({
+                  message: boundedError(
+                    error instanceof Error ? error : String(error),
+                  ),
+                }),
             }).pipe(Effect.asVoid);
           }
           return Effect.sync(() => startRun(text));
