@@ -3,7 +3,7 @@ import type {
   ExtensionUIContext,
   Theme,
 } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
   ACTIVE_WORK_CHANNELS,
   type ActiveWorkItem,
@@ -15,8 +15,6 @@ const MAX_FLASH = 2;
 const FLASH_TTL_MS = 20_000;
 const SPINNER_MS = 150;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/** 1 header + MAX_VISIBLE × 2-line cards + MAX_FLASH flash rows + 1 footer. */
-const ACTIVE_RAIL_LINES = 1 + MAX_VISIBLE * 2 + MAX_FLASH + 1;
 const COALESCE_MS = 100;
 
 interface SettleFlash {
@@ -71,6 +69,11 @@ function bounded(text: string, maxLength: number) {
     : `${value.slice(0, maxLength - 1)}…`;
 }
 
+function compactAge(timestamp: number, now: number) {
+  const seconds = Math.max(0, Math.round((now - timestamp) / 1_000));
+  return seconds < 2 ? "active now" : `active ${age(timestamp, now)} ago`;
+}
+
 function spinnerAt(now: number) {
   return SPINNER_FRAMES[Math.floor(now / SPINNER_MS) % SPINNER_FRAMES.length];
 }
@@ -91,7 +94,7 @@ function statusChip(
   }
 }
 
-/** Render one running/quiet item as a 2-line card. */
+/** Render one item as compact metadata plus a fully wrapped operation. */
 function cardLines(
   item: ActiveWorkItem,
   theme: Theme,
@@ -102,38 +105,39 @@ function cardLines(
   const glyph = quiet
     ? theme.fg("muted", "■")
     : theme.fg("warning", spinnerAt(now));
-  const title = theme.fg("accent", bounded(item.label, 28));
+  const title = theme.fg("accent", bounded(item.label, 32));
   const meta = [
-    item.modelLabel ? bounded(item.modelLabel, 18) : undefined,
-    age(item.lastActivityAt, now),
+    compactAge(item.lastActivityAt, now),
+    item.completedOperations && item.completedOperations > 0
+      ? `${item.completedOperations} ops`
+      : undefined,
+    typeof item.contextPercent === "number"
+      ? `ctx ${item.contextPercent}%`
+      : undefined,
   ]
     .filter(Boolean)
     .join(" · ");
-  // Live spinner already signals activity; the chip is reserved for
-  // quiet/settled rows so the running state isn't stated twice.
+  // Live spinner already signals activity; the chip is reserved for quiet rows.
   const line1 = quiet
     ? `${glyph} ${title} ${statusChip("quiet", theme)}` +
       (meta ? theme.fg("dim", ` · ${meta}`) : "")
     : `${glyph} ${title}` + (meta ? theme.fg("dim", ` · ${meta}`) : "");
 
-  const parts: string[] = [];
-  if (item.currentOperation) {
-    parts.push(`→ ${bounded(item.currentOperation, 36)}`);
-  } else if (quiet) {
-    parts.push("quiet · no recent events");
-  } else {
-    parts.push("model working");
-  }
-  if (item.completedOperations && item.completedOperations > 0) {
-    parts.push(`${item.completedOperations} ops`);
-  }
-  if (typeof item.contextPercent === "number") {
-    parts.push(`ctx ${item.contextPercent}%`);
-  }
-  const line2 = `  ${theme.fg(quiet ? "muted" : "toolTitle", parts.join(" · "))}`;
+  const operation =
+    item.currentOperation ??
+    (quiet ? "quiet · no recent events" : "model working");
+  const operationLines = wrapTextWithAnsi(operation, Math.max(10, width - 5));
   return [
     truncateToWidth(line1, width, "…"),
-    truncateToWidth(line2, width, "…"),
+    ...operationLines.map((line, index) =>
+      truncateToWidth(
+        `${index === 0 ? "  → " : "     "}${theme.fg(
+          quiet ? "muted" : "toolTitle",
+          line,
+        )}`,
+        width,
+      ),
+    ),
   ];
 }
 
@@ -174,7 +178,6 @@ export function renderActiveWorkRail(
   const overflow =
     Math.max(0, items.length - MAX_VISIBLE) +
     Math.max(0, flashes.length - MAX_FLASH);
-  while (lines.length < ACTIVE_RAIL_LINES - 1) lines.push("");
   lines.push(
     overflow > 0
       ? theme.fg("dim", `+${overflow} more active items · ctrl+shift+a`)

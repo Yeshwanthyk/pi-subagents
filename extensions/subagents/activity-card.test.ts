@@ -134,7 +134,7 @@ test("active-work rail is bounded and shows overflow", () => {
     lastActivityAt: 2_000 + index,
   }));
   const lines = renderActiveWorkRail(items, theme, 7_000);
-  assert.equal(lines.length, 12);
+  assert.equal(lines.length, 10);
   assert.equal(lines.filter((line) => /sa-\d/.test(line)).length, 4);
   assert.match(lines.at(-1) ?? "", /\+2 more active items/);
 });
@@ -156,7 +156,7 @@ test("active-work rail derives quiet state as activity ages", () => {
   assert.match(lines.join("\n"), /\[QUIET\]/);
 });
 
-test("active-work rail renders running cards with spinner, model, ops and ctx", () => {
+test("active-work rail renders compact running rows with spinner, ops and ctx", () => {
   const item: ActiveWorkItem = {
     version: 1,
     key: "subagent:sa-1",
@@ -176,10 +176,31 @@ test("active-work rail renders running cards with spinner, model, ops and ctx", 
   assert.match(text, /⠋/);
   assert.doesNotMatch(text, /\[RUNNING\]/);
   assert.match(text, /Fix login flow/);
-  assert.match(text, /deepseek-v4-flash/);
   assert.match(text, /12 ops/);
   assert.match(text, /ctx 4%/);
   assert.match(text, /→ bash npm test/);
+});
+
+test("active-work rail wraps the full operation instead of truncating it", () => {
+  const item: ActiveWorkItem = {
+    version: 1,
+    key: "subagent:sa-long",
+    kind: "subagent",
+    label: "p0-implementer",
+    status: "running",
+    summary: "read source",
+    currentOperation:
+      "read vendor/alchemy/packages/alchemy/src/Cloudflare/Workers/Source.ts",
+    runningProcesses: 0,
+    startedAt: 1_000,
+    lastActivityAt: 2_000,
+  };
+  const text = renderActiveWorkRail([item], theme, 3_000, [], 42).join("\n");
+  assert.match(
+    text.replace(/\s+/g, ""),
+    /vendor\/alchemy\/packages\/alchemy\/src\/Cloudflare\/Workers\/Source\.ts/,
+  );
+  assert.doesNotMatch(text, /…/);
 });
 
 test("active-work rail spinner advances with time and is deterministic per now", () => {

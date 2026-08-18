@@ -58,7 +58,7 @@ export function subagentActiveWorkItem(
   const current = snapshot.liveTools[0];
   const quiet = Date.now() - snapshot.lastActivityAt >= 30_000;
   const operation = current
-    ? bounded(
+    ? singleLine(
         `${current.name}${current.argsPreview ? ` ${current.argsPreview}` : ""}`,
       )
     : undefined;
@@ -66,7 +66,7 @@ export function subagentActiveWorkItem(
     version: 1,
     key: `subagent:${snapshot.id}`,
     kind: "subagent",
-    label: bounded(snapshot.title, 72),
+    label: bounded(`${snapshot.id} · ${snapshot.title}`, 72),
     status: quiet ? "quiet" : "running",
     summary:
       operation ?? (quiet ? "quiet · no recent events" : "model working"),
