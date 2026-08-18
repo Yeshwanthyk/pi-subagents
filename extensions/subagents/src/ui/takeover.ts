@@ -12,7 +12,12 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
-import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  Input,
+  matchesKey,
+  truncateToWidth,
+  visibleWidth,
+} from "@earendil-works/pi-tui";
 import { formatElapsed, type SubagentSnapshot } from "../domain.ts";
 import { formatContextUtilization } from "../format.ts";
 import type { SubagentReadModel } from "../manager.ts";
@@ -32,6 +37,26 @@ function backgroundLine(
 /** Below this terminal width the dashboard falls back to a single list. */
 const TWO_PANE_MIN_WIDTH = 88;
 const TRANSCRIPT_SCROLL_STEP = 6;
+const TAKEOVER_COMPACT_HEADER_WIDTH = 64;
+
+export interface TakeoverPosition {
+  /** Zero-based position in the current dashboard order. */
+  index: number;
+  total: number;
+}
+
+/** Cycle through the current dashboard order, wrapping at either end. */
+export function cycleSubagentId(
+  ids: ReadonlyArray<string>,
+  currentId: string,
+  direction: -1 | 1,
+): string | undefined {
+  if (ids.length === 0) return undefined;
+  const currentIndex = ids.indexOf(currentId);
+  const baseIndex =
+    currentIndex >= 0 ? currentIndex : direction > 0 ? -1 : ids.length;
+  return ids[(baseIndex + direction + ids.length) % ids.length];
+}
 
 function configuredKeys(
   keybindings: KeybindingsManager,
@@ -125,6 +150,65 @@ export function renderTakeoverHeader(
     theme.fg("dim", ` · ${takeoverMetaLabels(snap).slice(0, 2).join(" · ")}`) +
     (utilization ? theme.fg("dim", ` · ${utilization}`) : "");
   return truncateToWidth(header, width, "…");
+}
+/** Responsive identity and metadata header for the single-agent takeover view. */
+export function renderTakeoverHeaderLines(
+  snap: SubagentSnapshot,
+  width: number,
+  theme: Theme,
+  position?: TakeoverPosition,
+): string[] {
+  const positionLabel =
+    position && position.total > 0
+      ? theme.fg("muted", `${position.index + 1}/${position.total}`)
+      : undefined;
+  const identity =
+    `${statusGlyph(snap, theme)} ` +
+    theme.fg("accent", theme.bold(`${snap.id} · ${snap.title}`));
+
+  let identityLine = truncateToWidth(identity, width, "…");
+  if (positionLabel) {
+    const positionWidth = visibleWidth(positionLabel);
+    const identityWidth = Math.max(1, width - positionWidth - 1);
+    identityLine = truncateToWidth(identity, identityWidth, "…");
+    const gap = Math.max(1, width - visibleWidth(identityLine) - positionWidth);
+    identityLine = truncateToWidth(
+      `${identityLine}${" ".repeat(gap)}${positionLabel}`,
+      width,
+      "…",
+    );
+  }
+
+  const model = `${snap.backend}: ${snap.meta.modelLabel ?? "?"}`;
+  const context = formatContextUtilization(snap.usage);
+  const coreMeta = [
+    statusWord(snap, theme),
+    theme.fg("muted", model),
+    context ? theme.fg("dim", `ctx ${context}`) : undefined,
+  ].filter((label): label is string => label !== undefined);
+  const runMeta = [
+    theme.fg("dim", formatElapsed(snap)),
+    snap.completedOperations > 0
+      ? theme.fg("dim", `${snap.completedOperations} ops`)
+      : undefined,
+    subagentThinkingLabel(snap)
+      ? theme.fg("dim", `think:${subagentThinkingLabel(snap)}`)
+      : undefined,
+  ].filter((label): label is string => label !== undefined);
+  const separator = theme.fg("dim", " · ");
+
+  if (width < TAKEOVER_COMPACT_HEADER_WIDTH) {
+    return [
+      identityLine,
+      truncateToWidth(coreMeta.join(separator), width, "…"),
+      truncateToWidth(runMeta.join(separator), width, "…"),
+    ];
+  }
+
+  return [
+    identityLine,
+    truncateToWidth([...coreMeta, ...runMeta].join(separator), width, "…"),
+  ];
 }
 
 /** Two-line row for the left-hand agent list of the two-pane dashboard. */
@@ -734,7 +818,10 @@ class TakeoverView implements Component, Focusable {
   private input = new Input();
   /** Scroll offset in lines from the bottom of the transcript. 0 = pinned to bottom. */
   private scrollOffset = 0;
+  private headerRows = 1;
   private unsubscribe: () => void;
+  private unsubscribeView: () => void;
+  private drafts = new Map<string, string>();
   private renderTimer?: ReturnType<typeof setTimeout>;
   private ticker: ReturnType<typeof setInterval>;
   private closed = false;
@@ -765,11 +852,16 @@ class TakeoverView implements Component, Focusable {
     this.done = done;
     this.options = options;
     this.unsubscribe = view.subscribeTo(id, () => this.scheduleRender());
+    // The current agent subscription keeps streaming output cheap; the
+    // broader subscription keeps the `n/total` header accurate as agents
+    // settle or are pruned while this view is open.
+    this.unsubscribeView = view.subscribe(() => this.scheduleRender());
     // Elapsed time in the header ticks along at 1Hz.
     this.ticker = setInterval(() => this.tui.requestRender(), 1000);
     this.input.onSubmit = (value: string) => {
       const text = value.trim();
       if (!text) return;
+      this.drafts.delete(this.id);
       this.input.setValue("");
       this.view.requestSend(this.id, text);
       this.scrollOffset = 0;
@@ -779,6 +871,33 @@ class TakeoverView implements Component, Focusable {
 
   private snap(): SubagentSnapshot | undefined {
     return this.view.get(this.id);
+  }
+  private position(): TakeoverPosition {
+    const ids = this.view.list().map((snapshot) => snapshot.id);
+    const index = ids.indexOf(this.id);
+    return {
+      index: Math.max(0, index),
+      total: ids.length,
+    };
+  }
+
+  private moveAgent(direction: -1 | 1) {
+    const nextId = cycleSubagentId(
+      this.view.list().map((snapshot) => snapshot.id),
+      this.id,
+      direction,
+    );
+    if (!nextId || nextId === this.id) return;
+
+    this.drafts.set(this.id, this.input.getValue());
+    this.unsubscribe();
+    this.id = nextId;
+    this.unsubscribe = this.view.subscribeTo(this.id, () =>
+      this.scheduleRender(),
+    );
+    this.input.setValue(this.drafts.get(this.id) ?? "");
+    this.scrollOffset = 0;
+    this.tui.requestRender();
   }
 
   private scheduleRender() {
@@ -795,6 +914,7 @@ class TakeoverView implements Component, Focusable {
     if (this.closed) return false;
     this.closed = true;
     this.unsubscribe();
+    this.unsubscribeView();
     clearInterval(this.ticker);
     if (this.renderTimer) clearTimeout(this.renderTimer);
     this.renderTimer = undefined;
@@ -822,6 +942,14 @@ class TakeoverView implements Component, Focusable {
       this.close();
       return;
     }
+    if (matchesKey(data, "tab")) {
+      this.moveAgent(1);
+      return;
+    }
+    if (matchesKey(data, "shift+tab")) {
+      this.moveAgent(-1);
+      return;
+    }
     if (this.keybindings.matches(data, "tui.editor.cursorUp")) {
       this.scrollOffset += TRANSCRIPT_SCROLL_STEP;
       this.scheduleRender();
@@ -836,14 +964,14 @@ class TakeoverView implements Component, Focusable {
       return;
     }
     if (this.keybindings.matches(data, "tui.editor.pageUp")) {
-      this.scrollOffset += this.viewportHeight();
+      this.scrollOffset += this.viewportHeight(this.headerRows);
       this.tui.requestRender();
       return;
     }
     if (this.keybindings.matches(data, "tui.editor.pageDown")) {
       this.scrollOffset = Math.max(
         0,
-        this.scrollOffset - this.viewportHeight(),
+        this.scrollOffset - this.viewportHeight(this.headerRows),
       );
       this.tui.requestRender();
       return;
@@ -852,11 +980,12 @@ class TakeoverView implements Component, Focusable {
     this.tui.requestRender();
   }
 
-  private viewportHeight(): number {
+  private viewportHeight(headerRows = 1): number {
     const rows = this.tui.terminal.rows || 30;
-    // The complete view renders viewport + 7 chrome rows. Using rows - 8
-    // makes the overlay exactly terminal rows - 1.
-    return Math.max(6, rows - 8);
+    // The complete view renders viewport + (6 + headerRows) chrome rows.
+    // Leaving one row for pi's footer makes the overlay exactly terminal
+    // rows - 1, even when the compact header grows to three lines.
+    return Math.max(1, rows - 7 - headerRows);
   }
 
   render(width: number): string[] {
@@ -872,14 +1001,21 @@ class TakeoverView implements Component, Focusable {
       return lines;
     }
 
+    const header = renderTakeoverHeaderLines(
+      snap,
+      width,
+      theme,
+      this.position(),
+    );
+    this.headerRows = header.length;
     lines.push(border);
-    lines.push(renderTakeoverHeader(snap, width, theme));
+    lines.push(...header);
     lines.push(border);
 
     // Fixed-height transcript viewport. Error and scroll status consume rows
     // inside the viewport so streaming/scrolling never changes overlay height.
     const transcript = buildTranscriptLines(snap, width, theme);
-    const viewport = this.viewportHeight();
+    const viewport = this.viewportHeight(header.length);
     const errorRows = snap.errorText ? 1 : 0;
     const scrollRows = this.scrollOffset > 0 ? 1 : 0;
     const transcriptCapacity = Math.max(1, viewport - errorRows - scrollRows);
@@ -922,7 +1058,10 @@ class TakeoverView implements Component, Focusable {
 
     lines.push(border);
     lines.push(...this.input.render(width));
-    const help = `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page`;
+    const help =
+      width < TAKEOVER_COMPACT_HEADER_WIDTH
+        ? `tab/shift+tab agents · ${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort`
+        : `${configuredKeys(this.keybindings, "tui.input.submit")} send · tab next · shift+tab previous · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page`;
     lines.push(truncateToWidth(theme.fg("dim", help), width));
     lines.push(border);
     return lines;

@@ -4,10 +4,12 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { SubagentSnapshot } from "./src/domain.ts";
 import {
+  cycleSubagentId,
   orderDashboardSnapshots,
   reconcileDashboardSelection,
   renderDetailHeader,
   renderListPaneRow,
+  renderTakeoverHeaderLines,
   type DashboardSelection,
 } from "./src/ui/takeover.ts";
 
@@ -64,6 +66,50 @@ test("dashboard selection follows its subagent id and falls back by row", () => 
 
   reconcileDashboardSelection(selection, []);
   assert.deepEqual(selection, { id: undefined, index: 0 });
+});
+
+test("agent cycling wraps and handles a missing current id", () => {
+  const ids = ["sa-1", "sa-2", "sa-3"];
+  assert.equal(cycleSubagentId(ids, "sa-1", 1), "sa-2");
+  assert.equal(cycleSubagentId(ids, "sa-1", -1), "sa-3");
+  assert.equal(cycleSubagentId(ids, "sa-3", 1), "sa-1");
+  assert.equal(cycleSubagentId(ids, "sa-2", -1), "sa-1");
+  assert.equal(cycleSubagentId(ids, "missing", 1), "sa-1");
+  assert.equal(cycleSubagentId(ids, "missing", -1), "sa-3");
+  assert.equal(cycleSubagentId([], "sa-1", 1), undefined);
+});
+
+test("takeover header keeps identity and metadata visible at responsive widths", () => {
+  const snap = snapshot({
+    title: "executor-env-scout",
+    completedOperations: 8,
+    meta: {
+      backend: "pi",
+      modelLabel: "deepseek-v4-flash",
+      reasoningEffort: "medium",
+    },
+  });
+
+  const wide = renderTakeoverHeaderLines(snap, 100, theme, {
+    index: 2,
+    total: 6,
+  });
+  assert.equal(wide.length, 2);
+  assert.match(wide[0]!, /sa-1 · executor-env-scout/);
+  assert.match(wide[0]!, /3\/6/);
+  assert.match(wide[1]!, /pi: deepseek-v4-flash/);
+  assert.match(wide[1]!, /ctx 10%\/100k/);
+  assert.match(wide[1]!, /8 ops/);
+  assert.match(wide[1]!, /think:medium/);
+
+  const compact = renderTakeoverHeaderLines(snap, 40, theme, {
+    index: 2,
+    total: 6,
+  });
+  assert.equal(compact.length, 3);
+  assert.match(compact[0]!, /3\/6/);
+  assert.match(compact[1]!, /deepseek-v4-flash/);
+  for (const line of compact) assert.ok(visibleWidth(line) <= 40);
 });
 
 test("list pane row shows title, id, status word and dim meta, bounded to width", () => {
