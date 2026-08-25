@@ -223,7 +223,13 @@ export function renderTakeoverHeaderLines(
   ];
 }
 
-/** Two-line row for the left-hand agent list of the two-pane dashboard. */
+/**
+ * Two-line row for the left-hand agent list and the narrow dashboard.
+ *
+ * Keep identity on the primary line and move model/context details to the
+ * secondary line. A narrow terminal must never spend the title's space on
+ * metadata that is still available in the takeover view.
+ */
 export function renderListPaneRow(
   snap: SubagentSnapshot,
   width: number,
@@ -586,10 +592,12 @@ class SubagentDashboard implements Component {
     reconcileDashboardSelection(this.selection, subs);
 
     const rows = this.tui.terminal.rows || 30;
+    const narrow = this.narrow();
+    const helpRows = narrow ? 2 : 1;
     // Render exactly terminal rows - 1 so the overlay covers the header,
     // chat, editor, and extra footer lines while leaving pi's final footer
-    // row visible.
-    const bodyHeight = Math.max(6, rows - 5);
+    // row visible. Compact help uses one additional row.
+    const bodyHeight = Math.max(6, rows - 4 - helpRows);
     const innerWidth = width - 2;
 
     const lines: string[] = [];
@@ -617,9 +625,11 @@ class SubagentDashboard implements Component {
 
     // Top border with panel title.
     const settled = subs.filter((s) => s.status !== "running").length;
-    const borderLabel = `agents · ${settled}/${subs.length}`;
+    const borderLabel = narrow
+      ? `agents · ${this.selection.index + 1}/${subs.length} selected`
+      : `agents · ${settled}/${subs.length}`;
 
-    if (this.narrow()) {
+    if (narrow) {
       // Single-column list (narrow terminals).
       lines.push(
         theme.fg("border", "╭") +
@@ -680,22 +690,49 @@ class SubagentDashboard implements Component {
       );
     }
 
-    // Hints
-    lines.push(truncateToWidth(theme.fg("dim", this.helpLine()), width));
+    // Hints. The compact dashboard uses two short lines so the essential
+    // actions remain discoverable instead of being truncated into an
+    // ambiguous tail on small terminals.
+    lines.push(...this.helpLines(width));
 
     return lines;
   }
 
   private helpLine(): string {
     const keys = this.keybindings;
-    if (this.narrow())
-      return `  ${configuredKeys(keys, "tui.select.up")}/${configuredKeys(keys, "tui.select.down")}/jk select · ${configuredKeys(keys, "tui.select.confirm")} take over · x abort · ${configuredKeys(keys, "tui.select.cancel")} close`;
     return this.focusPane === "detail"
       ? `  tab list · ⏎ send steer · ${configuredKeys(keys, "tui.editor.cursorUp")}/${configuredKeys(keys, "tui.editor.cursorDown")} scroll · ${configuredKeys(keys, "app.clear")} abort run · ${configuredKeys(keys, "tui.select.cancel")} back to list`
       : `  ${configuredKeys(keys, "tui.select.up")}/${configuredKeys(keys, "tui.select.down")}/jk select · tab detail · x abort · ${configuredKeys(keys, "tui.select.cancel")} close`;
   }
 
-  /** Left pane: compact 2-line rows with a scroll window around the selection. */
+  private helpLines(width: number): string[] {
+    const theme = this.theme;
+    if (!this.narrow())
+      return [truncateToWidth(theme.fg("dim", this.helpLine()), width)];
+
+    const keys = this.keybindings;
+    return [
+      truncateToWidth(
+        theme.fg(
+          "dim",
+          `  ${configuredKeys(keys, "tui.select.up")}/${configuredKeys(keys, "tui.select.down")}/jk select · ${configuredKeys(keys, "tui.select.confirm")} open`,
+        ),
+        width,
+      ),
+      truncateToWidth(
+        theme.fg(
+          "dim",
+          `  x abort · ${configuredKeys(keys, "tui.select.cancel")} close`,
+        ),
+        width,
+      ),
+    ];
+  }
+
+  /**
+   * Left pane: compact 2-line rows with a scroll window around the selection.
+   * The same row shape is used by the narrow dashboard.
+   */
   private renderListPane(
     subs: ReadonlyArray<SubagentSnapshot>,
     width: number,
@@ -777,6 +814,7 @@ class SubagentDashboard implements Component {
     return lines;
   }
 
+  /** Narrow dashboard rows: identity first, metadata second. */
   private renderRows(
     subs: ReadonlyArray<SubagentSnapshot>,
     width: number,
@@ -784,31 +822,46 @@ class SubagentDashboard implements Component {
   ): string[] {
     const theme = this.theme;
     const out: string[] = [];
+    const rowHeight = 2;
+    const maxVisible = Math.max(1, Math.floor(height / rowHeight));
 
-    // Scroll window around selection
+    // Scroll by complete two-line rows so the selected agent is never split
+    // from its metadata line.
     let start = 0;
-    if (subs.length > height) {
+    if (subs.length > maxVisible) {
       start = Math.min(
-        Math.max(0, this.selection.index - Math.floor(height / 2)),
-        subs.length - height,
+        Math.max(0, this.selection.index - Math.floor((maxVisible - 1) / 2)),
+        subs.length - maxVisible,
       );
     }
-    const visible = subs.slice(start, start + height);
+    const visible = subs.slice(start, start + maxVisible);
 
     for (let i = 0; i < visible.length; i++) {
-      const snap = visible[i];
+      const snap = visible[i]!;
       const index = start + i;
-      const isSelected = index === this.selection.index;
-
-      out.push(renderDashboardRow(snap, width, isSelected, theme));
+      out.push(
+        ...renderListPaneRow(
+          snap,
+          width,
+          index === this.selection.index,
+          theme,
+        ),
+      );
     }
 
+    // Scroll markers occupy a complete two-line slot, avoiding orphaned
+    // metadata beneath a marker.
     if (start > 0) {
-      out[0] = truncateToWidth(theme.fg("dim", `   ... ${start} more`), width);
+      out[0] = truncateToWidth(
+        theme.fg("dim", `  +${start} more above`),
+        width,
+      );
+      out[1] = "";
     }
-    if (start + height < subs.length) {
+    if (start + maxVisible < subs.length) {
+      out[out.length - 2] = "";
       out[out.length - 1] = truncateToWidth(
-        theme.fg("dim", `   ... ${subs.length - start - height} more`),
+        theme.fg("dim", `  +${subs.length - start - maxVisible} more below`),
         width,
       );
     }

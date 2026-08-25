@@ -123,6 +123,28 @@ test("list pane row shows title, id, status word and dim meta, bounded to width"
   assert.ok(visibleWidth(line1) <= 40 && visibleWidth(line2) <= 40);
 });
 
+test("narrow rows keep selection identity ahead of long metadata", () => {
+  const snap = snapshot({
+    id: "sa-7",
+    title: "oauth-refresh-generation",
+    meta: {
+      backend: "pi",
+      modelLabel: "openai-codex/gpt-5.6-luna",
+      reasoningEffort: "high",
+    },
+  });
+
+  for (const width of [40, 56, 80]) {
+    const [primary, secondary] = renderListPaneRow(snap, width, true, theme);
+    assert.match(primary, /oauth-refresh/);
+    assert.match(primary, /running/);
+    assert.doesNotMatch(primary, /openai-codex/);
+    assert.match(secondary, /openai-codex|pi/);
+    assert.ok(visibleWidth(primary) <= width);
+    assert.ok(visibleWidth(secondary) <= width);
+  }
+});
+
 test("detail header shows id, title, status and live meta", () => {
   const settledAt = Date.now();
   const header = renderDetailHeader(
