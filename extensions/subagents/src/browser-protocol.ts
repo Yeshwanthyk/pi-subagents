@@ -170,11 +170,7 @@ const UsageSchema = Type.Object({
 });
 const ChildSchema = Type.Object({
   id: Type.String({ maxLength: BROWSER_ACTIVITY_LIMITS.maxChildIdLength }),
-  backend: Type.Union([
-    Type.Literal("pi"),
-    Type.Literal("claude"),
-    Type.Literal("codex"),
-  ]),
+  backend: Type.Union([Type.Literal("pi"), Type.Literal("codex")]),
   model: Type.Optional(Text(BROWSER_ACTIVITY_LIMITS.maxModelLength)),
   reasoningEffort: Type.Optional(
     Type.Union([

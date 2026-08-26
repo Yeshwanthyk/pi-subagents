@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentSession, Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { claudeThinkingConfig } from "./src/backends/claude.ts";
 import {
   applyCodexMetadataNotification,
   negotiateCodexReasoningEffort,
@@ -47,24 +46,6 @@ test("Codex reports negotiated model-supported effort", () => {
     negotiateCodexReasoningEffort("high", "unknown", undefined),
     { nativeEffort: "high", reasoningEffort: undefined },
   );
-});
-
-test("Claude reports the effective adaptive-thinking effort", () => {
-  assert.deepEqual(claudeThinkingConfig(undefined), {});
-  assert.deepEqual(claudeThinkingConfig("off"), {
-    reasoningEffort: "off",
-    thinking: { type: "disabled" },
-  });
-  assert.deepEqual(claudeThinkingConfig("minimal"), {
-    reasoningEffort: "low",
-    thinking: { type: "adaptive" },
-    effort: "low",
-  });
-  assert.deepEqual(claudeThinkingConfig("max"), {
-    reasoningEffort: "max",
-    thinking: { type: "adaptive" },
-    effort: "max",
-  });
 });
 
 test("Codex settings and reroutes replace stale effort metadata", () => {

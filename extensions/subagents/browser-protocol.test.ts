@@ -15,7 +15,7 @@ import {
 function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
   return {
     id: "sa-1",
-    backend: "claude",
+    backend: "codex",
     owner: "subagents",
     resultDelivery: "parent",
     title: "Browser fixture",
@@ -25,8 +25,8 @@ function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
     createdAt: 1_000,
     lastActivityAt: 2_000,
     meta: {
-      backend: "claude",
-      modelLabel: "claude/test",
+      backend: "codex",
+      modelLabel: "codex/test",
       sessionFilePath: "/private/session.jsonl",
       nativeSessionId: "native-secret",
     },

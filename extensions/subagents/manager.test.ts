@@ -1,8 +1,8 @@
 /**
  * End-to-end smoke tests: manager behavior through a real ManagedRuntime,
  * exactly as the tool handlers drive it. The registry is test-only: scripted
- * stub sessions registered under the claude/codex names (the production
- * backends launch real processes and have their own live test files), plus
+ * stub sessions registered under the codex name (the production backend
+ * launches a real process and has its own live test file), plus
  * the real pi backend for its cheap registry precondition.
  */
 
@@ -31,13 +31,6 @@ import { runTool } from "./src/runtime.ts";
 const TestRegistryLive = Layer.sync(BackendRegistry, () => {
   const backends: SubagentBackend[] = [
     piBackend,
-    makeStubBackend({
-      backend: "claude",
-      defaultModelLabel: "claude/sonnet",
-      contextWindow: 200_000,
-      toolName: "Bash",
-      cadenceMs: 40,
-    }),
     makeStubBackend({
       backend: "codex",
       defaultModelLabel: "codex/gpt-5-codex",
@@ -103,10 +96,10 @@ test("stub subagent completes and delivers a final result", async () => {
 
     const snap = await runTool(
       runtime,
-      manager.spawn("claude", task("Say hello to the tests")),
+      manager.spawn("codex", task("Say hello to the tests")),
     );
     assert.equal(snap.status, "running");
-    assert.equal(snap.backend, "claude");
+    assert.equal(snap.backend, "codex");
     assert.ok(snap.meta.sessionFilePath);
 
     await runTool(runtime, manager.waitFor([snap.id]));
@@ -115,7 +108,7 @@ test("stub subagent completes and delivers a final result", async () => {
     assert.equal(done.status, "done");
     assert.match(
       done.finalText,
-      /\[stub:claude\] completed: Say hello to the tests/,
+      /\[stub:codex\] completed: Say hello to the tests/,
     );
     assert.ok(done.turns >= 2);
     assert.ok(done.transcript.some((item) => item.kind === "toolResult"));
@@ -156,7 +149,7 @@ test("activity snapshots track live and completed tool operations", async () => 
   await withManager(async (manager, runtime) => {
     const snap = await runTool(
       runtime,
-      manager.spawn("claude", task("Observe tool activity")),
+      manager.spawn("codex", task("Observe tool activity")),
     );
     const deadline = Date.now() + 3_000;
     while (
@@ -166,14 +159,14 @@ test("activity snapshots track live and completed tool operations", async () => 
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     const active = manager.view.get(snap.id);
-    assert.equal(active?.liveTools[0]?.name, "Bash");
+    assert.equal(active?.liveTools[0]?.name, "shell");
     assert.ok((active?.liveTools[0]?.startedAt ?? 0) > 0);
     assert.ok((active?.lastActivityAt ?? 0) >= active!.createdAt);
 
     await runTool(runtime, manager.waitFor([snap.id]));
     const done = manager.view.get(snap.id);
     assert.equal(done?.completedOperations, 1);
-    assert.equal(done?.lastCompletedOperation?.name, "Bash");
+    assert.equal(done?.lastCompletedOperation?.name, "shell");
     assert.equal(done?.processTelemetry, "unavailable");
   });
 });
@@ -182,7 +175,7 @@ test("backend metadata propagates effective reasoning effort", async () => {
   await withManager(async (manager, runtime) => {
     const snap = await runTool(
       runtime,
-      manager.spawn("claude", {
+      manager.spawn("codex", {
         ...task("Reason about metadata"),
         reasoningEffort: "high",
       }),
@@ -219,7 +212,7 @@ test("cancel interrupts a running stub subagent", async () => {
   await withManager(async (manager, runtime) => {
     const snap = await runTool(
       runtime,
-      manager.spawn("claude", task("Long running task")),
+      manager.spawn("codex", task("Long running task")),
     );
     const report = await runTool(runtime, manager.cancel([snap.id]));
     assert.deepEqual(report, [
@@ -264,7 +257,7 @@ test("idle restarts respect the concurrency cap", async () => {
     // Settle one subagent, then fill all four slots with running ones.
     const settled = await runTool(
       runtime,
-      manager.spawn("claude", task("early finisher")),
+      manager.spawn("codex", task("early finisher")),
     );
     await runTool(runtime, manager.waitFor([settled.id]));
     await runTool(
@@ -288,7 +281,7 @@ test("settled client agents cannot restart from the manager view", async () => {
   await withManager(async (manager, runtime) => {
     const snap = await runTool(
       runtime,
-      manager.spawn("claude", {
+      manager.spawn("codex", {
         ...task("Client task"),
         owner: "pi-tasks",
         resultDelivery: "client",
@@ -308,7 +301,7 @@ test("send steers an idle subagent into another turn", async () => {
   await withManager(async (manager, runtime) => {
     const snap = await runTool(
       runtime,
-      manager.spawn("claude", task("First turn")),
+      manager.spawn("codex", task("First turn")),
     );
     await runTool(runtime, manager.waitFor([snap.id]));
     const afterFirst = manager.view.get(snap.id);
@@ -330,11 +323,11 @@ test("parent-facing view hides client-correlated jobs while the full view retain
   await withManager(async (manager, runtime) => {
     const parentRun = await runTool(
       runtime,
-      manager.spawn("claude", task("parent-owned task")),
+      manager.spawn("codex", task("parent-owned task")),
     );
     const clientRun = await runTool(
       runtime,
-      manager.spawn("claude", {
+      manager.spawn("codex", {
         ...task("client-owned task"),
         owner: "client-owner",
         resultDelivery: "client",
@@ -378,14 +371,14 @@ test("manager settlement seam never sends client jobs through the parent coordin
     } as const;
     const parentRun = await runTool(
       runtime,
-      manager.spawn("claude", {
+      manager.spawn("codex", {
         ...task("parent result"),
         parentRef,
       }),
     );
     const clientRun = await runTool(
       runtime,
-      manager.spawn("claude", {
+      manager.spawn("codex", {
         ...task("client result"),
         resultDelivery: "client",
         client: { id: "client-owner", correlationId: "run-2" },

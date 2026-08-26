@@ -2,7 +2,7 @@
 
 Local Pi package extracted from [`davis7dotsh/my-pi-setup`](https://github.com/davis7dotsh/my-pi-setup) for personal evaluation.
 
-It provides headless Pi, Claude Code, and Codex subagents with asynchronous result delivery, wait/check/cancel tools, and an interactive `/subagents` transcript/takeover UI.
+It provides headless Pi and Codex subagents with asynchronous result delivery, wait/check/cancel tools, and an interactive `/subagents` transcript/takeover UI.
 
 ## Install locally
 
@@ -36,7 +36,7 @@ npm run check
 npm test
 ```
 
-Live Claude/Codex tests are separate because they use authenticated external harnesses:
+Live Codex tests are separate because they use an authenticated external harness:
 
 ```sh
 npm run test:live

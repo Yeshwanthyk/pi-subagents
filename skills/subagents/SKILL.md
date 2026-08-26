@@ -13,8 +13,6 @@ Each subagent is headless, has its own context window, cannot see the parent con
 **Prompt nicknames:** “pi”, “pi agent”, “pi subagent”
 **Best default:** Use when the user does not request another harness. It inherits the parent model and thinking level when `model` or `reasoning_effort` is omitted.
 
-Do not use models from the Anthropic provider even if one appears in the model list.
-
 Pi can use any model shown by `pi --list-models`. Prefer `provider/model-id`; a bare model id only works when unambiguous. Common picks in this environment:
 
 | Model                            | Recommended effort |
@@ -22,23 +20,8 @@ Pi can use any model shown by `pi --list-models`. Prefer `provider/model-id`; a 
 | inherited parent model (default) | inherited          |
 | `openai-codex/gpt-5.6-sol`       | `high`             |
 | `openai-codex/gpt-5.6-terra`     | `high`             |
-| `opencode/claude-fable-5`        | `medium`           |
 
 **Thinking budgets:** `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. These map directly to pi thinking levels.
-
-## Claude Code Harness
-
-**Harness:** `claude`
-**Prompt nicknames:** “claude”, “Claude Code”, “claude agent”, “claude subagent”, "cc"
-**Best default:** use the latest fable model on high reasoning. Do not default to anything else, if the user does not specify, use fable.
-
-| Model hint | Model               | Recommended effort |
-| ---------- | ------------------- | ------------------ |
-| `fable`    | latest Claude Fable | `high`             |
-
-**Thinking budgets:** `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The extension maps these to Claude thinking-token budgets: 0, 1,024, 4,096, 10,000, 16,000, 32,000, and 63,999 tokens respectively.
-
-Requires Claude Code to be installed and authenticated.
 
 ## Codex Harness
 

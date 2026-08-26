@@ -1,16 +1,15 @@
 # subagents — Design Plan
 
 A pi extension that fires off background subagents from a parent pi session, where each
-subagent can be powered by one of three backends — **pi** (in-process SDK session),
-**Claude Code** (`@anthropic-ai/claude-agent-sdk`), or **Codex** (`codex app-server`) —
-unified behind a single Effect v4 service interface.
+subagent can be powered by **pi** (in-process SDK session) or **Codex**
+(`codex app-server`), unified behind a single Effect v4 service interface.
 
 > **Status:** this document describes the original v1 plan (stubbed backends). All
-> three backends are now REAL implementations — see `src/backends/{pi,claude,codex}.ts`.
+> both backends are now REAL implementations — see `src/backends/{pi,codex}.ts`.
 > The stub machinery survives in `src/backends/stub.ts` for the manager test registry.
 
 **Scope of the first version:** interface design + stubbed backend internals + the v1 UI
-carried over. No real Claude/Codex process integration yet; the pi backend may also stay
+carried over. No real Codex process integration yet; the pi backend may also stay
 stubbed initially so the manager/UI/tool loop can be exercised end to end with zero
 external dependencies.
 
@@ -122,15 +121,14 @@ else ports over mostly verbatim.
 ## 2. Backend integration facts
 
 These shape the interface even though v1-of-v2 stubs the internals. (Traced from the
-"T3 Code" codebase which integrates Codex and Claude Code.)
+"T3 Code" codebase which integrates Codex.)
 
 | | Interactive sessions | One-shot tasks | Event shape | Interrupt | Steering |
 |---|---|---|---|---|---|
 | **pi** | In-process `createAgentSession()` (pi SDK); real session files; `session.subscribe()` | `session.prompt()` and read final assistant message (or `pi -p` subprocess, not needed) | `AgentSessionEvent` (message_start/update/end, tool_execution_*, agent_start/settled, queue_update, ...) | `session.abort()` | `session.steer()` / `followUp()` |
-| **Claude Code** | `@anthropic-ai/claude-agent-sdk` `query()` — SDK launches the `claude` executable and streams JSON messages (assistant/user/result/system, streaming partials, tool_use blocks) | `claude -p --output-format json` | SDK message stream (async iterable) | `query.interrupt()` / abort controller | streaming-input mode: push more user messages into the input iterable |
 | **Codex** | spawn `codex app-server` child process, JSON-RPC over stdin/stdout (`newConversation` / `sendUserTurn`, notifications: `agentMessageDelta`, `execCommandBegin/End`, `taskComplete`, `tokenCount`, ...) | `codex exec` (prints result to stdout, `--json` for events) | JSON-RPC notifications | `interruptConversation` request | send another `sendUserTurn` on the same conversation |
 
-Common denominator all three can supply:
+Common denominator both can supply:
 
 - an async event stream with: lifecycle (started/turn/settled), assistant text
   (deltas and/or completed messages), reasoning text, tool execution begin/update/end,
@@ -138,8 +136,8 @@ Common denominator all three can supply:
 - a way to send a follow-up/steering user message into a live session;
 - an interrupt operation;
 - a final result text per run;
-- metadata: backend name, model identifier, session/log file path (pi session file,
-  Claude session id + projects dir JSONL, Codex rollout path), working dir.
+- metadata: backend name, model identifier, session/log file path (pi session file or
+  Codex rollout path), working dir.
 
 That is exactly what the normalized event model below encodes.
 
@@ -167,7 +165,7 @@ That is exactly what the normalized event model below encodes.
 ### 3.2 Domain model (`src/domain.ts`)
 
 ```ts
-type BackendName = "pi" | "claude" | "codex";
+type BackendName = "pi" | "codex";
 type SubagentStatus = "running" | "done" | "error";   // unchanged from v1
 
 interface SpawnTask {
@@ -175,8 +173,8 @@ interface SpawnTask {
   title: string;
   cwd: string;
   // Generic model hint; each backend interprets/validates it its own way.
-  model?: string;            // pi: "provider/model-id"; claude: model alias; codex: model slug
-  reasoningEffort?: string;  // pi thinking level; codex reasoning effort; claude: ignored/mapped
+  model?: string;            // pi: "provider/model-id"; codex: model slug
+  reasoningEffort?: string;  // pi thinking level; codex reasoning effort
   parentContext: {           // resolved by the tool layer, passed opaquely
     parentCwd: string;
     projectTrusted: boolean;
@@ -187,10 +185,10 @@ interface SpawnTask {
 
 interface SubagentMeta {
   backend: BackendName;
-  modelLabel?: string;         // "anthropic/claude-opus-4-5", "gpt-5-codex", ...
+  modelLabel?: string;         // "openai/gpt-5", "gpt-5-codex", ...
   contextWindow?: number;      // for utilization %, when known
-  sessionFilePath?: string;    // pi session file / claude JSONL / codex rollout path
-  nativeSessionId?: string;    // claude session id, codex conversation id
+  sessionFilePath?: string;    // pi session file / codex rollout path
+  nativeSessionId?: string;    // native backend session or conversation id
 }
 ```
 
@@ -202,7 +200,7 @@ their native streams into this; nothing downstream knows which backend produced 
 ```ts
 type SubagentEvent =
   // lifecycle
-  | { _tag: "RunStarted" }                       // pi agent_start / claude init / codex turn start
+  | { _tag: "RunStarted" }                       // pi agent_start / codex turn start
   | { _tag: "RunSettled"; outcome: RunOutcome }  // terminal per run (a session can run again via send())
   // transcript building blocks
   | { _tag: "UserMessage"; text: string }        // initial prompt + takeover sends, echoed by backend
@@ -406,7 +404,7 @@ logic: copied as-is.
 ```
 Layer graph:
   PiBackendStub.layer      ─┐
-  ClaudeBackendStub.layer  ─┼→ BackendRegistry.layer ─→ SubagentManager.layer ─→ AppLayer
+                           ├→ BackendRegistry.layer ─→ SubagentManager.layer ─→ AppLayer
   CodexBackendStub.layer   ─┘
 ```
 
@@ -422,10 +420,10 @@ Layer graph:
   tagged errors to `Error` messages matching v1 wording. `onUpdate` and `ctx`
   (model registry, cwd, trust) are captured into the program as plain values/callbacks.
 - **Tool schema change:** `subagent_spawn` gains
-  `agent: StringEnum(["pi", "claude", "codex"])` (optional, default `"pi"`), and
+  `agent: StringEnum(["pi", "codex"])` (optional, default `"pi"`), and
   `model`/`provider`/`reasoning_effort` keep their v1 shapes but are documented as
-  backend-interpreted (pi validates against the registry; claude/codex validate against
-  their own known-model rules — stubs accept anything). `describeSubagent` lines and the
+  backend-interpreted (pi validates against the registry; codex validates against
+  its own known-model rules — stubs accept anything). `describeSubagent` lines and the
   dashboard gain the backend name (e.g. `sa-3 [running] "title" (codex, gpt-5-codex,
   41%/272k, 1m32s, /repo)`).
 - `pi.registerMessageRenderer("subagent-result", ...)`, `pi.registerCommand(
@@ -435,7 +433,7 @@ Layer graph:
 
 ### 3.8 What the stubs do (v1 of this extension)
 
-All three backends share a `createStubSession(profile)` helper (`src/backends/stub.ts`)
+Both backends share a `createStubSession(profile)` helper (`src/backends/stub.ts`)
 that fakes a plausible session so the manager, tools, result delivery, and both TUI
 views are exercised end to end:
 
@@ -445,7 +443,7 @@ views are exercised end to end:
   then a scripted turn: 2–3 `AssistantDelta` batches on a timer (~200ms cadence so
   streaming is visible), one fake `ToolStart/Update/End` cycle (`bash` with an args
   preview), `UsageChanged` ramping tokens, a final `AssistantMessage`, and `RunSettled`
-  with `Completed` — final text echoes the task: `"[stub:claude] completed: <first 200
+  with `Completed` — final text echoes the task: `"[stub:codex] completed: <first 200
   chars of prompt>"`. Total runtime ~3–6s (configurable per profile) so `subagent_wait`,
   the footer counters, and the dashboard's running→done transition are observable.
 - **send**: emits `UserMessage` + `QueueChanged` (briefly, to exercise the queued-line
@@ -456,8 +454,7 @@ views are exercised end to end:
 - **failure path**: a magic prompt prefix (e.g. `FAIL:`) makes the run settle with
   `Failed` — so error rendering, `errorText` rows, and failed result delivery are
   testable without real backends.
-- **Backend differentiation**: per-backend profiles vary the model label
-  (`anthropic/claude-opus-4-5` vs `claude-sonnet-4-5` vs `gpt-5-codex`), fake context
+- **Backend differentiation**: per-backend profiles vary the model label, fake context
   window, tool names, and delta cadence — enough to verify the UI treats backends
   uniformly. `available` returns `true` for stubs (real impls will probe binaries/SDK).
 - The **pi stub** can later be swapped for the real in-process SDK implementation by
@@ -484,7 +481,6 @@ views are exercised end to end:
     ├── backends/
     │   ├── stub.ts            # shared scripted fake-session machinery
     │   ├── pi.ts              # PiBackend layer (v1: stub profile; later: real pi SDK sessions)
-    │   ├── claude.ts          # ClaudeBackend layer (v1: stub; later: @anthropic-ai/claude-agent-sdk)
     │   └── codex.ts           # CodexBackend layer (v1: stub; later: codex app-server JSON-RPC)
     ├── manager.ts             # SubagentManager service + layer: registry, cap, waitFor,
     │                          # cancel, prune, settle hook, event-fold into snapshots
@@ -533,29 +529,27 @@ Recommendation: (a) during development, rename to final names when v2 replaces v
    `backend_options` free-form object; (c) per-backend defaults in a config file with no
    per-spawn override. Which surface do you want the parent LLM to have?
 2. **One-shot exec mode.** Should the interface expose a separate cheap
-   `exec(task): Effect<RunOutcome>` (mapping to `codex exec` / `claude -p
-   --output-format json` / a fresh in-memory pi session), or is one interactive-session
+   `exec(task): Effect<RunOutcome>` (mapping to `codex exec` or a fresh in-memory pi
+   session), or is one interactive-session
    path enough? Exec would forfeit takeover/steering for that subagent — is a
    `mode: "session" | "exec"` spawn parameter desirable, or backend-internal
    optimization only?
-3. **Permissions/sandboxing for Claude/Codex children.** Subagents are headless, so
-   interactive permission prompts are impossible. Do we run Claude with
-   `bypassPermissions`/`--dangerously-skip-permissions` and Codex with
+3. **Permissions/sandboxing for Codex children.** Subagents are headless, so
+   interactive permission prompts are impossible. Do we run Codex with a
    `--full-auto`-style sandbox + never-ask approval policy? Should this be a global
    extension setting, per-spawn, or hardcoded? (Pi children inherit v1's trust-store
    logic — keep that as-is?)
 4. **Concurrency cap scope.** Keep one global `MAX_RUNNING = 4`, or per-backend caps
-   (e.g. 4 pi + 2 claude + 2 codex)? Global is proposed as default.
+   (e.g. 4 pi + 2 codex)? Global is proposed as default.
 5. **Steering support parity in real backends.** Codex steering means
-   interrupt-then-new-turn or queued `sendUserTurn`; Claude requires streaming-input
-   mode from the start. OK to declare `capabilities.steering` and have the TakeoverView
+   interrupt-then-new-turn or queued `sendUserTurn`. OK to declare
+   `capabilities.steering` and have the TakeoverView
    input show "(steering not supported)" if a backend can't, or is steering a hard
-   requirement for all three?
-6. **Model/thinking inheritance across backends.** When `agent: "claude"` and no model
-   given, what's the default (e.g. always `opus`/`sonnet`)? Inheriting the parent pi
-   model is meaningless cross-backend. Proposal: per-backend default model in a small
-   config block; confirm.
-7. **Binary/SDK discovery + failure UX.** When `codex`/`claude` isn't installed or has
+   requirement for both?
+6. **Model/thinking inheritance across backends.** Inheriting the parent pi model is
+   meaningless for Codex. Proposal: per-backend default model in a small config block;
+   confirm.
+7. **Binary/SDK discovery + failure UX.** When `codex` isn't installed or has
    no credentials, should `subagent_spawn` fail fast with a clear tool error (proposed),
    or should the backends be hidden from the `agent` enum dynamically?
 8. **Result truncation budgets.** Keep v1's numbers (24KB result message, 48KB wait
@@ -563,7 +557,7 @@ Recommendation: (a) during development, rename to final names when v2 replaces v
 9. **Effect version pinning.** Effect v4 is beta — pin an exact `4.0.0-beta.x` and
    accept manual bumps, or track the beta dist-tag?
 10. **Persistence across reloads.** v1 loses all subagents on `session_shutdown`
-    (disposeAll). Codex/Claude children are external processes that *could* outlive a
+    (disposeAll). Codex children are external processes that *could* outlive a
     pi reload — should v2 keep v1's kill-everything behavior (proposed for v1 of v2) or
     plan for reattach later?
 

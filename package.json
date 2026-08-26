@@ -14,7 +14,7 @@
     "lint": "oxlint",
     "check": "npm run lint && tsc --noEmit",
     "test": "node --test --experimental-strip-types extensions/subagents/manager.test.ts extensions/subagents/activity-card.test.ts extensions/subagents/browser-protocol.test.ts extensions/subagents/result-delivery.test.ts extensions/subagents/parent-coordinator.test.ts extensions/subagents/context-usage.test.ts extensions/subagents/reasoning-effort.test.ts extensions/subagents/takeover.test.ts extensions/subagents/headless-dialog.test.ts extensions/subagents/client-api.test.ts",
-    "test:live": "node --test --experimental-strip-types extensions/subagents/claude.test.ts extensions/subagents/codex.test.ts",
+    "test:live": "node --test --experimental-strip-types extensions/subagents/codex.test.ts",
     "format": "prettier --write \"extensions/**/*.ts\" \"skills/**/*.md\" \"*.{json,md}\"",
     "format:check": "prettier --check \"extensions/**/*.ts\" \"skills/**/*.md\" \"*.{json,md}\""
   },
@@ -28,7 +28,6 @@
     ]
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.207",
     "effect": "4.0.0-beta.98"
   },
   "peerDependencies": {
