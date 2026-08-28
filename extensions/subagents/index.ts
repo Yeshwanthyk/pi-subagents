@@ -6,7 +6,7 @@
  * - subagent_spawn: fire-and-forget spawn (prompt, title, agent, working_dir,
  *   model, reasoning_effort). Max 4 running at once across all backends.
  * - subagent_wait: block until the listed parent-owned subagents settle, return results.
- * - subagent_cancel: stop one or more running parent-owned subagents.
+ * - subagent_cancel: stop one or more queued/running parent-owned subagents.
  * - subagent_check: peek at a parent-owned subagent's status and recent activity.
  * - subagent_list: list all parent-owned subagents.
  *
@@ -44,6 +44,7 @@ import { Type } from "typebox";
 import {
   BACKEND_NAMES,
   formatElapsed,
+  isSubagentPending,
   latestText,
   REASONING_EFFORTS,
   type SubagentSnapshot,
@@ -211,10 +212,9 @@ function transcriptTail(snap: SubagentSnapshot) {
 }
 
 function headlessOutput(snap: SubagentSnapshot) {
-  const preferred =
-    snap.status === "running"
-      ? snap.liveAssistant?.text.trim()
-      : snap.finalText.trim();
+  const preferred = isSubagentPending(snap.status)
+    ? snap.liveAssistant?.text.trim()
+    : snap.finalText.trim();
   const output = preferred || transcriptTail(snap).trim() || "(no output yet)";
   return output.slice(-HEADLESS_OUTPUT_MAX_LENGTH);
 }
@@ -247,7 +247,8 @@ export async function runHeadlessSubagentsDialog(
       const snap = view.get(id);
       if (snap === undefined) break;
       const actions = [
-        ...(snap.status === "running" ? [STEER_CHOICE, ABORT_CHOICE] : []),
+        ...(snap.status === "running" ? [STEER_CHOICE] : []),
+        ...(isSubagentPending(snap.status) ? [ABORT_CHOICE] : []),
         SHOW_OUTPUT_CHOICE,
         BACK_CHOICE,
       ];
@@ -269,7 +270,7 @@ export async function runHeadlessSubagentsDialog(
         continue;
       }
 
-      if (action === ABORT_CHOICE && snap.status === "running") {
+      if (action === ABORT_CHOICE && isSubagentPending(snap.status)) {
         if (await ui.confirm(`Abort ${snap.id}?`, snap.title)) {
           view.requestAbort(id);
           ui.notify(`Abort requested for ${id}`, "info");
@@ -458,9 +459,15 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const running = subs.filter((snap) => snap.status === "running").length;
+    const queued = subs.filter((snap) => snap.status === "queued").length;
     const failed = subs.filter((snap) => snap.status === "error").length;
-    const done = subs.length - running - failed;
-    const status = formatActivityStatus(ui.theme, { running, done, failed });
+    const done = subs.length - queued - running - failed;
+    const status = formatActivityStatus(ui.theme, {
+      queued,
+      running,
+      done,
+      failed,
+    });
     if (status === publishedStatus) return;
     publishedStatus = status;
     ui.setStatus("subagents", status);
@@ -682,7 +689,7 @@ export default function (pi: ExtensionAPI) {
       const state = context.state as
         | { unsubActivity?: () => void; lastActivityRefresh?: number }
         | undefined;
-      const settled = !snapshot || snapshot.status !== "running";
+      const settled = !snapshot || !isSubagentPending(snapshot.status);
       if (state) {
         if (settled && state.unsubActivity) {
           state.unsubActivity();
@@ -910,6 +917,8 @@ export default function (pi: ExtensionAPI) {
         const preview = truncateHead(output, { maxBytes: 2048, maxLines: 20 });
         text += `\n\nLatest output:\n${preview.content}`;
         if (preview.truncated) text += "\n[...]";
+      } else if (snap.status === "queued") {
+        text += "\n\n(waiting for an execution slot)";
       } else if (snap.status === "running") {
         text += "\n\n(no text output yet)";
       }

@@ -50,6 +50,7 @@ export function formatContextUtilization(usage: ContextUtilization) {
 }
 
 export interface ActivityCounts {
+  queued?: number;
   running: number;
   done: number;
   failed: number;
@@ -64,6 +65,9 @@ const SQUARE = "■";
  */
 export function formatActivityCounts(theme: Theme, counts: ActivityCounts) {
   const parts: string[] = [];
+  if ((counts.queued ?? 0) > 0) {
+    parts.push(theme.fg("muted", `${SQUARE} ${counts.queued} queued`));
+  }
   if (counts.running > 0) {
     parts.push(theme.fg("warning", `${SQUARE} ${counts.running} running`));
   }

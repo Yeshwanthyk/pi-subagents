@@ -1,10 +1,14 @@
-import type { ParentRef, SubagentSnapshot, SubagentStatus } from "./domain.ts";
+import type {
+  ParentRef,
+  SubagentSnapshot,
+  TerminalSubagentStatus,
+} from "./domain.ts";
 import { parentRefKey } from "./parent-ref.ts";
 
 export interface ParentResultEnvelope {
   readonly id: string;
   readonly title: string;
-  readonly status: SubagentStatus;
+  readonly status: TerminalSubagentStatus;
   readonly error?: string;
   readonly output: string;
   readonly parentRef: ParentRef;
@@ -122,6 +126,7 @@ export function parentResultEnvelope(
   snapshot: SubagentSnapshot,
 ): ParentResultEnvelope | undefined {
   if (
+    (snapshot.status !== "done" && snapshot.status !== "error") ||
     snapshot.parentRef === undefined ||
     snapshot.client !== undefined ||
     snapshot.resultDelivery !== "parent"

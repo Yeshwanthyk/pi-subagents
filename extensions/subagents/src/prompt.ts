@@ -2,7 +2,7 @@
 
 /** Describes subagent_spawn, including harnesses and the fixed concurrency cap. */
 export const SUBAGENT_SPAWN_TOOL_DESCRIPTION =
-  "Spawn a background subagent: background work is normal and this returns immediately with an id. The child is fully autonomous with its own context window and runs on pi (in-process) or codex (Codex CLI). Its final output is delivered automatically when it settles, or collect it explicitly with subagent_wait. Children cannot orchestrate more agents/workflows or ask the user, and cannot see this conversation, so the prompt must be self-contained. Max 4 subagents can be running at once across all harnesses.";
+  "Spawn a background subagent: background work is normal and this returns immediately with an id. The child is fully autonomous with its own context window and runs on pi (in-process) or codex (Codex CLI). Its final output is delivered automatically when it settles, or collect it explicitly with subagent_wait. Children cannot orchestrate more agents/workflows or ask the user, and cannot see this conversation, so the prompt must be self-contained. Max 4 subagents run at once across all harnesses; excess work waits in the shared FIFO queue.";
 
 /** Adds background subagent delegation to the parent model's available-tools prompt. */
 export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
@@ -55,7 +55,7 @@ export const SUBAGENT_WAIT_PARAMETER_DESCRIPTIONS = {
 
 /** Describes aborting running subagents while retaining their partial transcripts. */
 export const SUBAGENT_CANCEL_TOOL_DESCRIPTION =
-  "Cancel one or more running parent-owned subagents. This aborts their active work but preserves their partial session transcripts on disk.";
+  "Cancel one or more queued or running parent-owned subagents. Queued work is removed without starting a backend session; active work preserves its partial session transcript on disk.";
 
 /** Model-facing schema description for the subagent ids to cancel. */
 export const SUBAGENT_CANCEL_PARAMETER_DESCRIPTIONS = {
@@ -79,7 +79,7 @@ export const SUBAGENT_LIST_TOOL_DESCRIPTION =
 export function buildSubagentResultMessage(options: {
   id: string;
   title: string;
-  status: "running" | "done" | "error";
+  status: "done" | "error";
   errorText?: string;
   output: string;
 }) {
@@ -93,7 +93,7 @@ export function buildSubagentResultMessage(options: {
 export interface SubagentResultCard {
   readonly id: string;
   readonly title: string;
-  readonly status: "running" | "done" | "error";
+  readonly status: "done" | "error";
   readonly error?: string;
   readonly output: string;
 }

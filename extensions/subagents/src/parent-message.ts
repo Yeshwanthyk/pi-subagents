@@ -1,4 +1,4 @@
-import type { SubagentStatus } from "./domain.ts";
+import type { TerminalSubagentStatus } from "./domain.ts";
 import type { ParentResultEnvelope } from "./parent-mailbox.ts";
 import {
   buildSubagentResultBatchMessage,
@@ -9,7 +9,7 @@ export interface ParentResultBatchDetails {
   readonly results: ReadonlyArray<{
     readonly id: string;
     readonly title: string;
-    readonly status: SubagentStatus;
+    readonly status: TerminalSubagentStatus;
   }>;
 }
 

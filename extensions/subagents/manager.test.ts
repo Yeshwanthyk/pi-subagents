@@ -8,16 +8,18 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Effect, Layer, ManagedRuntime } from "effect";
+import { Effect, Layer, ManagedRuntime, Queue, Stream } from "effect";
 import { BackendRegistry, type SubagentBackend } from "./src/backend.ts";
 import { piBackend } from "./src/backends/pi.ts";
 import { makeStubBackend } from "./src/backends/stub.ts";
 import type {
   BackendName,
   ParentContext,
+  SubagentEvent,
   SpawnTask,
   SubagentSnapshot,
 } from "./src/domain.ts";
+import { SpawnError } from "./src/domain.ts";
 import {
   SubagentManager,
   SubagentManagerLive,
@@ -58,6 +60,95 @@ function task(prompt: string): SpawnTask {
   return { prompt, title: "test", cwd: process.cwd(), parent };
 }
 
+function makeControlledBackend() {
+  const starts: string[] = [];
+  const sessions = new Map<string, Queue.Queue<SubagentEvent>>();
+  const backend: SubagentBackend = {
+    name: "codex",
+    capabilities: {
+      steering: true,
+      modelSelection: true,
+      reasoningEffort: true,
+    },
+    available: Effect.succeed(true),
+    spawn: (spawnTask) =>
+      Effect.gen(function* () {
+        starts.push(spawnTask.prompt);
+        if (spawnTask.prompt.startsWith("SPAWN_FAIL:")) {
+          return yield* new SpawnError({ message: "controlled spawn failure" });
+        }
+        const events = yield* Queue.make<SubagentEvent>();
+        sessions.set(spawnTask.prompt, events);
+        return {
+          meta: Effect.succeed({
+            backend: "codex",
+            modelLabel: "controlled/codex",
+          }),
+          events: Stream.fromQueue(events),
+          send: () => Effect.void,
+          interrupt: Queue.offer(events, {
+            _tag: "RunSettled",
+            outcome: { _tag: "Interrupted" },
+          }).pipe(Effect.asVoid),
+        };
+      }),
+  };
+
+  const emit = (prompt: string, event: SubagentEvent) => {
+    const events = sessions.get(prompt);
+    assert.ok(events, `No controlled session for ${prompt}`);
+    return Effect.runPromise(Queue.offer(events, event));
+  };
+
+  return {
+    backend,
+    starts,
+    complete: (prompt: string, finalText = prompt) =>
+      emit(prompt, {
+        _tag: "RunSettled",
+        outcome: { _tag: "Completed", finalText },
+      }),
+    emit,
+  };
+}
+
+const createRuntimeWith = (backend: SubagentBackend) =>
+  ManagedRuntime.make(
+    SubagentManagerLive.pipe(
+      Layer.provide(
+        Layer.succeed(
+          BackendRegistry,
+          new Map<BackendName, SubagentBackend>([[backend.name, backend]]),
+        ),
+      ),
+    ),
+  );
+
+async function withControlledManager(
+  run: (
+    manager: SubagentManagerApi,
+    runtime: ReturnType<typeof createRuntimeWith>,
+    controlled: ReturnType<typeof makeControlledBackend>,
+  ) => Promise<void>,
+) {
+  const controlled = makeControlledBackend();
+  const runtime = createRuntimeWith(controlled.backend);
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    await run(manager, runtime, controlled);
+  } finally {
+    await runtime.dispose();
+  }
+}
+
+async function waitUntil(predicate: () => boolean, message: string) {
+  const deadline = Date.now() + 3_000;
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(predicate(), true, message);
+}
+
 async function withManager(
   run: (
     manager: SubagentManagerApi,
@@ -78,11 +169,16 @@ async function waitForSettlement(
   id: string,
 ): Promise<SubagentSnapshot> {
   const deadline = Date.now() + 3_000;
-  while (manager.view.get(id)?.status === "running" && Date.now() < deadline) {
+  while (
+    (manager.view.get(id)?.status === "queued" ||
+      manager.view.get(id)?.status === "running") &&
+    Date.now() < deadline
+  ) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   const snapshot = manager.view.get(id);
   assert.ok(snapshot);
+  assert.notEqual(snapshot.status, "queued");
   assert.notEqual(snapshot.status, "running");
   return snapshot;
 }
@@ -117,7 +213,19 @@ test("stub subagent completes and delivers a final result", async () => {
   });
 });
 test("listener re-subscription waits for the next notification pass", async () => {
-  await withManager(async (manager, runtime) => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    await runTool(
+      runtime,
+      Effect.forEach(
+        [1, 2, 3, 4],
+        (n) => manager.spawn("codex", task(`occupy-${n}`)),
+        { concurrency: "unbounded" },
+      ),
+    );
+    await waitUntil(
+      () => controlled.starts.length === 4,
+      "four tasks should occupy the slots",
+    );
     const calls: string[] = [];
     let unsubscribeFirst = () => {};
     const second = () => calls.push("second");
@@ -128,20 +236,16 @@ test("listener re-subscription waits for the next notification pass", async () =
     };
     unsubscribeFirst = manager.view.subscribe(first);
 
-    await assert.rejects(
-      runTool(runtime, manager.spawn("pi", task("missing model registry"))),
-      /model registry/,
+    const queued = await runTool(
+      runtime,
+      manager.spawn("codex", task("queued-listener-test")),
     );
     assert.deepEqual(calls, ["first"]);
 
-    await assert.rejects(
-      runTool(
-        runtime,
-        manager.spawn("pi", task("missing model registry again")),
-      ),
-      /model registry/,
-    );
-    assert.deepEqual(calls, ["first", "second"]);
+    await runTool(runtime, manager.cancel([queued.id]));
+    assert.equal(calls[0], "first");
+    assert.ok(calls.slice(1).every((call) => call === "second"));
+    assert.ok(calls.includes("second"));
   });
 });
 
@@ -198,7 +302,10 @@ test("FAIL: prompts settle as errors; unconsumed settles are delivered", async (
       manager.spawn("codex", task("FAIL: blow up please")),
     );
     // Poll without wait-interest so the settle is delivered unconsumed.
-    while (manager.view.get(snap.id)?.status === "running") {
+    while (
+      manager.view.get(snap.id)?.status === "queued" ||
+      manager.view.get(snap.id)?.status === "running"
+    ) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     const failed = manager.view.get(snap.id);
@@ -222,33 +329,204 @@ test("cancel interrupts a running stub subagent", async () => {
   });
 });
 
-test("the concurrency cap rejects a fifth running subagent", async () => {
-  await withManager(async (manager, runtime) => {
+test("shared admission is FIFO across direct and workflow-owned tasks", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
     const spawns = await runTool(
       runtime,
       Effect.forEach(
-        [1, 2, 3, 4],
-        (n) => manager.spawn("codex", task(`Task ${n}`)),
+        [1, 2, 3, 4, 5, 6, 7],
+        (n) => {
+          const spawnTask = task(`Task ${n}`);
+          return manager.spawn(
+            "codex",
+            n === 6
+              ? {
+                  ...spawnTask,
+                  workflow: { runId: "wf-1", taskId: "writer" },
+                }
+              : spawnTask,
+          );
+        },
         { concurrency: "unbounded" },
       ),
     );
-    assert.equal(spawns.length, 4);
-    await assert.rejects(
-      runTool(runtime, manager.spawn("codex", task("Task 5"))),
-      /Max 4 subagents/,
+    await waitUntil(
+      () => controlled.starts.length === 4,
+      "only four backend sessions should start initially",
+    );
+    assert.deepEqual(controlled.starts, [
+      "Task 1",
+      "Task 2",
+      "Task 3",
+      "Task 4",
+    ]);
+    assert.deepEqual(
+      spawns.slice(4).map((snapshot) => snapshot.status),
+      ["queued", "queued", "queued"],
+    );
+    assert.deepEqual(spawns[5]?.workflow, {
+      runId: "wf-1",
+      taskId: "writer",
+    });
+
+    await controlled.complete("Task 2");
+    await waitUntil(
+      () => controlled.starts.length === 5,
+      "Task 5 should start",
+    );
+    assert.equal(controlled.starts[4], "Task 5");
+    const fifthSettlement = runTool(
+      runtime,
+      manager.awaitSettlement(spawns[4]!.id),
+    );
+    await controlled.complete("Task 5", "fifth result");
+    assert.equal((await fifthSettlement)?.finalText, "fifth result");
+
+    await controlled.complete("Task 4");
+    await waitUntil(
+      () => controlled.starts.length === 6,
+      "Task 6 should start",
+    );
+    assert.equal(controlled.starts[5], "Task 6");
+    await controlled.complete("Task 1");
+    await waitUntil(
+      () => controlled.starts.length === 7,
+      "Task 7 should start",
+    );
+    assert.equal(controlled.starts[6], "Task 7");
+  });
+});
+
+test("cancelling queued work never starts its backend session", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const spawns = await runTool(
+      runtime,
+      Effect.forEach(
+        [1, 2, 3, 4, 5],
+        (n) => manager.spawn("codex", task(`cancel-queued-${n}`)),
+        { concurrency: "unbounded" },
+      ),
+    );
+    await waitUntil(
+      () => controlled.starts.length === 4,
+      "four tasks should start",
+    );
+    const queued = spawns[4]!;
+    assert.equal(queued.status, "queued");
+    const [result] = await runTool(runtime, manager.cancel([queued.id]));
+    assert.equal(result?.cancelled, true);
+    assert.equal(manager.view.get(queued.id)?.outcome?._tag, "Interrupted");
+
+    await controlled.complete("cancel-queued-1");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(controlled.starts.includes("cancel-queued-5"), false);
+  });
+});
+
+test("running cancellation releases one slot exactly once", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const spawns = await runTool(
+      runtime,
+      Effect.forEach(
+        [1, 2, 3, 4, 5, 6],
+        (n) => manager.spawn("codex", task(`cancel-running-${n}`)),
+        { concurrency: "unbounded" },
+      ),
+    );
+    await waitUntil(
+      () => controlled.starts.length === 4,
+      "four tasks should start",
+    );
+    await runTool(runtime, manager.cancel([spawns[0]!.id]));
+    await waitUntil(
+      () => controlled.starts.length === 5,
+      "fifth task should start",
+    );
+    assert.equal(controlled.starts[4], "cancel-running-5");
+
+    await controlled.emit("cancel-running-1", {
+      _tag: "RunSettled",
+      outcome: { _tag: "Interrupted" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(controlled.starts.length, 5);
+    assert.equal(manager.view.get(spawns[5]!.id)?.status, "queued");
+
+    await controlled.complete("cancel-running-2");
+    await waitUntil(
+      () => controlled.starts.length === 6,
+      "sixth task should start",
+    );
+    assert.equal(controlled.starts[5], "cancel-running-6");
+  });
+});
+
+test("parallel spawns reserve no more than the global running limit", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const spawns = await runTool(
+      runtime,
+      Effect.forEach(
+        Array.from({ length: 20 }, (_, index) => index + 1),
+        (n) => manager.spawn("codex", task(`parallel-${n}`)),
+        { concurrency: "unbounded" },
+      ),
+    );
+    await waitUntil(
+      () => controlled.starts.length === 4,
+      "four tasks should start",
+    );
+    assert.equal(controlled.starts.length, 4);
+    assert.equal(
+      spawns.filter((snapshot) => snapshot.status === "running").length,
+      4,
+    );
+    assert.equal(
+      spawns.filter((snapshot) => snapshot.status === "queued").length,
+      16,
     );
   });
 });
 
-test("pi spawn fails fast without the parent model registry", async () => {
-  await withManager(async (manager, runtime) => {
-    await assert.rejects(
-      runTool(runtime, manager.spawn("pi", task("needs a registry"))),
-      /model registry/,
+test("backend admission failure settles the record and releases its slot", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const spawns = await runTool(
+      runtime,
+      Effect.forEach(
+        ["SPAWN_FAIL: first", "hold-2", "hold-3", "hold-4", "after-failure"],
+        (prompt) => manager.spawn("codex", task(prompt)),
+        { concurrency: "unbounded" },
+      ),
     );
-    // The failed spawn must release its concurrency reservation.
-    const snap = await runTool(runtime, manager.spawn("codex", task("ok")));
-    assert.equal(snap.backend, "codex");
+    const failed = await runTool(
+      runtime,
+      manager.awaitSettlement(spawns[0]!.id),
+    );
+    assert.equal(failed?.status, "error");
+    assert.match(failed?.errorText ?? "", /controlled spawn failure/);
+    await waitUntil(
+      () => controlled.starts.includes("after-failure"),
+      "failure should release capacity for the queued task",
+    );
+  });
+});
+
+test("pi admission failures settle through the shared manager record", async () => {
+  await withManager(async (manager, runtime) => {
+    const pi = await runTool(
+      runtime,
+      manager.spawn("pi", task("needs a registry")),
+    );
+    const failed = await runTool(runtime, manager.awaitSettlement(pi.id));
+    assert.equal(failed?.status, "error");
+    assert.match(failed?.errorText ?? "", /model registry/);
+
+    // The failed Pi admission must release its global slot for Codex work.
+    const codex = await runTool(
+      runtime,
+      manager.spawn("codex", task("after pi failure")),
+    );
+    await runTool(runtime, manager.waitFor([codex.id]));
+    assert.equal(manager.view.get(codex.id)?.status, "done");
   });
 });
 

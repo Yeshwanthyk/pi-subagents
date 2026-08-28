@@ -64,6 +64,13 @@ function statusPresentation(
       word: theme.fg("error", "FAILED"),
     };
   }
+  if (snapshot.status === "queued") {
+    return {
+      square: theme.fg("muted", "■"),
+      word: theme.fg("muted", "QUEUED"),
+    };
+  }
+
   const quiet = now - snapshot.lastActivityAt >= 30_000;
   return {
     square: theme.fg("warning", "■"),
@@ -91,6 +98,8 @@ export function renderSubagentActivity(
     if (snapshot.liveTools.length > (options.expanded ? 4 : 1)) {
       text += `\n  ${theme.fg("dim", `+${snapshot.liveTools.length - (options.expanded ? 4 : 1)} more tools`)}`;
     }
+  } else if (snapshot.status === "queued") {
+    text += `\n  ${theme.fg("muted", "waiting for an execution slot")}`;
   } else if (snapshot.status === "running") {
     const label = snapshot.liveAssistant ? "model responding" : "model working";
     text += `\n  ${theme.fg("muted", label)}${theme.fg(
@@ -141,7 +150,9 @@ export function renderSubagentWaitSummary(
   theme: Theme,
   now = Date.now(),
 ) {
-  const pending = snapshots.filter((snapshot) => snapshot.status === "running");
+  const pending = snapshots.filter(
+    (snapshot) => snapshot.status === "queued" || snapshot.status === "running",
+  );
   const complete = snapshots.length - pending.length;
   const lines = [
     `Waiting for ${pending.length} subagent${pending.length === 1 ? "" : "s"}${complete ? ` · ${complete} complete` : ""}`,
@@ -154,7 +165,14 @@ export function renderSubagentWaitSummary(
   ).length;
   if (done + failed > 0) {
     lines.push(
-      formatActivityCounts(theme, { running: pending.length, done, failed }),
+      formatActivityCounts(theme, {
+        queued: pending.filter((snapshot) => snapshot.status === "queued")
+          .length,
+        running: pending.filter((snapshot) => snapshot.status === "running")
+          .length,
+        done,
+        failed,
+      }),
     );
   }
   for (const snapshot of pending.slice(0, 6)) {

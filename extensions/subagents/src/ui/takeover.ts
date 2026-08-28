@@ -19,7 +19,11 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { formatElapsed, type SubagentSnapshot } from "../domain.ts";
+import {
+  formatElapsed,
+  isSubagentPending,
+  type SubagentSnapshot,
+} from "../domain.ts";
 import { formatContextUtilization } from "../format.ts";
 import type { SubagentReadModel } from "../manager.ts";
 import { buildTranscriptLines, sanitizeText } from "./transcript.ts";
@@ -68,6 +72,8 @@ function configuredKeys(
 
 function statusGlyph(snap: SubagentSnapshot, theme: Theme): string {
   switch (snap.status) {
+    case "queued":
+      return theme.fg("muted", "■");
     case "running":
       return theme.fg("warning", "■");
     case "done":
@@ -100,6 +106,8 @@ export function takeoverMetaLabels(snap: SubagentSnapshot) {
 
 function statusWord(snap: SubagentSnapshot, theme: Theme): string {
   switch (snap.status) {
+    case "queued":
+      return theme.fg("muted", "queued");
     case "running":
       return theme.fg("warning", "running");
     case "done":
@@ -111,6 +119,8 @@ function statusWord(snap: SubagentSnapshot, theme: Theme): string {
 
 function detailStatusLabel(snap: SubagentSnapshot, theme: Theme): string {
   switch (snap.status) {
+    case "queued":
+      return theme.fg("muted", theme.bold("QUEUED"));
     case "running":
       return theme.fg("warning", theme.bold("RUNNING"));
     case "done":
@@ -510,7 +520,8 @@ class SubagentDashboard implements Component {
     if (this.focusPane === "detail") {
       if (this.keybindings.matches(data, "app.clear")) {
         const snap = subs[this.selection.index];
-        if (snap?.status === "running") this.view.requestAbort(snap.id);
+        if (snap && isSubagentPending(snap.status))
+          this.view.requestAbort(snap.id);
         return;
       }
       if (this.keybindings.matches(data, "tui.editor.cursorUp")) {
@@ -562,7 +573,7 @@ class SubagentDashboard implements Component {
     if (data === "x") {
       const snap = subs[this.selection.index];
       if (!snap) return;
-      if (snap.status === "running") this.view.requestAbort(snap.id);
+      if (isSubagentPending(snap.status)) this.view.requestAbort(snap.id);
       return;
     }
   }
@@ -608,9 +619,10 @@ class SubagentDashboard implements Component {
       theme.bold(this.options.title ?? "Subagents"),
     );
     const running = subs.filter((s) => s.status === "running").length;
+    const queued = subs.filter((s) => s.status === "queued").length;
     const headerRight = theme.fg(
       running > 0 ? "warning" : "muted",
-      `● ${running} running`,
+      `● ${running} running${queued > 0 ? ` · ${queued} queued` : ""}`,
     );
     const headerPad = Math.max(
       1,
@@ -624,7 +636,7 @@ class SubagentDashboard implements Component {
     );
 
     // Top border with panel title.
-    const settled = subs.filter((s) => s.status !== "running").length;
+    const settled = subs.filter((s) => !isSubagentPending(s.status)).length;
     const borderLabel = narrow
       ? `agents · ${this.selection.index + 1}/${subs.length} selected`
       : `agents · ${settled}/${subs.length}`;
@@ -999,7 +1011,8 @@ class TakeoverView implements Component, Focusable {
   handleInput(data: string): void {
     if (this.keybindings.matches(data, "app.clear")) {
       const snap = this.snap();
-      if (snap?.status === "running") this.view.requestAbort(this.id);
+      if (snap && isSubagentPending(snap.status))
+        this.view.requestAbort(this.id);
       return;
     }
     if (

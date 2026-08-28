@@ -38,8 +38,15 @@ export function isReasoningEffort(
   );
 }
 
-export type SubagentStatus = "running" | "done" | "error";
+export type SubagentStatus = "queued" | "running" | "done" | "error";
+export type TerminalSubagentStatus = Extract<SubagentStatus, "done" | "error">;
 export type SubagentResultDelivery = "parent" | "client";
+
+/** Stable correlation for a child admitted on behalf of a workflow task. */
+export interface WorkflowOwnership {
+  readonly runId: string;
+  readonly taskId: string;
+}
 
 export interface SubagentClient {
   readonly id: string;
@@ -73,6 +80,8 @@ export interface SpawnTask {
   readonly cwd: string;
   /** Logical namespace for the feature or extension that created the session. */
   readonly owner?: string;
+  /** Workflow correlation owned by the workflow layer, opaque to backends. */
+  readonly workflow?: WorkflowOwnership;
   /** Where terminal lifecycle output is delivered. */
   readonly resultDelivery?: SubagentResultDelivery;
   /** Correlation metadata for an extension client that owns task state. */
@@ -235,6 +244,7 @@ export interface SubagentSnapshot {
   readonly id: string;
   readonly backend: BackendName;
   readonly owner: string;
+  readonly workflow?: WorkflowOwnership;
   readonly resultDelivery: SubagentResultDelivery;
   readonly client?: SubagentClient;
   /** Runtime-only relationship captured at spawn; never persisted in message details. */
@@ -244,6 +254,8 @@ export interface SubagentSnapshot {
   readonly cwd: string;
   readonly status: SubagentStatus;
   readonly createdAt: number;
+  /** Set only after admission creates a backend session. */
+  readonly startedAt?: number;
   readonly settledAt?: number;
   /** Latest meaningful model, tool, queue, or lifecycle event. */
   readonly lastActivityAt: number;
@@ -263,6 +275,16 @@ export interface SubagentSnapshot {
   readonly finalText: string;
   /** Count of finalized assistant messages (for subagent_check). */
   readonly turns: number;
+}
+
+export function isSubagentPending(status: SubagentStatus): boolean {
+  return status === "queued" || status === "running";
+}
+
+export function isSubagentTerminal(
+  status: SubagentStatus,
+): status is TerminalSubagentStatus {
+  return status === "done" || status === "error";
 }
 
 /** Final text, or the live streaming buffer while a run is active (v1 `latestOutput`). */

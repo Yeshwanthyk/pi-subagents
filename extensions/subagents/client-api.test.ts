@@ -93,6 +93,7 @@ test("client API spawns once per client correlation and lists the result", async
         return created;
       }),
     waitFor: () => Effect.void,
+    awaitSettlement: () => Effect.succeed(undefined),
     cancel: () => Effect.succeed([]),
     send: () => Effect.void,
     get: () => Effect.succeed(undefined),

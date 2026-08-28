@@ -81,7 +81,7 @@ export interface BrowserActivityChildSnapshot {
   readonly model?: string;
   readonly reasoningEffort?: ReasoningEffort;
   readonly title: string;
-  readonly status: "running";
+  readonly status: "queued" | "running";
   readonly prompt: string;
   readonly output: string;
   readonly failure?: string;
@@ -184,7 +184,7 @@ const ChildSchema = Type.Object({
     ]),
   ),
   title: Text(BROWSER_ACTIVITY_LIMITS.maxTitleLength),
-  status: Type.Literal("running"),
+  status: Type.Union([Type.Literal("queued"), Type.Literal("running")]),
   prompt: Text(BROWSER_ACTIVITY_LIMITS.maxPromptLength),
   output: Text(BROWSER_ACTIVITY_LIMITS.maxOutputLength),
   failure: Type.Optional(Text(BROWSER_ACTIVITY_LIMITS.maxFailureLength)),
@@ -427,7 +427,7 @@ function projectChild(
     id: id(snapshot.id) ?? "unknown",
     backend: snapshot.backend,
     title: line(snapshot.title, BROWSER_ACTIVITY_LIMITS.maxTitleLength),
-    status: "running",
+    status: snapshot.status === "queued" ? "queued" : "running",
     prompt: bounded(snapshot.prompt, BROWSER_ACTIVITY_LIMITS.maxPromptLength),
     output: bounded(output, BROWSER_ACTIVITY_LIMITS.maxOutputLength),
     transcript: snapshot.transcript
@@ -453,7 +453,8 @@ function projectChild(
 export function projectBrowserTerminal(
   snapshot: SubagentSnapshot,
 ): BrowserActivityTerminalSnapshot | undefined {
-  if (snapshot.status === "running") return undefined;
+  if (snapshot.status === "queued" || snapshot.status === "running")
+    return undefined;
   const childId = id(snapshot.id);
   if (!childId) return undefined;
   const failure = snapshot.errorText
@@ -483,7 +484,8 @@ export function projectBrowserActivity(
   const children = snapshots
     .filter(
       (snapshot) =>
-        snapshot.status === "running" && id(snapshot.id) !== undefined,
+        (snapshot.status === "queued" || snapshot.status === "running") &&
+        id(snapshot.id) !== undefined,
     )
     .sort(
       (left, right) =>
