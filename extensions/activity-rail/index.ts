@@ -3,7 +3,7 @@ import type {
   ExtensionUIContext,
   Theme,
 } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
   ACTIVE_WORK_CHANNELS,
   type ActiveWorkItem,
@@ -12,8 +12,6 @@ import {
   parseActiveWorkRemoval,
 } from "../subagents/src/activity-protocol.ts";
 
-const MAX_VISIBLE = 3;
-const MAX_FLASH = 1;
 const FLASH_TTL_MS = 20_000;
 const COALESCE_MS = 100;
 type EventPayload = Parameters<Parameters<ExtensionAPI["events"]["on"]>[1]>[0];
@@ -25,27 +23,7 @@ interface SettleFlash {
   settledAt: number;
 }
 
-function age(timestamp: number, now: number) {
-  const seconds = Math.max(0, Math.round((now - timestamp) / 1_000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainder = seconds % 60;
-  return `${minutes}m${remainder.toString().padStart(2, "0")}s`;
-}
-
-function bounded(text: string, maxLength: number) {
-  const value = text.replace(/\s+/g, " ").trim();
-  return value.length <= maxLength
-    ? value
-    : `${value.slice(0, maxLength - 1)}…`;
-}
-
-function compactAge(timestamp: number, now: number) {
-  const seconds = Math.max(0, Math.round((now - timestamp) / 1_000));
-  return seconds < 2 ? "active now" : `active ${age(timestamp, now)} ago`;
-}
-
-function statusChip(
+function compactStatus(
   status: "running" | "quiet" | "done" | "error",
   theme: Theme,
 ) {
@@ -53,68 +31,80 @@ function statusChip(
     case "done":
       return theme.fg("success", "[DONE]");
     case "error":
-      return theme.fg("error", "[FAILED]");
+      return theme.fg("error", "[FAIL]");
     case "quiet":
       return theme.fg("muted", "[QUIET]");
     default:
-      return theme.fg("warning", "[RUNNING]");
+      return theme.fg("warning", "[RUN]");
   }
 }
 
-/** Render one active item on a single bounded line. */
-function itemLine(
-  item: ActiveWorkItem,
+function compactRailLine(
+  items: ReadonlyArray<ActiveWorkItem>,
+  flashes: ReadonlyArray<SettleFlash>,
   theme: Theme,
   now: number,
   width: number,
 ) {
-  const quiet = item.status === "quiet" || now - item.lastActivityAt >= 30_000;
-  const glyph = quiet ? theme.fg("muted", "■") : theme.fg("warning", "●");
-  const title = theme.fg("accent", bounded(item.label, 30));
-  const meta = [
-    compactAge(item.lastActivityAt, now),
-    item.completedOperations && item.completedOperations > 0
-      ? `${item.completedOperations} ops`
-      : undefined,
-    item.contextPercent !== undefined
-      ? `ctx ${item.contextPercent}%`
-      : undefined,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-  const operation =
-    item.currentOperation ??
-    (quiet ? "quiet · no recent events" : "model working");
-  const chip = quiet ? ` ${statusChip("quiet", theme)}` : "";
-  return truncateToWidth(
-    `${glyph} ${title}${chip}${theme.fg("dim", " — ")}${theme.fg(
-      quiet ? "muted" : "toolTitle",
-      operation,
-    )}${meta ? theme.fg("dim", ` · ${meta}`) : ""}`,
-    width,
-    "…",
+  const firstItem = items[0];
+  const firstFlash = flashes[0];
+  if (!firstItem && !firstFlash) {
+    const empty = width < 40 ? "0a · ^⇧A" : "0 active · ctrl+shift+a";
+    return truncateToWidth(theme.fg("dim", empty), width, "…");
+  }
+  const quiet =
+    firstItem !== undefined &&
+    (firstItem.status === "quiet" || now - firstItem.lastActivityAt >= 30_000);
+  const label = firstItem?.label ?? firstFlash?.title ?? "activity";
+  const status = firstItem
+    ? compactStatus(quiet ? "quiet" : "running", theme)
+    : compactStatus(firstFlash?.status ?? "done", theme);
+  const overflow = Math.max(
+    0,
+    items.length +
+      flashes.length -
+      (firstItem !== undefined || firstFlash !== undefined ? 1 : 0),
   );
-}
-
-function flashLine(
-  flash: SettleFlash,
-  theme: Theme,
-  now: number,
-  width: number,
-) {
-  const ok = flash.status === "done";
-  const glyph = theme.fg(ok ? "success" : "error", ok ? "✓" : "✕");
-  const meta = [
-    flash.ops !== undefined ? `${flash.ops} ops` : undefined,
-    age(flash.settledAt, now),
-  ]
-    .filter(Boolean)
-    .join(" · ");
-  const line =
-    `${glyph} ${theme.fg("muted", bounded(flash.title, 28))} ` +
-    `${statusChip(flash.status, theme)}` +
-    (meta ? theme.fg("dim", ` · ${meta}`) : "");
-  return truncateToWidth(line, width, "…");
+  const extraNarrow = width < 40;
+  // Below 40 columns, conventional key/state symbols preserve every useful
+  // field instead of allowing truncation to hide the shortcut or identity.
+  const shortcut = extraNarrow ? "^⇧A" : "ctrl+shift+a";
+  const prefix = theme.fg(
+    items.length > 0 ? "warning" : "muted",
+    extraNarrow ? `${items.length}a · ` : `${items.length} active · `,
+  );
+  const shortState = theme.fg(
+    firstItem
+      ? quiet
+        ? "muted"
+        : "warning"
+      : firstFlash?.status === "error"
+        ? "error"
+        : "success",
+    firstItem
+      ? quiet
+        ? "Q"
+        : "R"
+      : firstFlash?.status === "error"
+        ? "!"
+        : "D",
+  );
+  const suffix = extraNarrow
+    ? `${theme.fg("dim", " · ")}${shortState}${
+        overflow > 0 ? theme.fg("dim", ` · +${overflow}`) : ""
+      }${theme.fg("dim", ` · ${shortcut}`)}`
+    : `${theme.fg("dim", " · ")}${status}${
+        overflow > 0 ? theme.fg("dim", ` · +${overflow}`) : ""
+      }${theme.fg("dim", ` · ${shortcut}`)}`;
+  const labelWidth = Math.max(
+    1,
+    width - visibleWidth(prefix) - visibleWidth(suffix),
+  );
+  const compactLabel = theme.fg(
+    firstItem ? "accent" : "muted",
+    truncateToWidth(label.replace(/\s+/g, " ").trim(), labelWidth, "…"),
+  );
+  return truncateToWidth(`${prefix}${compactLabel}${suffix}`, width, "…");
 }
 
 export function renderActiveWorkRail(
@@ -122,24 +112,10 @@ export function renderActiveWorkRail(
   theme: Theme,
   now = Date.now(),
   flashes: ReadonlyArray<SettleFlash> = [],
-  maxWidth = 100,
+  maxWidth = 120,
 ) {
-  const count = items.length;
-  const lines = [
-    `${theme.fg("warning", "●")} ${theme.fg(
-      "muted",
-      theme.bold(`${count} active ${count === 1 ? "item" : "items"}`),
-    )}${theme.fg("dim", " · ctrl+shift+a")}`,
-  ];
-  const visible = items.slice(0, MAX_VISIBLE);
-  for (const item of visible) lines.push(itemLine(item, theme, now, maxWidth));
-  for (const flash of flashes.slice(0, MAX_FLASH))
-    lines.push(flashLine(flash, theme, now, maxWidth));
-  const overflow =
-    Math.max(0, items.length - MAX_VISIBLE) +
-    Math.max(0, flashes.length - MAX_FLASH);
-  if (overflow > 0) lines.push(theme.fg("dim", `+${overflow} more`));
-  return lines;
+  const width = Math.max(1, maxWidth);
+  return [compactRailLine(items, flashes, theme, now, width)];
 }
 
 export default function activityRail(pi: ExtensionAPI) {
@@ -155,11 +131,15 @@ export default function activityRail(pi: ExtensionAPI) {
       ui.setWidget("active-work", undefined);
       return;
     }
+    const itemSnapshot = [...items.values()];
+    const flashSnapshot = [...flashes.values()];
     ui.setWidget(
       "active-work",
-      renderActiveWorkRail([...items.values()], ui.theme, now, [
-        ...flashes.values(),
-      ]),
+      (_tui, theme) => ({
+        render: (width: number) =>
+          renderActiveWorkRail(itemSnapshot, theme, now, flashSnapshot, width),
+        invalidate() {},
+      }),
       { placement: "belowEditor" },
     );
   };
