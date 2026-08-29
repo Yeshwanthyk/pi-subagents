@@ -13,6 +13,12 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import type { WorkflowDraft } from "./drafts.ts";
+import {
+  workflowTaskPurpose,
+  workflowTaskRuntime,
+  workflowTaskScope,
+  workflowTaskWiring,
+} from "./prompt.ts";
 
 const MIN_SPLIT_WIDTH = 96;
 const MIN_PANEL_HEIGHT = 8;
@@ -44,7 +50,9 @@ function panel(
   const innerWidth = panelWidth - 2;
   const bodyHeight = Math.max(1, height - 2);
   const border = focused ? "borderAccent" : "borderMuted";
-  const heading = ` ${title} `;
+  const titleWidth = Math.max(0, innerWidth - 3);
+  const titleText = truncateToWidth(title, titleWidth, "");
+  const heading = titleText.length > 0 ? ` ${titleText} ` : "";
   const ruleLength = Math.max(0, innerWidth - visibleWidth(heading) - 1);
   const lines = [theme.fg(border, `╭─${heading}${"─".repeat(ruleLength)}╮`)];
   for (let index = 0; index < bodyHeight; index++) {
@@ -68,13 +76,6 @@ function addWrapped(
   }
 }
 
-function taskScope(draft: WorkflowDraft, taskIndex: number): string {
-  const task = draft.definition.tasks[taskIndex];
-  if (!task) return "";
-  if (task.readOnly) return "read only";
-  return `owns ${(task.owns ?? []).join(", ")}`;
-}
-
 function reviewRows(
   draft: WorkflowDraft,
   artifactPath: string,
@@ -90,20 +91,28 @@ function reviewRows(
     rows.push(
       `${theme.fg("accent", String(index + 1).padStart(2, " "))}  ${theme.bold(task.label)} ${theme.fg("dim", `· ${task.id}`)}`,
     );
-    const dependencies = task.needs?.length
-      ? `after ${task.needs.join(", ")} · `
-      : "";
     addWrapped(
       rows,
-      `    ${dependencies}${taskScope(draft, index)}`,
+      `    Purpose: ${workflowTaskPurpose(task)}`,
+      width,
+      "text",
+      theme,
+    );
+    addWrapped(rows, `    ${workflowTaskWiring(task)}`, width, "muted", theme);
+    addWrapped(
+      rows,
+      `    Scope: ${workflowTaskScope(task)}`,
       width,
       "muted",
       theme,
     );
-    const runtime = [task.harness, task.model, task.effort]
-      .filter((value) => value !== undefined)
-      .join(" · ");
-    if (runtime) addWrapped(rows, `    ${runtime}`, width, "dim", theme);
+    addWrapped(
+      rows,
+      `    Requested/configured runtime: ${workflowTaskRuntime(task)}`,
+      width,
+      "dim",
+      theme,
+    );
   }
   rows.push("");
   rows.push(theme.fg("dim", "REVIEW"));
@@ -332,15 +341,14 @@ export function workflowDraftReviewText(
 ): string {
   const definition = exactDefinition(draft);
   const tasks = draft.definition.tasks.flatMap((task, index) => {
-    const dependencies = task.needs?.length
-      ? ` after ${task.needs.join(", ")}`
-      : "";
-    const scope = task.readOnly
-      ? "read only"
-      : `owns ${(task.owns ?? []).join(", ")}`;
+    const wiring = workflowTaskWiring(task);
+    const scope = workflowTaskScope(task);
     return [
       `${index + 1}. ${task.label} (${task.id})`,
-      `   ${scope}${dependencies}`,
+      `   Purpose: ${workflowTaskPurpose(task)}`,
+      `   ${wiring}`,
+      `   Scope: ${scope}`,
+      `   Requested/configured runtime: ${workflowTaskRuntime(task)}`,
     ];
   });
   return [

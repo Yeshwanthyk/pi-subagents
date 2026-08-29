@@ -14,6 +14,8 @@ import {
 import { WorkflowManager } from "./manager.ts";
 import {
   buildWorkflowDraftMessage,
+  MAX_WORKFLOW_DRAFT_MESSAGE_BYTES,
+  MAX_WORKFLOW_DRAFT_MESSAGE_TASK_ROWS,
   WORKFLOW_TOOL_DESCRIPTION,
   WORKFLOW_PROMPT_GUIDELINES,
 } from "./prompt.ts";
@@ -406,8 +408,165 @@ test("prompt contract makes prepare, review, and exact later approval explicit",
   assert.match(message, /Draft prepared/);
   assert.match(message, /immutable · not started/);
   assert.match(message, new RegExp(`/workflow-draft ${draft.draftId}`));
-  assert.doesNotMatch(message, /Review this exact graph/);
-  assert.equal(message.split("\n").length, 2);
+  assert.match(message, /Purpose: inspect without writing/);
+  assert.match(message, /Needs: none · Consumes: none/);
+  assert.match(message, /Scope: read-only/);
+  assert.match(message, /Requested\/configured runtime:/);
+  assert.match(
+    message,
+    /Harness: workflow default \(execution defaults to pi unless approval options override\)/,
+  );
+  assert.match(message, /Provider: unspecified/);
+  assert.match(
+    message,
+    /Model: unspecified \(selected backend\/session default\)/,
+  );
+  assert.match(
+    message,
+    /Thinking: unspecified \(selected backend\/session default\)/,
+  );
+  assert.match(message, /Digest: [a-f0-9]{64}/);
+  assert.match(message, /Outcome\nReview this exact graph/);
+  assert.ok(message.split("\n").length < 20);
   assert.match(WORKFLOW_TOOL_DESCRIPTION, /normal assistant response/i);
-  assert.match(WORKFLOW_PROMPT_GUIDELINES.join("\n"), /task wiring\/scopes/i);
+  assert.match(WORKFLOW_TOOL_DESCRIPTION, /purpose derived from the prompt/i);
+  assert.match(
+    WORKFLOW_TOOL_DESCRIPTION,
+    /harness, provider, model, and thinking effort/i,
+  );
+  assert.match(WORKFLOW_TOOL_DESCRIPTION, /execution digest/i);
+  assert.match(
+    WORKFLOW_PROMPT_GUIDELINES.join("\n"),
+    /purpose derived from its prompt/i,
+  );
+  assert.match(
+    WORKFLOW_PROMPT_GUIDELINES.join("\n"),
+    /requested\/configured runtime row/i,
+  );
+});
+
+test("buildWorkflowDraftMessage omits the prompt tail while retaining the bounded preview", (t) => {
+  const { workflowsDir, cwd } = fixture(t);
+  const tail = "PROMPT_TAIL_NOT_SHOWN";
+  const draft = createWorkflowDraft(workflowsDir, {
+    sessionId: "session-a",
+    cwd,
+    preparedAtUserInput: 1,
+    preview: "A bounded preview",
+    definition: {
+      tasks: [
+        {
+          ...definition().tasks[0]!,
+          prompt: `Visible intent. ${tail.repeat(100)}`,
+        },
+      ],
+    },
+    createId: () => "draft_ffffffffffff",
+  });
+  const message = buildWorkflowDraftMessage({
+    draft,
+    artifactPath: workflowDraftArtifactPath(workflowsDir, draft.draftId),
+  });
+
+  assert.match(message, /Outcome\nA bounded preview/);
+  assert.doesNotMatch(message, new RegExp(tail));
+});
+
+test("buildWorkflowDraftMessage describes codex and empty or bare model requests honestly", (t) => {
+  const { workflowsDir, cwd } = fixture(t);
+  const base = definition().tasks[0]!;
+  const draft = createWorkflowDraft(workflowsDir, {
+    sessionId: "session-a",
+    cwd,
+    preparedAtUserInput: 1,
+    preview: "Runtime defaults",
+    definition: {
+      tasks: [
+        { ...base, id: "codex", label: "Codex", harness: "codex" },
+        { ...base, id: "empty", label: "Empty", model: "" },
+        { ...base, id: "bare", label: "Bare", model: "gpt-5" },
+        {
+          ...base,
+          id: "codex-slash",
+          label: "Codex slash",
+          harness: "codex",
+          model: "openai-codex/gpt-5",
+        },
+        {
+          ...base,
+          id: "whitespace",
+          label: "Whitespace",
+          harness: "pi",
+          model: "   ",
+        },
+      ],
+    },
+    createId: () => "draft_666666666666",
+  });
+  const message = buildWorkflowDraftMessage({
+    draft,
+    artifactPath: workflowDraftArtifactPath(workflowsDir, draft.draftId),
+  });
+
+  assert.match(message, /Codex \(codex\)[\s\S]*Harness: codex/);
+  assert.match(
+    message,
+    /Model: unspecified \(codex backend\/session default\)/,
+  );
+  assert.match(
+    message,
+    /Thinking: unspecified \(codex backend\/session default\)/,
+  );
+  assert.match(
+    message,
+    /Empty \(empty\)[\s\S]*Provider: unspecified · Model: unspecified \(selected backend\/session default\)/,
+  );
+  assert.match(
+    message,
+    /Bare \(bare\)[\s\S]*Provider: not encoded in model ID · Model: gpt-5/,
+  );
+  assert.match(
+    message,
+    /Codex slash \(codex-slash\)[\s\S]*Provider: selected by codex backend · Model: openai-codex\/gpt-5/,
+  );
+  assert.match(
+    message,
+    /Whitespace \(whitespace\)[\s\S]*Model: configured whitespace-only value "   "/,
+  );
+  assert.doesNotMatch(message, /inherits session\/default/);
+});
+
+test("buildWorkflowDraftMessage bounds aggregate UTF-8 bytes and task rows with an omission marker", (t) => {
+  const { workflowsDir, cwd } = fixture(t);
+  const base = definition().tasks[0]!;
+  const total = MAX_WORKFLOW_DRAFT_MESSAGE_TASK_ROWS + 8;
+  const draft = createWorkflowDraft(workflowsDir, {
+    sessionId: "session-a",
+    cwd,
+    preparedAtUserInput: 1,
+    preview: "Bounded task review",
+    definition: {
+      name: "many tasks",
+      tasks: Array.from({ length: total }, (_, index) => ({
+        ...base,
+        id: `task-${index + 1}`,
+        label: `Task ${index + 1}`,
+        prompt: `Inspect task ${index + 1}`,
+      })),
+    },
+    createId: () => "draft_777777777777",
+  });
+  const message = buildWorkflowDraftMessage({
+    draft,
+    artifactPath: workflowDraftArtifactPath(workflowsDir, draft.draftId),
+  });
+
+  assert.ok(
+    Buffer.byteLength(message, "utf8") <= MAX_WORKFLOW_DRAFT_MESSAGE_BYTES,
+  );
+  assert.match(message, new RegExp(`Tasks \\(${total}\\)`));
+  assert.match(message, new RegExp(`… 8 task\\(s\\) omitted · total ${total}`));
+  assert.match(message, /Draft prepared · many tasks · draft_777777777777/);
+  assert.match(message, /Digest: [a-f0-9]{64}/);
+  assert.match(message, /Review: \/workflow-draft draft_777777777777/);
 });
