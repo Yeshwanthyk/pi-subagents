@@ -318,20 +318,23 @@ export interface TakeoverOptions {
   title?: string;
 }
 
+type SubagentViewResult = "toggle" | null;
+
 export async function openSubagent(
   ctx: TakeoverContext,
   view: SubagentReadModel,
   id: string,
   options: TakeoverOptions = {},
-): Promise<void> {
-  if (!view.get(id)) return;
-  await ctx.ui.custom<null>(
+): Promise<boolean> {
+  if (!view.get(id)) return false;
+  const result = await ctx.ui.custom<SubagentViewResult>(
     (tui, theme, keybindings, done) =>
       new TakeoverView(tui, theme, keybindings, id, view, done, options),
     {
       overlay: true,
     },
   );
+  return result === "toggle";
 }
 
 export async function openSubagentPicker(
@@ -340,6 +343,7 @@ export async function openSubagentPicker(
   options: TakeoverOptions = {},
 ) {
   const selection: DashboardSelection = { index: 0 };
+  let dismissDashboard: (() => void) | undefined;
 
   while (true) {
     if (view.size() === 0) {
@@ -348,8 +352,8 @@ export async function openSubagentPicker(
     }
 
     const picked = await ctx.ui.custom<string | null>(
-      (tui, theme, keybindings, done) =>
-        new SubagentDashboard(
+      (tui, theme, keybindings, done) => {
+        const dashboard = new SubagentDashboard(
           tui,
           theme,
           keybindings,
@@ -357,7 +361,10 @@ export async function openSubagentPicker(
           selection,
           done,
           options,
-        ),
+        );
+        dismissDashboard = () => dashboard.dismiss();
+        return dashboard;
+      },
       {
         overlay: true,
       },
@@ -366,7 +373,13 @@ export async function openSubagentPicker(
     if (!picked) return;
     if (!view.get(picked)) continue;
 
-    await openSubagent(ctx, view, picked, options);
+    const toggled = await openSubagent(ctx, view, picked, options);
+    if (toggled) {
+      // The takeover is nested above the dashboard. Dismiss both overlays so
+      // the editor regains focus rather than leaving the picker underneath.
+      dismissDashboard?.();
+      return;
+    }
     // After leaving the takeover view, fall back to the dashboard.
   }
 }
@@ -495,6 +508,10 @@ class SubagentDashboard implements Component {
     if (this.cleanup()) this.done(result);
   }
 
+  dismiss(): void {
+    this.close(null);
+  }
+
   dispose(): void {
     this.cleanup();
   }
@@ -503,6 +520,10 @@ class SubagentDashboard implements Component {
     const subs = this.subs();
     reconcileDashboardSelection(this.selection, subs);
 
+    if (matchesKey(data, "ctrl+shift+a")) {
+      this.close(null);
+      return;
+    }
     if (this.keybindings.matches(data, "tui.select.cancel")) {
       if (this.focusPane === "detail") {
         this.focusList();
@@ -891,7 +912,7 @@ class TakeoverView implements Component, Focusable {
   private keybindings: KeybindingsManager;
   private id: string;
   private view: SubagentReadModel;
-  private done: (value: null) => void;
+  private done: (value: SubagentViewResult) => void;
   private options: TakeoverOptions;
 
   private input = new Input();
@@ -920,7 +941,7 @@ class TakeoverView implements Component, Focusable {
     keybindings: KeybindingsManager,
     id: string,
     view: SubagentReadModel,
-    done: (value: null) => void,
+    done: (value: SubagentViewResult) => void,
     options: TakeoverOptions,
   ) {
     this.tui = tui;
@@ -1000,8 +1021,8 @@ class TakeoverView implements Component, Focusable {
     return true;
   }
 
-  private close() {
-    if (this.cleanup()) this.done(null);
+  private close(result: SubagentViewResult = null) {
+    if (this.cleanup()) this.done(result);
   }
 
   dispose(): void {
@@ -1009,6 +1030,10 @@ class TakeoverView implements Component, Focusable {
   }
 
   handleInput(data: string): void {
+    if (matchesKey(data, "ctrl+shift+a")) {
+      this.close("toggle");
+      return;
+    }
     if (this.keybindings.matches(data, "app.clear")) {
       const snap = this.snap();
       if (snap && isSubagentPending(snap.status))

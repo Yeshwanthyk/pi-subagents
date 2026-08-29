@@ -238,11 +238,11 @@ function executorFromManager(
     get: (id) => manager.view.get(id),
     cancel: (ids) => Effect.runPromise(manager.cancel(ids)),
     subscribeTo: (id, listener) => manager.view.subscribeTo(id, listener),
+  };
   if (manager.awaitAdmission) {
     executor.awaitAdmission = (id, expectedWorkflow) =>
       Effect.runPromise(manager.awaitAdmission!(id, expectedWorkflow));
   }
-  };
   const observeWorkflow = manager.observeWorkflow;
   if (observeWorkflow) {
     executor.observeWorkflow = async (id, expectedWorkflow) =>

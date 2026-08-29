@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import type {
+  KeybindingsManager,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import type { TUI } from "@earendil-works/pi-tui";
 import type { SubagentSnapshot } from "./src/domain.ts";
 import {
   cycleSubagentId,
+  openSubagentPicker,
   orderDashboardSnapshots,
   reconcileDashboardSelection,
   renderDetailHeader,
@@ -45,6 +50,66 @@ function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
   };
 }
 
+test("Ctrl+Shift+A toggles the dashboard open, closed, and open again", async () => {
+  const toggleInput = "\x1b[97;6u";
+  const tuiFixture = {
+    terminal: { columns: 100, rows: 30 },
+    requestRender() {},
+  };
+  // SAFETY: This fixture provides the TUI fields used by SubagentDashboard.
+  const tui = Object.assign(Object.create(null) as TUI, tuiFixture);
+  const keybindingsFixture = {
+    matches: () => false,
+  };
+  // SAFETY: This fixture only needs the keybinding lookup used by the dashboard.
+  const keybindings = Object.assign(
+    Object.create(null) as KeybindingsManager,
+    keybindingsFixture,
+  );
+  type TestComponent = { handleInput(data: string): void };
+  let opens = 0;
+  type TestFactory<T> = (
+    tui: TUI,
+    theme: Theme,
+    keybindings: KeybindingsManager,
+    done: (value: T) => void,
+  ) => TestComponent;
+  const custom = async <T>(factory: TestFactory<T>): Promise<T> => {
+    opens += 1;
+
+    return new Promise<T>((resolve) => {
+      const component = factory(tui, theme, keybindings, resolve);
+      component.handleInput(toggleInput);
+    });
+  };
+  const ctxFixture = {
+    mode: "tui",
+    ui: { custom },
+  };
+  // SAFETY: The custom UI fixture supplies the only context surface exercised here.
+  const ctx = Object.assign(
+    Object.create(null) as Parameters<typeof openSubagentPicker>[0],
+    ctxFixture,
+  );
+  const snap = snapshot();
+  const viewFixture = {
+    size: () => 1,
+    list: () => [snap],
+    get: (id: string) => (id === snap.id ? snap : undefined),
+    subscribe: () => () => {},
+  };
+  // SAFETY: This fixture implements every read-model method exercised by the dashboard.
+  const view = Object.assign(
+    Object.create(null) as Parameters<typeof openSubagentPicker>[1],
+    viewFixture,
+  );
+
+  await openSubagentPicker(ctx, view);
+  await openSubagentPicker(ctx, view);
+  await openSubagentPicker(ctx, view);
+
+  assert.equal(opens, 3);
+});
 test("dashboard selection follows its subagent id and falls back by row", () => {
   const selection: DashboardSelection = { id: "sa-7", index: 6 };
 
