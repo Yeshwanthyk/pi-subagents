@@ -109,7 +109,10 @@ import {
 } from "./src/workflows/tools.ts";
 import { WorkflowControls } from "./src/workflows/controls.ts";
 import { showWorkflowDraftReview } from "./src/workflows/draft-review.ts";
-import { workflowDraftArtifactPath } from "./src/workflows/drafts.ts";
+import {
+  loadWorkflowDraft,
+  workflowDraftArtifactPath,
+} from "./src/workflows/drafts.ts";
 import {
   WORKFLOW_CHECK_TOOL_DESCRIPTION,
   WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS,
@@ -1026,7 +1029,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("workflow-draft", {
-    description: "Review a pending workflow draft and its exact source/spec",
+    description: "Review a workflow draft and its exact source/spec",
     getArgumentCompletions: (prefix) => {
       const matches = (workflowLifecycle?.listPending() ?? [])
         .filter((draft) => draft.draftId.startsWith(prefix))
@@ -1057,24 +1060,48 @@ export default function (pi: ExtensionAPI) {
             (draft) => draft.draftId === query || draft.draftId.endsWith(query),
           )
         : available.slice(0, 1);
-      if (matches.length !== 1) {
+      if (matches.length > 1) {
         ctx.ui.notify(
-          query
-            ? `No unique pending workflow draft matching "${query}".`
-            : "No pending workflow drafts in this session.",
+          `Multiple pending workflow drafts match "${query}".`,
           "warning",
         );
         return;
       }
-      const draft = matches[0];
-      if (!draft) return;
+      const workflowsDir = path.join(getAgentDir(), "workflows");
+      let draft = matches[0];
+      let approvable = true;
+      if (!draft) {
+        if (!query) {
+          ctx.ui.notify(
+            "No pending workflow drafts in this session.",
+            "warning",
+          );
+          return;
+        }
+        try {
+          const persisted = loadWorkflowDraft(workflowsDir, query);
+          if (
+            persisted.sessionId !== ctx.sessionManager.getSessionId() ||
+            persisted.cwd !== path.resolve(ctx.cwd)
+          ) {
+            ctx.ui.notify(
+              "That workflow draft belongs to another session or project.",
+              "warning",
+            );
+            return;
+          }
+          draft = persisted;
+          approvable = false;
+        } catch {
+          ctx.ui.notify(`No workflow draft matching "${query}".`, "warning");
+          return;
+        }
+      }
       await showWorkflowDraftReview(
         ctx,
         draft,
-        workflowDraftArtifactPath(
-          path.join(getAgentDir(), "workflows"),
-          draft.draftId,
-        ),
+        workflowDraftArtifactPath(workflowsDir, draft.draftId),
+        approvable,
       );
     },
   });

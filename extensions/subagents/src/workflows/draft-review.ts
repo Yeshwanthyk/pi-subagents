@@ -167,6 +167,7 @@ export class WorkflowDraftReview {
   private readonly draft: WorkflowDraft;
   private readonly artifactPath: string;
   private readonly done: (action: ReviewAction) => void;
+  private readonly approvable: boolean;
 
   constructor(
     tui: TUI,
@@ -175,6 +176,7 @@ export class WorkflowDraftReview {
     draft: WorkflowDraft,
     artifactPath: string,
     done: (action: ReviewAction) => void,
+    approvable = true,
   ) {
     this.tui = tui;
     this.theme = theme;
@@ -182,6 +184,7 @@ export class WorkflowDraftReview {
     this.draft = draft;
     this.artifactPath = artifactPath;
     this.done = done;
+    this.approvable = approvable;
   }
 
   handleInput(data: string): void {
@@ -201,7 +204,7 @@ export class WorkflowDraftReview {
       this.keybindings.matches(data, "tui.select.pageDown");
 
     if (cancel) return this.done("close");
-    if (data === "a") return this.done("approve");
+    if (data === "a" && this.approvable) return this.done("approve");
     if (left) this.focus = "review";
     else if (right) this.focus = "definition";
     else if (data === "g") this.setScroll(0);
@@ -217,13 +220,19 @@ export class WorkflowDraftReview {
   render(width: number): string[] {
     const height = Math.max(MIN_PANEL_HEIGHT + 3, this.tui.terminal.rows - 1);
     const name = this.draft.definition.name ?? this.draft.draftId;
+    const state = this.approvable
+      ? "· immutable · not started"
+      : "· saved copy · review only";
     const header = truncateToWidth(
-      ` ${this.theme.fg("success", "●")} ${this.theme.bold("Draft review")} ${this.theme.fg("accent", name)} ${this.theme.fg("dim", "· immutable · not started")}`,
+      ` ${this.theme.fg("success", "●")} ${this.theme.bold("Draft review")} ${this.theme.fg("accent", name)} ${this.theme.fg("dim", state)}`,
       width,
       "",
     );
+    const approvalHint = this.approvable
+      ? `${this.theme.fg("accent", "a")} approve · `
+      : "";
     const footer = truncateToWidth(
-      ` ${this.theme.fg("dim", "h/l focus · j/k scroll · ctrl-u/d page ·")} ${this.theme.fg("accent", "a")} approve · ${this.theme.fg("accent", "esc")} close`,
+      ` ${this.theme.fg("dim", "h/l focus · j/k scroll · ctrl-u/d page ·")} ${approvalHint}${this.theme.fg("accent", "esc")} close`,
       width,
       "",
     );
@@ -354,6 +363,7 @@ export async function showWorkflowDraftReview(
   ctx: ExtensionCommandContext,
   draft: WorkflowDraft,
   artifactPath: string,
+  approvable = true,
 ): Promise<void> {
   if (ctx.mode !== "tui") {
     const review = workflowDraftReviewText(draft, artifactPath);
@@ -373,13 +383,14 @@ export async function showWorkflowDraftReview(
         draft,
         artifactPath,
         done,
+        approvable,
       ),
     {
       overlay: true,
       overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%" },
     },
   );
-  if (action !== "approve") return;
+  if (!approvable || action !== "approve") return;
   ctx.ui.setEditorText(`Approve workflow draft ${draft.draftId}.`);
   ctx.ui.notify(
     "Approval loaded in the editor. Submit it to start the immutable draft.",

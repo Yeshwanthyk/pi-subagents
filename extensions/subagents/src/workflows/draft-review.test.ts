@@ -59,7 +59,7 @@ const keybindings = {
     data === "escape" && action === "tui.select.cancel",
 } as unknown as KeybindingsManager;
 
-function createReview(done: (action: string) => void) {
+function createReview(done: (action: string) => void, approvable = true) {
   const tui = {
     terminal: { rows: 24 },
     requestRender() {},
@@ -71,6 +71,7 @@ function createReview(done: (action: string) => void) {
     draft,
     "/tmp/draft.json",
     done,
+    approvable,
   );
 }
 
@@ -109,4 +110,13 @@ test("draft inspector exposes explicit approve and close actions", () => {
   review.handleInput("a");
   review.handleInput("escape");
   assert.deepEqual(actions, ["approve", "close"]);
+});
+
+test("saved draft copies remain inspectable but cannot prefill approval", () => {
+  const actions: string[] = [];
+  const review = createReview((action) => actions.push(action), false);
+  assert.ok(review.render(100).some((line) => line.includes("review only")));
+  review.handleInput("a");
+  review.handleInput("escape");
+  assert.deepEqual(actions, ["close"]);
 });
