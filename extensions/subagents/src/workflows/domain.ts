@@ -1,4 +1,10 @@
-import type { BackendName, ReasoningEffort } from "../domain.ts";
+import type {
+  BackendName,
+  ReasoningEffort,
+  SubagentFailureKind,
+} from "../domain.ts";
+
+export type WorkflowRecoveryKind = "orphaned" | "interrupted";
 
 export const WORKFLOW_TASK_KINDS = [
   "scout",
@@ -8,10 +14,11 @@ export const WORKFLOW_TASK_KINDS = [
   "repair",
 ] as const;
 export type WorkflowTaskKind = (typeof WORKFLOW_TASK_KINDS)[number];
+export type WorkflowRetryKind = SubagentFailureKind;
 
 export interface WorkflowTaskRetry {
   readonly maxAttempts: number;
-  readonly on: ReadonlyArray<"provider_stall" | "backend_failure">;
+  readonly on: ReadonlyArray<WorkflowRetryKind>;
 }
 
 interface WorkflowTaskBase {
@@ -44,7 +51,12 @@ export interface ValidatedWorkflowDefinition {
 }
 
 export type WorkflowStatus =
-  "pending_approval" | "running" | "completed" | "failed" | "cancelled";
+  | "pending_approval"
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 export type WorkflowTerminalStatus = Extract<
   WorkflowStatus,
@@ -66,19 +78,50 @@ export type WorkflowTaskTerminalStatus = Extract<
   WorkflowTaskStatus,
   "completed" | "failed" | "cancelled" | "skipped"
 >;
+export type WorkflowTaskAttemptStatus =
+  "ready" | "queued" | "running" | "completed" | "failed" | "cancelled";
+
+export type WorkflowTaskAttemptOutcome =
+  | { readonly _tag: "Completed"; readonly resultPreview?: string }
+  | {
+      readonly _tag: "Failed";
+      readonly error: string;
+      readonly failureKind?: WorkflowRetryKind;
+    }
+  | { readonly _tag: "Cancelled"; readonly reason: string };
+
+export interface WorkflowTaskAttempt {
+  readonly id: string;
+  readonly number: number;
+  readonly status: WorkflowTaskAttemptStatus;
+  readonly childId?: string;
+  readonly queuedAt?: number;
+  readonly startedAt?: number;
+  readonly finishedAt?: number;
+  readonly outcome?: WorkflowTaskAttemptOutcome;
+}
 
 export type WorkflowOutcome =
   | { readonly _tag: "Completed"; readonly summary?: string }
-  | { readonly _tag: "Failed"; readonly error: string }
+  | {
+      readonly _tag: "Failed";
+      readonly error: string;
+      readonly recovery?: WorkflowRecoveryKind;
+    }
   | { readonly _tag: "Cancelled"; readonly reason: string };
 
 export type WorkflowTaskOutcome =
   | { readonly _tag: "Completed"; readonly resultPreview?: string }
-  | { readonly _tag: "Failed"; readonly error: string }
+  | {
+      readonly _tag: "Failed";
+      readonly error: string;
+      readonly failureKind?: WorkflowRetryKind;
+    }
   | { readonly _tag: "Cancelled"; readonly reason: string }
   | {
       readonly _tag: "Skipped";
-      readonly failedDependencyId: string;
+      readonly failedDependencyId?: string;
+      readonly skippedByTaskId?: string;
       readonly reason: string;
     };
 
@@ -91,6 +134,12 @@ export interface WorkflowLogEntry {
 export interface WorkflowTaskReadModel {
   readonly definition: WorkflowTaskDefinition;
   readonly status: WorkflowTaskStatus;
+  /** Current attempt identity; absent before the first admission. */
+  readonly attemptId?: string;
+  /** Zero before the first admission, then the current attempt number. */
+  readonly attemptNumber: number;
+  /** Bounded by the workflow journal and ordered oldest to newest. */
+  readonly attempts: ReadonlyArray<WorkflowTaskAttempt>;
   readonly declaredAt: number;
   readonly lastActivityAt: number;
   readonly queuedAt?: number;
@@ -110,6 +159,8 @@ export interface WorkflowReadModel {
   readonly lastActivityAt: number;
   readonly startedAt?: number;
   readonly finishedAt?: number;
+  readonly pausedAt?: number;
+  readonly resumedAt?: number;
   readonly outcome?: WorkflowOutcome;
   readonly tasks: Readonly<Record<string, WorkflowTaskReadModel>>;
   readonly logs: ReadonlyArray<WorkflowLogEntry>;

@@ -24,7 +24,7 @@ export const WORKFLOW_TOOL_DESCRIPTION = [
   "Do not use concurrency, agent(), parallel(), or pipeline(); do not add imports, callbacks, identifiers, spreads, computed keys, templates, getters, filesystem/network/process/timer access, or imperative scheduling. The only source call is the outer flow(...).",
   "After showing the preview and exact immutable artifact to the user, wait for a newer explicit user response. Approval accepts only the exact draftId. It fails closed unless persisted and process-memory metadata agree and the session and project are unchanged.",
   "Saved definitions are discovered with project precedence and snapshotted at preparation. Later edits to the saved file never alter the reviewed draft.",
-  "Approval registers the immutable graph, returns its run ID immediately, and starts detached background scheduling; child results stay in the workflow owner and are not delivered to the parent/client channels.",
+  "Approval registers the immutable graph, returns its run ID immediately, and starts detached background scheduling; child results stay in the workflow owner and are not delivered to the parent/client channels. Use workflow_check for read-only inspection and workflow_control for run/task authority controls.",
 ].join("\n");
 
 export const WORKFLOW_CHECK_TOOL_DESCRIPTION =
@@ -33,8 +33,22 @@ export const WORKFLOW_CHECK_TOOL_DESCRIPTION =
 export const WORKFLOW_LIST_TOOL_DESCRIPTION =
   "List tracked workflow runs with bounded status and task counts; use workflow_check for one run's task rows and authoritative child activity.";
 
+export const WORKFLOW_CONTROL_TOOL_DESCRIPTION = [
+  "Control an approved workflow by its run ID: pause/resume scheduling, explicitly retry or skip a task and its descendants, or cancel the run.",
+  "Controls append journal events and are idempotent at terminal/current states. Pause prevents new admissions while already-running children continue; retry creates a fresh bounded attempt identity; skip is deterministic; automatic retry is limited to configured provider_stall or backend_failure classifications.",
+  "Do not target child IDs here. Workflow-child takeover remains read-only; use workflow_check and the existing child transcript view for observation.",
+].join("\n");
+
 export const WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS = {
   runId: "Exact workflow run ID returned after approval",
+} as const;
+
+export const WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS = {
+  action:
+    "One workflow authority action: pause, resume, retry, skip, or cancel",
+  runId: "Exact approved workflow run ID",
+  taskId: "Exact workflow task ID; required for retry and skip",
+  reason: "Optional bounded operator reason recorded in the workflow journal",
 } as const;
 
 export const WORKFLOW_PROMPT_SNIPPET =

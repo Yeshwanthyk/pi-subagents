@@ -1,3 +1,4 @@
+import type { WorkflowControls } from "./controls.ts";
 import * as path from "node:path";
 import type {
   ValidatedWorkflowDefinition,
@@ -24,6 +25,41 @@ import {
   savedWorkflowProvenance,
   type SavedWorkflow,
 } from "./saved-workflows.ts";
+
+export type WorkflowControlRequest =
+  | {
+      readonly action: "pause" | "resume" | "cancel";
+      readonly runId: string;
+      readonly reason?: string;
+    }
+  | {
+      readonly action: "retry" | "skip";
+      readonly runId: string;
+      readonly taskId: string;
+      readonly reason?: string;
+    };
+
+export function applyWorkflowControl(
+  controls: WorkflowControls,
+  request: WorkflowControlRequest,
+): Promise<WorkflowReadModel> {
+  switch (request.action) {
+    case "pause":
+      return Promise.resolve(controls.pause(request.runId, request.reason));
+    case "resume":
+      return Promise.resolve(controls.resume(request.runId));
+    case "retry":
+      return Promise.resolve(
+        controls.retryTask(request.runId, request.taskId, request.reason),
+      );
+    case "skip":
+      return Promise.resolve(
+        controls.skipTask(request.runId, request.taskId, request.reason),
+      );
+    case "cancel":
+      return controls.cancelRun(request.runId, request.reason);
+  }
+}
 
 export interface WorkflowPreparationContext {
   readonly sessionId: string;
@@ -170,7 +206,9 @@ export class WorkflowToolLifecycle {
     assertWorkflowDraftArtifactMatches(authoritative, artifact);
     assertWorkflowDraftApproved(authoritative, context);
 
-    const created = this.options.manager.createRun(authoritative.definition);
+    const created = this.options.manager.createRun(authoritative.definition, {
+      cwd: context.cwd,
+    });
     const run = this.options.manager.start(
       created.id,
       execution ?? this.options.execution,

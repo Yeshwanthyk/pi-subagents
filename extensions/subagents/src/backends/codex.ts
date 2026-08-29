@@ -24,10 +24,16 @@ import type {
   RunOutcome,
   SpawnTask,
   SubagentEvent,
+  SubagentFailureProvenance,
   SubagentMeta,
   TranscriptPart,
 } from "../domain.ts";
-import { isReasoningEffort, SendError, SpawnError } from "../domain.ts";
+import {
+  failureKindFromProvenance,
+  isReasoningEffort,
+  SendError,
+  SpawnError,
+} from "../domain.ts";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const MODEL_LIST_TIMEOUT_MS = 5_000;
@@ -67,6 +73,16 @@ const ARRAY_CHECK = Compile(Type.Array(Type.Any()));
 const OBJECT_CHECK = Compile(Type.Record(Type.String(), Type.Any()));
 /** A JSON-RPC id: JSON-RPC 2.0 allows only string or number ids. */
 const JSON_RPC_ID_CHECK = Compile(Type.Union([Type.String(), Type.Number()]));
+
+class CodexRequestError extends Error {
+  readonly provenance: SubagentFailureProvenance;
+
+  constructor(message: string, provenance: SubagentFailureProvenance) {
+    super(message);
+    this.name = "CodexRequestError";
+    this.provenance = provenance;
+  }
+}
 
 interface PendingRequest {
   readonly resolve: (result: JsonObject) => void;
@@ -206,6 +222,18 @@ function firstLine(value: JsonValue | undefined): string | undefined {
 function boundedError(error: Error | JsonValue): string {
   const text = error instanceof Error ? error.message : String(error);
   return text.slice(0, 4096);
+}
+
+function failure(
+  provenance: SubagentFailureProvenance,
+  errorText: string,
+): Extract<RunOutcome, { readonly _tag: "Failed" }> {
+  return {
+    _tag: "Failed",
+    errorText,
+    failureKind: failureKindFromProvenance(provenance),
+    failureProvenance: provenance,
+  };
 }
 
 function protocolError(value: JsonValue): string {
@@ -556,19 +584,34 @@ const makeCodexSession = (
     ) =>
       new Promise<JsonObject>((resolve, reject) => {
         if (state.closed) {
-          reject(new Error("Codex app-server is closed."));
+          reject(
+            new CodexRequestError("Codex app-server is closed.", {
+              _tag: "process",
+            }),
+          );
           return;
         }
         const id = ++state.nextRequestId;
         const timer = setTimeout(() => {
           pendingRequests.delete(id);
-          reject(new Error(`Codex app-server request ${method} timed out.`));
+          reject(
+            new CodexRequestError(
+              `Codex app-server request ${method} timed out.`,
+              method === "turn/start"
+                ? { _tag: "turn_deadline" }
+                : { _tag: "protocol" },
+            ),
+          );
         }, timeoutMs);
         pendingRequests.set(id, { resolve, reject, timer });
         if (!writeMessage({ id, method, params })) {
           clearTimeout(timer);
           pendingRequests.delete(id);
-          reject(new Error("Codex app-server stdin is closed."));
+          reject(
+            new CodexRequestError("Codex app-server stdin is closed.", {
+              _tag: "process",
+            }),
+          );
         }
       });
 
@@ -626,11 +669,14 @@ const makeCodexSession = (
         INTERRUPT_FALLBACK_MS,
       ).catch((error) => {
         if (state.activeRun && serial === state.runSerial) {
+          const message = boundedError(
+            error instanceof Error ? error : String(error),
+          );
           emit({
             _tag: "BackendError",
-            message: boundedError(
-              error instanceof Error ? error : String(error),
-            ),
+            message,
+            failureKind: failureKindFromProvenance({ _tag: "protocol" }),
+            failureProvenance: { _tag: "protocol" },
           });
         }
       });
@@ -683,6 +729,10 @@ const makeCodexSession = (
           const errorText = boundedError(
             error instanceof Error ? error : String(error),
           );
+          const provenance =
+            error instanceof CodexRequestError
+              ? error.provenance
+              : ({ _tag: "unknown" } as const);
           settleRun(
             state.interruptRequested
               ? {
@@ -690,17 +740,14 @@ const makeCodexSession = (
                   partialText: state.finalText || undefined,
                 }
               : {
-                  _tag: "Failed",
-                  errorText,
+                  ...failure(provenance, errorText),
                   partialText: state.finalText || undefined,
                 },
             serial,
           );
-          // A timed-out turn/start means a turn may be running that we can
-          // never see or interrupt (no turn id). That session cannot be
-          // trusted with further work — kill it; the exit handler reports
-          // the death. Explicit protocol rejections keep the session alive.
-          if (errorText.includes("timed out")) {
+          // A turn deadline can leave an unknown native turn running, so this
+          // session cannot be trusted with further work.
+          if (provenance._tag === "turn_deadline") {
             void terminateChild(child, () => state.exited);
           }
         },
@@ -914,7 +961,12 @@ const makeCodexSession = (
             stringValue(error?.message) ?? "Codex run failed",
           );
           if (params.willRetry !== true) state.runError = messageText;
-          emit({ _tag: "BackendError", message: messageText });
+          emit({
+            _tag: "BackendError",
+            message: messageText,
+            failureKind: failureKindFromProvenance({ _tag: "unknown" }),
+            failureProvenance: { _tag: "unknown" },
+          });
           break;
         }
         case "turn/completed": {
@@ -926,13 +978,13 @@ const makeCodexSession = (
           if (state.interruptRequested || status === "interrupted") {
             settleRun({ _tag: "Interrupted", partialText });
           } else if (status === "failed") {
+            const errorText = boundedError(
+              state.runError ??
+                stringValue(error?.message) ??
+                "Codex run failed",
+            );
             settleRun({
-              _tag: "Failed",
-              errorText: boundedError(
-                state.runError ??
-                  stringValue(error?.message) ??
-                  "Codex run failed",
-              ),
+              ...failure({ _tag: "unknown" }, errorText),
               partialText,
             });
           } else {
@@ -973,6 +1025,7 @@ const makeCodexSession = (
         emit({
           _tag: "BackendError",
           message: `Invalid Codex protocol line: ${line.slice(0, 512)}`,
+          failureKind: "backend_failure",
         });
         return;
       }
@@ -1007,6 +1060,8 @@ const makeCodexSession = (
           _tag: "Failed",
           errorText: boundedError(detail),
           partialText: state.finalText || state.lastAssistantText || undefined,
+          failureKind: failureKindFromProvenance({ _tag: "process" }),
+          failureProvenance: { _tag: "process" },
         });
       }
       Queue.endUnsafe(events);

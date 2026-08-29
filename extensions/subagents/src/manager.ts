@@ -39,8 +39,10 @@ import type {
   TranscriptItem,
   ParentRef,
   WorkflowOwnership,
+  SubagentFailureKind,
 } from "./domain.ts";
 import {
+  failureKindFromProvenance,
   BackendUnavailableError,
   SendError,
   SpawnError,
@@ -78,6 +80,7 @@ interface MutableSnapshot {
   settledAt?: number;
   lastActivityAt: number;
   errorText?: string;
+  failureKind?: SubagentFailureKind;
   outcome?: RunOutcome;
   meta: SubagentMeta;
   usage: { tokens?: number; contextWindow?: number };
@@ -442,6 +445,12 @@ const makeManager = Effect.gen(function* () {
     s.settledAt = Date.now();
     s.lastActivityAt = s.settledAt;
     s.outcome = outcome;
+    s.failureKind =
+      outcome._tag === "Failed"
+        ? (outcome.failureKind ??
+          failureKindFromProvenance(outcome.failureProvenance) ??
+          s.failureKind)
+        : undefined;
     switch (outcome._tag) {
       case "Completed":
         s.status = "done";
@@ -501,6 +510,7 @@ const makeManager = Effect.gen(function* () {
         s.startedAt ??= observedAt;
         s.settledAt = undefined;
         s.errorText = undefined;
+        s.failureKind = undefined;
         s.outcome = undefined;
         break;
       case "RunSettled":
@@ -577,6 +587,9 @@ const makeManager = Effect.gen(function* () {
         break;
       case "BackendError":
         s.errorText = bounded(event.message);
+        s.failureKind =
+          event.failureKind ??
+          failureKindFromProvenance(event.failureProvenance);
         break;
     }
     notify(s.id);
@@ -636,6 +649,7 @@ const makeManager = Effect.gen(function* () {
                   settle(entry, {
                     _tag: "Failed",
                     errorText: "Backend event stream ended unexpectedly",
+                    failureKind: "backend_failure",
                   });
                 }
               }),
@@ -654,6 +668,8 @@ const makeManager = Effect.gen(function* () {
         settle(entry, {
           _tag: "Failed",
           errorText: admissionErrorText(result.failure),
+          failureKind: "backend_failure",
+          failureProvenance: { _tag: "spawn" },
         });
       }
     });
@@ -1030,7 +1046,11 @@ const makeManager = Effect.gen(function* () {
   const sameWorkflow = (
     actual: WorkflowOwnership | undefined,
     expected: WorkflowOwnership,
-  ) => actual?.runId === expected.runId && actual.taskId === expected.taskId;
+  ) =>
+    actual?.runId === expected.runId &&
+    actual.taskId === expected.taskId &&
+    (expected.attemptId === undefined ||
+      actual.attemptId === expected.attemptId);
 
   const handleFor = (id: string, expected?: WorkflowOwnership) =>
     Effect.suspend(() => {

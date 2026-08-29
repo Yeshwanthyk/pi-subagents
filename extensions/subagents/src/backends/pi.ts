@@ -35,12 +35,19 @@ import { Effect, Queue, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
 import type {
   ReasoningEffort,
+  RunOutcome,
   SpawnTask,
   SubagentEvent,
+  SubagentFailureProvenance,
   SubagentMeta,
   TranscriptPart,
 } from "../domain.ts";
-import { isReasoningEffort, SendError, SpawnError } from "../domain.ts";
+import {
+  failureKindFromProvenance,
+  isReasoningEffort,
+  SendError,
+  SpawnError,
+} from "../domain.ts";
 
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 const CHILD_TOOL_CALL_TIMEOUT_MS = 3 * 60 * 1_000;
@@ -53,6 +60,7 @@ const CHILD_EXCLUDED_TOOL_NAMES = [
   "subagent_check",
   "subagent_list",
   "workflow",
+  "workflow_control",
   "ask_user",
 ] as const;
 
@@ -337,6 +345,18 @@ function boundedError(error: Error | string) {
   return text.slice(0, 4096);
 }
 
+function failure(
+  provenance: SubagentFailureProvenance,
+  errorText: string,
+): Extract<RunOutcome, { readonly _tag: "Failed" }> {
+  return {
+    _tag: "Failed",
+    errorText,
+    failureKind: failureKindFromProvenance(provenance),
+    failureProvenance: provenance,
+  };
+}
+
 const makePiSession = (
   task: SpawnTask,
 ): Effect.Effect<SubagentSession, SpawnError, Scope.Scope> =>
@@ -465,8 +485,7 @@ const makePiSession = (
         emit({
           _tag: "RunSettled",
           outcome: {
-            _tag: "Failed",
-            errorText: boundedError(errorText),
+            ...failure({ _tag: "unknown" }, boundedError(errorText)),
             partialText,
           },
         });

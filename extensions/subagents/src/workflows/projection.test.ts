@@ -111,7 +111,21 @@ const statusDefinition: ValidatedWorkflowDefinition = {
 
 function event(at: number, value: WorkflowEventInput): WorkflowEvent {
   // SAFETY: WorkflowEventInput distributes every event variant and this restores its two shared fields.
-  return { ...value, runId: "wf-1", at } as WorkflowEvent;
+  const lifecycle =
+    value._tag === "TaskQueued" ||
+    value._tag === "TaskStarted" ||
+    value._tag === "TaskCompleted" ||
+    value._tag === "TaskFailed" ||
+    value._tag === "TaskCancelled" ||
+    value._tag === "TaskSkipped";
+  // SAFETY: The helper restores the shared fields for a typed fixture.
+  let result = { ...value, runId: "wf-1", at } as WorkflowEvent;
+  if (lifecycle && (!("attemptId" in value) || value.attemptId === undefined)) {
+    // SAFETY: This branch is restricted to lifecycle variants that carry an
+    // optional attemptId, and supplies the fixture's first-attempt identity.
+    result = { ...result, attemptId: "attempt-1" } as WorkflowEvent;
+  }
+  return result;
 }
 
 function runningRun() {

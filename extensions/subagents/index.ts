@@ -96,17 +96,23 @@ import {
   WorkflowManager,
   type WorkflowExecutionOptions,
 } from "./src/workflows/manager.ts";
+import { WorkflowArtifactStore } from "./src/workflows/artifacts.ts";
 import {
   isWorkflowTerminal,
   type WorkflowReadModel,
 } from "./src/workflows/domain.ts";
 import {
+  applyWorkflowControl,
   staticWorkflowDefinitionPreparer,
   WorkflowToolLifecycle,
+  type WorkflowControlRequest,
 } from "./src/workflows/tools.ts";
+import { WorkflowControls } from "./src/workflows/controls.ts";
 import {
-  WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS,
   WORKFLOW_CHECK_TOOL_DESCRIPTION,
+  WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS,
+  WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS,
+  WORKFLOW_CONTROL_TOOL_DESCRIPTION,
   WORKFLOW_LIST_TOOL_DESCRIPTION,
   WORKFLOW_PARAMETER_DESCRIPTIONS,
   WORKFLOW_PROMPT_GUIDELINES,
@@ -117,8 +123,12 @@ import { openSubagentPicker } from "./src/ui/takeover.ts";
 import {
   formatWorkflowList,
   formatWorkflowProjection,
+  formatWorkflowRecoveryFailures,
+  formatWorkflowRecoveryOmissions,
   projectWorkflowList,
   projectWorkflowRun,
+  projectWorkflowRecoveryFailures,
+  projectWorkflowRecoveryOmissions,
   workflowActiveWorkItem,
   workflowActiveWorkRemoval,
   workflowResultEnvelope,
@@ -211,6 +221,41 @@ const WORKFLOW_TOOL_PARAMS = Type.Union([
   }),
 ]);
 type WorkflowToolParams = Static<typeof WORKFLOW_TOOL_PARAMS>;
+const WORKFLOW_CONTROL_TOOL_PARAMS = Type.Union([
+  Type.Object({
+    action: Type.Union(
+      [Type.Literal("pause"), Type.Literal("resume"), Type.Literal("cancel")],
+      {
+        description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.action,
+      },
+    ),
+    runId: Type.String({
+      description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.runId,
+    }),
+    reason: Type.Optional(
+      Type.String({
+        description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.reason,
+      }),
+    ),
+  }),
+  Type.Object({
+    action: Type.Union([Type.Literal("retry"), Type.Literal("skip")], {
+      description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.action,
+    }),
+    runId: Type.String({
+      description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.runId,
+    }),
+    taskId: Type.String({
+      description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.taskId,
+    }),
+    reason: Type.Optional(
+      Type.String({
+        description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.reason,
+      }),
+    ),
+  }),
+]);
+type WorkflowControlToolParams = Static<typeof WORKFLOW_CONTROL_TOOL_PARAMS>;
 
 export interface HeadlessSubagentsUI {
   select(title: string, options: string[]): Promise<string | undefined>;
@@ -421,7 +466,13 @@ function resolveChildProjectTrust(options: {
 
 export default function (pi: ExtensionAPI) {
   let runtime: SubagentRuntime | undefined;
-  let managerPromise: Promise<SubagentManagerApi> | undefined;
+  let managerInitialization:
+    | {
+        readonly epoch: number;
+        readonly cwd: string;
+        readonly promise: Promise<SubagentManagerApi>;
+      }
+    | undefined;
   let sessionContext: ExtensionContext | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
@@ -436,6 +487,7 @@ export default function (pi: ExtensionAPI) {
   let sessionClosed = false;
   let userInputRevision = 0;
   let workflowManager: WorkflowManager | undefined;
+  let workflowControls: WorkflowControls | undefined;
   let workflowLifecycle: WorkflowToolLifecycle | undefined;
   const workflowParentRefs = new Map<string, ParentRef>();
   let publishWorkflowResult:
@@ -443,27 +495,57 @@ export default function (pi: ExtensionAPI) {
 
   const getRuntime = () => (runtime ??= createSubagentRuntime());
 
-  /** Resolve the manager service once per runtime and wire the extension hooks. */
+  /** Resolve one manager per session epoch; stale completions cannot install hooks. */
   const getManager = () => {
-    managerPromise ??= getRuntime()
+    const epoch = sessionEpoch;
+    const cwd = sessionContext?.cwd;
+    if (cwd === undefined || sessionClosed) {
+      return Promise.reject(
+        new Error("Subagent manager requires an active session."),
+      );
+    }
+    if (
+      managerInitialization?.epoch === epoch &&
+      managerInitialization.cwd === cwd
+    ) {
+      return managerInitialization.promise;
+    }
+    const promise = getRuntime()
       .runPromise(SubagentManager)
       .then((manager) => {
+        if (
+          sessionClosed ||
+          sessionEpoch !== epoch ||
+          sessionContext?.cwd !== cwd
+        ) {
+          throw new Error("Discarding stale subagent manager initialization.");
+        }
         manager.view.setOnSettled(onSettled);
         renderView = parentSubagentView(manager.view);
-        workflowManager = new WorkflowManager({ subagents: manager });
+        const workflowsDir = path.join(getAgentDir(), "workflows");
+        const artifactStore = new WorkflowArtifactStore({
+          workflowsDir,
+          cwd,
+        });
+        workflowManager = new WorkflowManager({
+          subagents: manager,
+          artifacts: artifactStore,
+        });
         workflowLifecycle = new WorkflowToolLifecycle({
-          workflowsDir: path.join(getAgentDir(), "workflows"),
+          workflowsDir,
           agentDir: getAgentDir(),
           manager: workflowManager,
           preparer: staticWorkflowDefinitionPreparer,
         });
+        workflowControls = new WorkflowControls(workflowManager);
         const schedule = () => scheduleObservability(manager);
         unsubStatus?.();
         unsubStatus = manager.view.subscribe(schedule);
         refreshObservability(manager);
         return manager;
       });
-    return managerPromise;
+    managerInitialization = { epoch, cwd, promise };
+    return promise;
   };
 
   const workflowExecutionFor = (
@@ -657,6 +739,14 @@ export default function (pi: ExtensionAPI) {
   const inspectWorkflow = (manager: SubagentManagerApi, runId: string) => {
     const run = workflowManager?.get(runId);
     if (!run) {
+      const failure = workflowManager?.recoveryFailures.find(
+        (item) => item.runId === runId,
+      );
+      if (failure) {
+        throw new Error(
+          `Workflow run id "${runId}" could not be recovered: ${failure.message}`,
+        );
+      }
       throw new Error(`Unknown workflow run id "${runId}".`);
     }
     const projection = projectWorkflowRun(run, manager.view.list());
@@ -701,18 +791,27 @@ export default function (pi: ExtensionAPI) {
     ui = ctx.hasUI ? ctx.ui : undefined;
     browserUI = ctx.mode === "rpc" && ctx.hasUI ? ctx.ui : undefined;
     browserRevision = 0;
-    if (browserUI) {
-      const existingManager = managerPromise;
-      if (existingManager) {
-        void existingManager
-          .then((manager) => {
-            if (browserUI) refreshObservability(manager);
-          })
-          .catch(() => undefined);
-      } else {
-        void getManager().catch(() => undefined);
-      }
-    }
+    const startEpoch = sessionEpoch;
+    void getManager()
+      .then((manager) => {
+        if (sessionClosed || sessionEpoch !== startEpoch) return;
+        if (browserUI) refreshObservability(manager);
+        const recoveryFailures = workflowManager?.recoveryFailures ?? [];
+        if (recoveryFailures.length > 0 && ui) {
+          ui.notify(
+            `Workflow recovery found ${recoveryFailures.length} artifact issue(s); workflow_list reports bounded details.`,
+            "warning",
+          );
+        }
+      })
+      .catch((error) => {
+        if (sessionClosed || sessionEpoch !== startEpoch) return;
+        const message = error instanceof Error ? error.message : String(error);
+        ui?.notify(
+          `Workflow recovery unavailable: ${message.slice(0, 256)}`,
+          "warning",
+        );
+      });
   });
 
   pi.on("agent_settled", (_event, ctx) => {
@@ -751,10 +850,11 @@ export default function (pi: ExtensionAPI) {
     const closingWorkflow = workflowManager;
     workflowManager = undefined;
     workflowLifecycle = undefined;
+    workflowControls = undefined;
     workflowParentRefs.clear();
     const closing = runtime;
     runtime = undefined;
-    managerPromise = undefined;
+    managerInitialization = undefined;
     // Seal workflow state and propagate cancellation while the shared
     // SubagentManager runtime is still alive, then dispose child scopes.
     try {
@@ -846,9 +946,23 @@ export default function (pi: ExtensionAPI) {
     async execute() {
       await getManager();
       const runs = workflowManager?.list() ?? [];
+      const recoveryFailures = workflowManager?.recoveryFailures ?? [];
+      const recoveryOmissions =
+        workflowManager?.getRecoveryReport().omissions ?? [];
+      const recoveryText =
+        recoveryFailures.length === 0 && recoveryOmissions.length === 0
+          ? ""
+          : `\n\n${recoveryFailures.length > 0 ? formatWorkflowRecoveryFailures(recoveryFailures) : ""}${recoveryOmissions.length > 0 ? `\n\n${formatWorkflowRecoveryOmissions(recoveryOmissions)}` : ""}`;
       return {
-        content: [{ type: "text", text: formatWorkflowList(runs) }],
-        details: { workflows: projectWorkflowList(runs) },
+        content: [
+          { type: "text", text: `${formatWorkflowList(runs)}${recoveryText}` },
+        ],
+        details: {
+          workflows: projectWorkflowList(runs),
+          recoveryFailures: projectWorkflowRecoveryFailures(recoveryFailures),
+          recoveryOmissions:
+            projectWorkflowRecoveryOmissions(recoveryOmissions),
+        },
       };
     },
   });
@@ -868,6 +982,43 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: inspected.text }],
         details: inspected.projection,
+      };
+    },
+  });
+  pi.registerTool({
+    name: "workflow_control",
+    label: "Control Workflow",
+    description: WORKFLOW_CONTROL_TOOL_DESCRIPTION,
+    parameters: WORKFLOW_CONTROL_TOOL_PARAMS,
+    async execute(_toolCallId, params: WorkflowControlToolParams) {
+      const manager = await getManager();
+      const controls = workflowControls;
+      if (!controls) throw new Error("Workflow controls are not initialized.");
+      // SAFETY: TypeBox validates the discriminated control union before the
+      // handler runs; this restores the corresponding domain request type.
+      const state = await applyWorkflowControl(
+        controls,
+        params as WorkflowControlRequest,
+      );
+      scheduleObservability(manager);
+      const projection = projectWorkflowRun(state, manager.view.list());
+      const taskSuffix = "taskId" in params ? ` task ${params.taskId}` : "";
+      const details = {
+        action: params.action,
+        runId: state.id,
+        taskId: "taskId" in params ? params.taskId : undefined,
+        status: state.status,
+        version: state.version,
+        projection,
+      };
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Workflow ${state.id} ${params.action}${taskSuffix} applied · [${state.status}] · v${state.version}\n${formatWorkflowProjection(projection)}`,
+          },
+        ],
+        details,
       };
     },
   });

@@ -40,6 +40,34 @@ export function isReasoningEffort(
 
 export type SubagentStatus = "queued" | "running" | "done" | "error";
 export type TerminalSubagentStatus = Extract<SubagentStatus, "done" | "error">;
+export type SubagentFailureKind = "provider_stall" | "backend_failure";
+/** Provenance is supplied by the backend boundary; it is never inferred from text. */
+export type SubagentFailureProvenance =
+  | { readonly _tag: "provider_deadline" }
+  | { readonly _tag: "turn_deadline" }
+  | {
+      readonly _tag: "process" | "protocol" | "spawn" | "tool" | "unknown";
+    };
+
+export function failureKindFromProvenance(
+  provenance: SubagentFailureProvenance | undefined,
+): SubagentFailureKind | undefined {
+  if (
+    provenance?._tag === "provider_deadline" ||
+    provenance?._tag === "turn_deadline"
+  ) {
+    return "provider_stall";
+  }
+  if (
+    provenance?._tag === "process" ||
+    provenance?._tag === "protocol" ||
+    provenance?._tag === "spawn" ||
+    provenance?._tag === "tool"
+  ) {
+    return "backend_failure";
+  }
+  return undefined;
+}
 /** Terminal output is consumed by the workflow owner and never delivered to a parent/client channel. */
 export type SubagentResultDelivery = "parent" | "client" | "workflow";
 
@@ -47,6 +75,8 @@ export type SubagentResultDelivery = "parent" | "client" | "workflow";
 export interface WorkflowOwnership {
   readonly runId: string;
   readonly taskId: string;
+  /** Attempt identity prevents a late child from mutating a retried task. */
+  readonly attemptId?: string;
 }
 
 export interface SubagentClient {
@@ -179,6 +209,8 @@ export type RunOutcome =
       readonly _tag: "Failed";
       readonly errorText: string;
       readonly partialText?: string;
+      readonly failureKind?: SubagentFailureKind;
+      readonly failureProvenance?: SubagentFailureProvenance;
     }
   | { readonly _tag: "Interrupted"; readonly partialText?: string };
 
@@ -233,7 +265,12 @@ export type SubagentEvent =
     }
   | { readonly _tag: "MetaChanged"; readonly meta: Partial<SubagentMeta> }
   /** Non-fatal diagnostics. Fatal failures arrive as a RunSettled outcome. */
-  | { readonly _tag: "BackendError"; readonly message: string };
+  | {
+      readonly _tag: "BackendError";
+      readonly message: string;
+      readonly failureProvenance?: SubagentFailureProvenance;
+      readonly failureKind?: SubagentFailureKind;
+    };
 
 // --- Snapshot ---------------------------------------------------------------
 
@@ -261,6 +298,8 @@ export interface SubagentSnapshot {
   /** Latest meaningful model, tool, queue, or lifecycle event. */
   readonly lastActivityAt: number;
   readonly errorText?: string;
+  /** Classification supplied by the backend for bounded workflow recovery. */
+  readonly failureKind?: SubagentFailureKind;
   readonly outcome?: RunOutcome;
   readonly meta: SubagentMeta;
   readonly usage: { readonly tokens?: number; readonly contextWindow?: number };

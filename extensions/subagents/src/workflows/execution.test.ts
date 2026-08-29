@@ -5,7 +5,11 @@ import * as path from "node:path";
 import test from "node:test";
 import { BackendRegistry, type SubagentBackend } from "../backend.ts";
 import { makeStubBackend } from "../backends/stub.ts";
-import type { BackendName, ParentContext } from "../domain.ts";
+import type {
+  BackendName,
+  ParentContext,
+  SubagentSnapshot,
+} from "../domain.ts";
 import { Layer, ManagedRuntime } from "effect";
 import {
   parentSubagentView,
@@ -13,7 +17,11 @@ import {
   SubagentManagerLive,
   type SubagentManagerApi,
 } from "../manager.ts";
-import { WorkflowManager, type WorkflowExecutionOptions } from "./manager.ts";
+import {
+  WorkflowManager,
+  type WorkflowChildExecutor,
+  type WorkflowExecutionOptions,
+} from "./manager.ts";
 import type {
   ValidatedWorkflowDefinition,
   WorkflowReadModel,
@@ -357,3 +365,176 @@ test("downstream children receive only explicit bounded dependency handoffs", as
     assert.doesNotMatch(child.prompt, /transcript/u);
   });
 });
+
+test("execution replays a bounded classified retry", async () => {
+  let spawnCount = 0;
+  const cancelled: string[] = [];
+  const executor: WorkflowChildExecutor = {
+    spawn: async (_backend, task) => {
+      spawnCount++;
+      const id = `child-${spawnCount}`;
+      assert.ok(task.workflow?.attemptId);
+      return executionChild(id, task.workflow!, "running");
+    },
+    awaitSettlement: async (id, expected) => {
+      assert.equal(id, `child-${id === "child-1" ? 1 : 2}`);
+      assert.ok(expected?.attemptId);
+      if (id === "child-1") {
+        return executionChild(id, expected!, "error", {
+          _tag: "Failed",
+          errorText: "provider stalled",
+          failureKind: "provider_stall",
+        });
+      }
+      return executionChild(id, expected!, "done", {
+        _tag: "Completed",
+        finalText: "completed on retry",
+      });
+    },
+    cancel: async (ids) => {
+      cancelled.push(...ids);
+      return [];
+    },
+  };
+  const workflows = new WorkflowManager({
+    createId: () => "wf-retry-execution",
+    createAttemptId: (() => {
+      let next = 0;
+      return () => `attempt-${++next}`;
+    })(),
+    execution: { executor },
+  });
+  const created = workflows.createRun({
+    tasks: [
+      {
+        id: "retry",
+        label: "Retry",
+        kind: "scout",
+        prompt: "retry",
+        readOnly: true,
+        retry: { maxAttempts: 2, on: ["provider_stall"] },
+      },
+    ],
+  });
+
+  const settled = await workflows.execute(created.id).completion;
+  assert.equal(settled.status, "completed");
+  assert.equal(spawnCount, 2);
+  assert.deepEqual(
+    settled.tasks.retry?.attempts.map((attempt) => [
+      attempt.number,
+      attempt.status,
+    ]),
+    [
+      [1, "failed"],
+      [2, "completed"],
+    ],
+  );
+  assert.deepEqual(
+    workflows.events(created.id).map((event) => event._tag),
+    [
+      "WorkflowCreated",
+      "WorkflowStarted",
+      "TaskQueued",
+      "TaskStarted",
+      "TaskFailed",
+      "TaskRetryRequested",
+      "TaskQueued",
+      "TaskStarted",
+      "TaskCompleted",
+      "WorkflowCompleted",
+    ],
+  );
+  assert.deepEqual(cancelled, []);
+  assert.deepEqual(workflows.replay(created.id), settled);
+});
+
+function executionChild(
+  id: string,
+  workflow: NonNullable<SubagentSnapshot["workflow"]>,
+  status: SubagentSnapshot["status"],
+  outcome?: SubagentSnapshot["outcome"],
+): SubagentSnapshot {
+  return {
+    id,
+    backend: "pi",
+    owner: "workflow:wf-retry-execution",
+    workflow,
+    resultDelivery: "workflow",
+    title: "retry",
+    prompt: "retry",
+    cwd: process.cwd(),
+    status,
+    createdAt: 1,
+    startedAt: 1,
+    lastActivityAt: 1,
+    outcome,
+    errorText: outcome?._tag === "Failed" ? outcome.errorText : undefined,
+    meta: { backend: "pi" },
+    usage: {},
+    transcript: [],
+    liveTools: [],
+    completedOperations: 0,
+    processTelemetry: "unavailable",
+    queued: [],
+    finalText: outcome?._tag === "Completed" ? outcome.finalText : "",
+    turns: 0,
+  };
+}
+
+test("driver failure atomically closes ready work and interrupts active children", async () => {
+  let settleChild!: (snapshot: SubagentSnapshot) => void;
+  const cancelled: string[] = [];
+  const executor: WorkflowChildExecutor = {
+    spawn: async (_backend, task) =>
+      executionChild("child-live", task.workflow!, "running"),
+    awaitSettlement: async () =>
+      new Promise<SubagentSnapshot>((resolve) => {
+        settleChild = resolve;
+      }),
+    cancel: async (ids) => {
+      cancelled.push(...ids);
+      return [];
+    },
+  };
+  const workflows = new WorkflowManager({
+    createId: () => "wf-driver-failure",
+    execution: { executor },
+  });
+  const created = workflows.createRun({
+    tasks: [task("active"), task("ready")],
+  });
+  const handle = workflows.execute(created.id);
+  await waitUntil(
+    () => workflows.get(created.id)?.tasks.active?.status === "running",
+    "active child admission",
+  );
+  const failed = workflows.fail(created.id, "driver failed");
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.tasks.active?.status, "cancelled");
+  assert.equal(failed.tasks.ready?.status, "cancelled");
+  assert.deepEqual(
+    workflows.events(created.id).map((event) => event._tag),
+    [
+      "WorkflowCreated",
+      "WorkflowStarted",
+      "TaskQueued",
+      "TaskQueued",
+      "TaskStarted",
+      "TaskStarted",
+      "WorkflowFailed",
+    ],
+  );
+  await handle.completion;
+  assert.deepEqual(cancelled, ["child-live"]);
+  settleChild(failedSnapshot("child-live"));
+});
+
+function failedSnapshot(id: string): SubagentSnapshot {
+  return executionChild(
+    id,
+    { runId: "wf-driver-failure", taskId: "active", attemptId: "attempt-1" },
+    "error",
+    { _tag: "Failed", errorText: "cancelled", failureKind: "backend_failure" },
+  );
+}

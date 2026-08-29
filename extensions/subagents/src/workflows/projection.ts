@@ -17,9 +17,15 @@ import { truncateUtf8, utf8Bytes } from "./events.ts";
 import {
   isWorkflowTerminal,
   type WorkflowReadModel,
+  type WorkflowRecoveryKind,
+  type WorkflowTaskAttempt,
   type WorkflowTaskReadModel,
   type WorkflowTaskStatus,
 } from "./domain.ts";
+import type {
+  WorkflowRecoveryFailure,
+  WorkflowRecoveryOmission,
+} from "./recovery.ts";
 
 /** Limits for the human/tool-facing workflow projection. */
 export const WORKFLOW_PROJECTION_LIMITS = {
@@ -34,16 +40,31 @@ export const WORKFLOW_PROJECTION_LIMITS = {
   maxInspectionBytes: 64 * 1024,
   maxActivityLabelBytes: 120,
   maxActivitySummaryBytes: 512,
+  maxAttempts: 64,
 } as const;
 
 export type WorkflowTaskDisplayStatus =
   "blocked" | "ready" | "queued" | "running" | "skipped" | "terminal";
+
+export interface WorkflowTaskAttemptProjection {
+  readonly id: string;
+  readonly number: number;
+  readonly status: WorkflowTaskAttempt["status"];
+  readonly childId?: string;
+  readonly startedAt?: number;
+  readonly finishedAt?: number;
+  readonly error?: string;
+  readonly failureKind?: "provider_stall" | "backend_failure";
+}
 
 export interface WorkflowTaskProjection {
   readonly id: string;
   readonly label: string;
   /** Exact lifecycle status from the authoritative workflow read model. */
   readonly status: WorkflowTaskStatus;
+  readonly attemptId?: string;
+  readonly attemptNumber: number;
+  readonly attempts: ReadonlyArray<WorkflowTaskAttemptProjection>;
   /** Compact row status; completed/failed/cancelled share `terminal`. */
   readonly displayStatus: WorkflowTaskDisplayStatus;
   readonly terminal: boolean;
@@ -80,6 +101,7 @@ export interface WorkflowProjectionCounts {
 export interface WorkflowProjectionOutcome {
   readonly status: "completed" | "failed" | "cancelled";
   readonly message?: string;
+  readonly recovery?: WorkflowRecoveryKind;
 }
 
 /**
@@ -97,6 +119,8 @@ export interface WorkflowProjection {
   readonly lastActivityAt: number;
   readonly startedAt?: number;
   readonly finishedAt?: number;
+  readonly pausedAt?: number;
+  readonly resumedAt?: number;
   readonly outcome?: WorkflowProjectionOutcome;
   readonly error?: string;
   readonly tasks: ReadonlyArray<WorkflowTaskProjection>;
@@ -143,6 +167,7 @@ function childLookup(
 function ownedChild(
   runId: string,
   taskId: string,
+  taskAttemptId: string | undefined,
   childId: string | undefined,
   lookup: (childId: string) => SubagentSnapshot | undefined,
 ): SubagentSnapshot | undefined {
@@ -150,7 +175,10 @@ function ownedChild(
   const child = lookup(childId);
   return child?.id === childId &&
     child.workflow?.runId === runId &&
-    child.workflow.taskId === taskId
+    child.workflow.taskId === taskId &&
+    (taskAttemptId === undefined ||
+      child.workflow.attemptId === undefined ||
+      child.workflow.attemptId === taskAttemptId)
     ? child
     : undefined;
 }
@@ -201,6 +229,38 @@ function taskError(
   return undefined;
 }
 
+function attemptProjection(
+  attempt: WorkflowTaskAttempt,
+): WorkflowTaskAttemptProjection {
+  const error =
+    attempt.outcome?._tag === "Failed"
+      ? safeLine(
+          attempt.outcome.error,
+          WORKFLOW_PROJECTION_LIMITS.maxErrorBytes,
+        )
+      : undefined;
+  const failureKind =
+    attempt.outcome?._tag === "Failed"
+      ? attempt.outcome.failureKind
+      : undefined;
+  return Object.freeze({
+    id: safeId(attempt.id),
+    number: nonNegativeInteger(attempt.number),
+    status: attempt.status,
+    ...(attempt.childId === undefined
+      ? {}
+      : { childId: safeId(attempt.childId) }),
+    ...(attempt.startedAt === undefined
+      ? {}
+      : { startedAt: nonNegativeInteger(attempt.startedAt) }),
+    ...(attempt.finishedAt === undefined
+      ? {}
+      : { finishedAt: nonNegativeInteger(attempt.finishedAt) }),
+    ...(error === undefined ? {} : { error }),
+    ...(failureKind === undefined ? {} : { failureKind }),
+  });
+}
+
 function currentTool(child: SubagentSnapshot | undefined): string | undefined {
   const tool = child?.liveTools[0];
   if (!tool) return undefined;
@@ -212,7 +272,13 @@ function taskProjection(
   task: WorkflowTaskReadModel,
   lookup: (childId: string) => SubagentSnapshot | undefined,
 ): WorkflowTaskProjection {
-  const child = ownedChild(run.id, task.definition.id, task.childId, lookup);
+  const child = ownedChild(
+    run.id,
+    task.definition.id,
+    task.attemptId,
+    task.childId,
+    lookup,
+  );
   const dependencies = (task.definition.needs ?? []).map(safeId);
   const owns = task.definition.readOnly
     ? []
@@ -231,6 +297,9 @@ function taskProjection(
   const effort = child?.meta.reasoningEffort ?? task.definition.effort;
   const operation = currentTool(child);
   const error = taskError(task, child);
+  const attempts = task.attempts
+    .slice(0, WORKFLOW_PROJECTION_LIMITS.maxAttempts)
+    .map(attemptProjection);
   const result: WorkflowTaskProjection = {
     id: safeId(task.definition.id),
     label: safeLine(
@@ -238,6 +307,8 @@ function taskProjection(
       WORKFLOW_PROJECTION_LIMITS.maxLabelBytes,
     ),
     status: task.status,
+    attemptNumber: nonNegativeInteger(task.attemptNumber),
+    attempts: Object.freeze(attempts),
     displayStatus: displayStatus(task.status),
     terminal:
       task.status === "completed" ||
@@ -255,6 +326,9 @@ function taskProjection(
     turns: nonNegativeInteger(child?.turns),
     ...(model === undefined ? {} : { model: safeLine(model, 256) }),
     ...(effort === undefined ? {} : { effort }),
+    ...(task.attemptId === undefined
+      ? {}
+      : { attemptId: safeId(task.attemptId) }),
     ...(task.childId === undefined ? {} : { childId: safeId(task.childId) }),
     ...(operation === undefined ? {} : { currentTool: operation }),
     ...(error === undefined ? {} : { error }),
@@ -318,6 +392,9 @@ function workflowOutcome(
       : {
           message: safeLine(message, WORKFLOW_PROJECTION_LIMITS.maxErrorBytes),
         }),
+    ...(run.outcome?._tag === "Failed" && run.outcome.recovery !== undefined
+      ? { recovery: run.outcome.recovery }
+      : {}),
   };
   return Object.freeze(result);
 }
@@ -363,6 +440,12 @@ export function projectWorkflowRun(
     ...(run.finishedAt === undefined
       ? {}
       : { finishedAt: nonNegativeInteger(run.finishedAt) }),
+    ...(run.pausedAt === undefined
+      ? {}
+      : { pausedAt: nonNegativeInteger(run.pausedAt) }),
+    ...(run.resumedAt === undefined
+      ? {}
+      : { resumedAt: nonNegativeInteger(run.resumedAt) }),
     ...(outcome === undefined ? {} : { outcome }),
     ...(outcome?.status === "failed" || outcome?.status === "cancelled"
       ? { error: outcome.message }
@@ -420,6 +503,11 @@ export function formatWorkflowProjection(
     `Tasks: ${projection.counts.terminal}/${projection.counts.total} terminal · ${projection.counts.running} running · ${projection.counts.queued} queued · ${projection.counts.ready} ready · ${projection.counts.blocked} blocked · ${projection.counts.skipped} skipped`,
   ];
   if (projection.error) lines.push(`Error: ${projection.error}`);
+  if (projection.outcome?.recovery) {
+    lines.push(
+      `Recovery: ${projection.outcome.recovery} (native child sessions were not resumed)`,
+    );
+  }
   lines.push("Task rows:");
   for (const task of projection.tasks) {
     const dependencies = task.dependencies.join(",") || "-";
@@ -465,6 +553,7 @@ function workflowChildren(
     const child = ownedChild(
       run.id,
       definition.id,
+      run.tasks[definition.id]?.attemptId,
       run.tasks[definition.id]?.childId,
       lookup,
     );
@@ -479,7 +568,8 @@ export function workflowActiveWorkItem(
   children?: WorkflowChildSource,
   now = Date.now(),
 ): ActiveWorkItem | undefined {
-  if (run.status !== "running") return undefined;
+  if (run.status !== "running" && run.status !== "paused") return undefined;
+  const paused = run.status === "paused";
   const projection = projectWorkflowRun(run, children);
   const liveChildren = workflowChildren(run, children);
   const currentTool = projection.tasks.find(
@@ -503,7 +593,11 @@ export function workflowActiveWorkItem(
     ? safeLine(currentTool, WORKFLOW_PROJECTION_LIMITS.maxOperationBytes)
     : undefined;
   const summary = safeLine(
-    operation ? `${activeText} · ${operation}` : activeText,
+    paused
+      ? `paused · ${operation ? `${activeText} · ${operation}` : activeText}`
+      : operation
+        ? `${activeText} · ${operation}`
+        : activeText,
     WORKFLOW_PROJECTION_LIMITS.maxActivitySummaryBytes,
   );
   const item: ActiveWorkItem = {
@@ -514,7 +608,8 @@ export function workflowActiveWorkItem(
       `workflow ${run.definition.name ?? run.id}`,
       WORKFLOW_PROJECTION_LIMITS.maxActivityLabelBytes,
     ),
-    status: now - lastActivityAt >= WORKFLOW_QUIET_MS ? "quiet" : "running",
+    status:
+      paused || now - lastActivityAt >= WORKFLOW_QUIET_MS ? "quiet" : "running",
     summary,
     runningProcesses: running,
     startedAt: nonNegativeInteger(run.startedAt ?? run.createdAt),
@@ -597,6 +692,7 @@ export interface WorkflowListProjection {
   readonly status: WorkflowReadModel["status"];
   readonly version: number;
   readonly lastActivityAt: number;
+  readonly recovery?: WorkflowRecoveryKind;
   readonly counts: WorkflowProjectionCounts;
 }
 
@@ -612,6 +708,7 @@ export function projectWorkflowList(
         status: projection.status,
         version: projection.version,
         lastActivityAt: projection.lastActivityAt,
+        recovery: projection.outcome?.recovery,
         counts: projection.counts,
       } satisfies WorkflowListProjection;
       return Object.freeze(item);
@@ -633,9 +730,102 @@ export function formatWorkflowList(
   const lines = ["Workflows:"];
   for (const run of projectWorkflowList(runs)) {
     const name = run.name ? ` "${run.name}"` : "";
-    const line = `- ${run.id}${name} [${run.status}] · ${run.counts.terminal}/${run.counts.total} terminal · v${run.version}`;
+    const recovery = run.recovery ? ` · recovery:${run.recovery}` : "";
+    const line = `- ${run.id}${name} [${run.status}] · ${run.counts.terminal}/${run.counts.total} terminal · v${run.version}${recovery}`;
     if (!appendBoundedLine(lines, line, maxBytes)) {
       lines.push("… [workflow rows truncated]");
+      break;
+    }
+  }
+  return truncateUtf8(lines.join("\n"), maxBytes);
+}
+
+export interface WorkflowRecoveryFailureProjection {
+  readonly runId?: string;
+  readonly path: string;
+  readonly phase: "scan" | "load" | "terminalize";
+  readonly message: string;
+}
+
+export interface WorkflowRecoveryOmissionProjection {
+  readonly runId: string;
+  readonly path: string;
+  readonly reason: "run_limit" | "byte_budget";
+}
+
+export function projectWorkflowRecoveryOmissions(
+  omissions: ReadonlyArray<WorkflowRecoveryOmission>,
+): ReadonlyArray<WorkflowRecoveryOmissionProjection> {
+  return Object.freeze(
+    omissions.slice(0, 64).map((omission) =>
+      Object.freeze({
+        runId: safeId(omission.runId),
+        path: safeLine(omission.path, WORKFLOW_PROJECTION_LIMITS.maxPathBytes),
+        reason: omission.reason,
+      }),
+    ),
+  );
+}
+
+export function projectWorkflowRecoveryFailures(
+  failures: ReadonlyArray<WorkflowRecoveryFailure>,
+): ReadonlyArray<WorkflowRecoveryFailureProjection> {
+  return Object.freeze(
+    failures.slice(0, 64).map((failure) =>
+      Object.freeze({
+        ...(failure.runId === undefined
+          ? {}
+          : { runId: safeId(failure.runId) }),
+        path: safeLine(failure.path, WORKFLOW_PROJECTION_LIMITS.maxPathBytes),
+        phase: failure.phase,
+        message: safeLine(
+          failure.message,
+          WORKFLOW_PROJECTION_LIMITS.maxErrorBytes,
+        ),
+      }),
+    ),
+  );
+}
+
+export function formatWorkflowRecoveryFailures(
+  failures: ReadonlyArray<WorkflowRecoveryFailure>,
+  options: WorkflowInspectionTextOptions = {},
+): string {
+  const maxBytes = Math.max(
+    1,
+    Math.min(
+      WORKFLOW_PROJECTION_LIMITS.maxInspectionBytes,
+      options.maxBytes ?? WORKFLOW_PROJECTION_LIMITS.maxInspectionBytes,
+    ),
+  );
+  const lines = ["Workflow recovery issues:"];
+  for (const item of projectWorkflowRecoveryFailures(failures)) {
+    const run = item.runId === undefined ? "" : ` ${item.runId}`;
+    const line = `- [${item.phase}]${run} ${item.message} (${item.path})`;
+    if (!appendBoundedLine(lines, line, maxBytes)) {
+      lines.push("… [recovery rows truncated]");
+      break;
+    }
+  }
+  return truncateUtf8(lines.join("\n"), maxBytes);
+}
+
+export function formatWorkflowRecoveryOmissions(
+  omissions: ReadonlyArray<WorkflowRecoveryOmission>,
+  options: WorkflowInspectionTextOptions = {},
+): string {
+  const maxBytes = Math.max(
+    1,
+    Math.min(
+      WORKFLOW_PROJECTION_LIMITS.maxInspectionBytes,
+      options.maxBytes ?? WORKFLOW_PROJECTION_LIMITS.maxInspectionBytes,
+    ),
+  );
+  const lines = ["Workflow recovery omissions:"];
+  for (const item of projectWorkflowRecoveryOmissions(omissions)) {
+    const line = `- [${item.reason}] ${item.runId} (${item.path})`;
+    if (!appendBoundedLine(lines, line, maxBytes)) {
+      lines.push("… [recovery rows truncated]");
       break;
     }
   }

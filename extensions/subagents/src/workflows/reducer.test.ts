@@ -52,7 +52,21 @@ type WorkflowEventInput = WorkflowEvent extends infer Event
 
 function event(at: number, value: WorkflowEventInput): WorkflowEvent {
   // SAFETY: WorkflowEventInput is the distributive union with only base fields removed.
-  return { ...value, runId: "wf-test", at } as WorkflowEvent;
+  const lifecycle =
+    value._tag === "TaskQueued" ||
+    value._tag === "TaskStarted" ||
+    value._tag === "TaskCompleted" ||
+    value._tag === "TaskFailed" ||
+    value._tag === "TaskCancelled" ||
+    value._tag === "TaskSkipped";
+  // SAFETY: The helper restores the shared fields for a typed fixture.
+  let result = { ...value, runId: "wf-test", at } as WorkflowEvent;
+  if (lifecycle && (!("attemptId" in value) || value.attemptId === undefined)) {
+    // SAFETY: This branch is restricted to lifecycle variants that carry an
+    // optional attemptId, and supplies the fixture's first-attempt identity.
+    result = { ...result, attemptId: "attempt-1" } as WorkflowEvent;
+  }
+  return result;
 }
 
 function runningEvents(): WorkflowEvent[] {
@@ -239,4 +253,284 @@ test("opaque task IDs remain own keys throughout the reducer projection", () => 
   );
   assert.deepEqual(Object.keys(state.tasks), ids);
   assert.equal(Object.getPrototypeOf(state.tasks), null);
+});
+
+test("paused workflows continue folding already-admitted children", () => {
+  const state = foldWorkflowEvents([
+    ...runningEvents(),
+    event(3, {
+      _tag: "TaskQueued",
+      taskId: "root",
+      childId: "child-1",
+      attemptId: "attempt-1",
+    }),
+    event(4, { _tag: "WorkflowPaused", reason: "hold admissions" }),
+    event(5, { _tag: "TaskStarted", taskId: "root", attemptId: "attempt-1" }),
+    event(6, {
+      _tag: "TaskCompleted",
+      taskId: "root",
+      attemptId: "attempt-1",
+    }),
+  ]);
+
+  assert.equal(state.status, "paused");
+  assert.equal(state.tasks.root?.status, "completed");
+  assert.equal(state.tasks.child?.status, "ready");
+});
+
+test("retry creates a new attempt and ignores stale terminals", () => {
+  const retryDefinition: ValidatedWorkflowDefinition = {
+    tasks: [
+      {
+        id: "root",
+        label: "Root",
+        kind: "writer",
+        prompt: "root",
+        readOnly: true,
+        retry: { maxAttempts: 2, on: ["provider_stall"] },
+      },
+    ],
+  };
+  const events: WorkflowEvent[] = [
+    event(1, { _tag: "WorkflowCreated", definition: retryDefinition }),
+    event(2, { _tag: "WorkflowStarted" }),
+    event(3, {
+      _tag: "TaskQueued",
+      taskId: "root",
+      childId: "old-child",
+      attemptId: "old-attempt",
+    }),
+    event(4, { _tag: "TaskStarted", taskId: "root", attemptId: "old-attempt" }),
+    event(5, {
+      _tag: "TaskFailed",
+      taskId: "root",
+      attemptId: "old-attempt",
+      error: "stalled",
+      failureKind: "provider_stall",
+    }),
+    event(6, {
+      _tag: "TaskRetryRequested",
+      taskId: "root",
+      previousAttemptId: "old-attempt",
+      attemptId: "new-attempt",
+      mode: "explicit",
+    }),
+  ];
+  let state = foldWorkflowEvents(events);
+  const stale = reduceWorkflowEvent(
+    state,
+    event(7, {
+      _tag: "TaskCompleted",
+      taskId: "root",
+      attemptId: "old-attempt",
+      resultPreview: "late",
+    }),
+  );
+  assert.strictEqual(stale, state);
+
+  state = reduceWorkflowEvent(
+    state,
+    event(8, {
+      _tag: "TaskQueued",
+      taskId: "root",
+      childId: "new-child",
+      attemptId: "new-attempt",
+    }),
+  );
+  state = reduceWorkflowEvent(
+    state,
+    event(9, { _tag: "TaskStarted", taskId: "root", attemptId: "new-attempt" }),
+  );
+  state = reduceWorkflowEvent(
+    state,
+    event(10, {
+      _tag: "TaskCompleted",
+      taskId: "root",
+      attemptId: "new-attempt",
+    }),
+  );
+  assert.equal(state.tasks.root?.status, "completed");
+  assert.deepEqual(
+    state.tasks.root?.attempts.map((attempt) => attempt.status),
+    ["failed", "completed"],
+  );
+});
+
+test("automatic retry requires a configured failure classification", () => {
+  const retryDefinition: ValidatedWorkflowDefinition = {
+    tasks: [
+      {
+        id: "root",
+        label: "Root",
+        kind: "scout",
+        prompt: "root",
+        readOnly: true,
+        retry: { maxAttempts: 2, on: ["provider_stall"] },
+      },
+    ],
+  };
+  const base = [
+    event(1, { _tag: "WorkflowCreated", definition: retryDefinition }),
+    event(2, { _tag: "WorkflowStarted" }),
+    event(3, { _tag: "TaskQueued", taskId: "root", childId: "child" }),
+    event(4, { _tag: "TaskStarted", taskId: "root" }),
+  ];
+  const backendFailure = foldWorkflowEvents([
+    ...base,
+    event(5, {
+      _tag: "TaskFailed",
+      taskId: "root",
+      error: "backend down",
+      failureKind: "backend_failure",
+    }),
+  ]);
+  assert.equal(backendFailure.tasks.root?.status, "failed");
+  assert.equal(backendFailure.tasks.root?.attempts.length, 1);
+
+  const providerFailure = foldWorkflowEvents([
+    ...base,
+    event(5, {
+      _tag: "TaskFailed",
+      taskId: "root",
+      error: "provider stalled",
+      failureKind: "provider_stall",
+    }),
+  ]);
+  const providerRetry = reduceWorkflowEvent(
+    providerFailure,
+    event(6, {
+      _tag: "TaskRetryRequested",
+      taskId: "root",
+      previousAttemptId: providerFailure.tasks.root?.attemptId,
+      attemptId: "retry-attempt",
+      mode: "automatic",
+      failureKind: "provider_stall",
+    }),
+  );
+  assert.equal(providerRetry.tasks.root?.status, "ready");
+
+  assert.throws(
+    () =>
+      reduceWorkflowEvent(
+        backendFailure,
+        event(6, {
+          _tag: "TaskRetryRequested",
+          taskId: "root",
+          attemptId: "retry-attempt",
+          mode: "automatic",
+          failureKind: "backend_failure",
+        }),
+      ),
+    WorkflowInvariantError,
+  );
+});
+
+test("workflow terminal events atomically terminalize every nonterminal task", () => {
+  const state = foldWorkflowEvents([
+    ...runningEvents(),
+    event(3, {
+      _tag: "TaskQueued",
+      taskId: "root",
+      childId: "child-root",
+    }),
+    event(4, { _tag: "TaskStarted", taskId: "root" }),
+  ]);
+  const cancelled = reduceWorkflowEvent(
+    state,
+    event(5, { _tag: "WorkflowCancelled", reason: "operator" }),
+  );
+  assert.equal(cancelled.status, "cancelled");
+  for (const task of Object.values(cancelled.tasks)) {
+    assert.equal(
+      ["completed", "failed", "cancelled", "skipped"].includes(task.status),
+      true,
+    );
+  }
+  assert.equal(cancelled.tasks.root?.status, "cancelled");
+  assert.equal(cancelled.tasks.child?.status, "cancelled");
+  assert.equal(cancelled.tasks.independent?.status, "cancelled");
+});
+
+test("lifecycle events after attempt one require their attempt identity", () => {
+  const retryDefinition: ValidatedWorkflowDefinition = {
+    tasks: [
+      {
+        id: "root",
+        label: "Root",
+        kind: "scout",
+        prompt: "root",
+        readOnly: true,
+        retry: { maxAttempts: 2, on: ["backend_failure"] },
+      },
+    ],
+  };
+  let state = foldWorkflowEvents([
+    event(1, { _tag: "WorkflowCreated", definition: retryDefinition }),
+    event(2, { _tag: "WorkflowStarted" }),
+    event(3, {
+      _tag: "TaskQueued",
+      taskId: "root",
+      childId: "child-1",
+      attemptId: "attempt-1",
+    }),
+    event(4, { _tag: "TaskStarted", taskId: "root", attemptId: "attempt-1" }),
+    event(5, {
+      _tag: "TaskFailed",
+      taskId: "root",
+      attemptId: "attempt-1",
+      error: "backend",
+      failureKind: "backend_failure",
+    }),
+    event(6, {
+      _tag: "TaskRetryRequested",
+      taskId: "root",
+      previousAttemptId: "attempt-1",
+      attemptId: "attempt-2",
+      mode: "explicit",
+    }),
+  ]);
+  assert.throws(
+    () =>
+      reduceWorkflowEvent(
+        state,
+        // SAFETY: This fixture is a TaskQueued event with its optional
+        // attemptId explicitly removed to exercise the lifecycle boundary.
+        {
+          ...event(7, {
+            _tag: "TaskQueued",
+            taskId: "root",
+            childId: "child-2",
+          }),
+          attemptId: undefined,
+        } as WorkflowEvent,
+      ),
+    WorkflowInvariantError,
+  );
+  assert.throws(
+    () =>
+      reduceWorkflowEvent(
+        state,
+        // SAFETY: This fixture removes the attempt identity from a task
+        // lifecycle event after the task has already retried.
+        {
+          ...event(7, {
+            _tag: "TaskSkipped",
+            taskId: "root",
+            reason: "missing identity",
+          }),
+          attemptId: undefined,
+        } as WorkflowEvent,
+      ),
+    WorkflowInvariantError,
+  );
+  state = reduceWorkflowEvent(
+    state,
+    event(7, {
+      _tag: "TaskQueued",
+      taskId: "root",
+      childId: "child-2",
+      attemptId: "attempt-2",
+    }),
+  );
+  assert.equal(state.tasks.root?.status, "queued");
 });
