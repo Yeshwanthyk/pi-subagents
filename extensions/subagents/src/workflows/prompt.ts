@@ -27,6 +27,16 @@ export const WORKFLOW_TOOL_DESCRIPTION = [
   "Approval registers the immutable graph, returns its run ID immediately, and starts detached background scheduling; child results stay in the workflow owner and are not delivered to the parent/client channels.",
 ].join("\n");
 
+export const WORKFLOW_CHECK_TOOL_DESCRIPTION =
+  "Inspect one tracked workflow run by ID without blocking. Shows bounded task rows joined to authoritative child activity; opening a child continues through the existing /subagents transcript view.";
+
+export const WORKFLOW_LIST_TOOL_DESCRIPTION =
+  "List tracked workflow runs with bounded status and task counts; use workflow_check for one run's task rows and authoritative child activity.";
+
+export const WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS = {
+  runId: "Exact workflow run ID returned after approval",
+} as const;
+
 export const WORKFLOW_PROMPT_SNIPPET =
   "Prepare an immutable flow({ tasks: [...] }) graph draft, then approve only its exact draft ID after user review; let dependencies and scopes derive parallelism";
 

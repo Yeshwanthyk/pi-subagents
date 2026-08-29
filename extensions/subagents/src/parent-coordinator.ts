@@ -4,10 +4,12 @@ import {
   parentResultEnvelope,
   type ParentMailbox,
   type ParentResultEnvelope,
+  type WorkflowResultEnvelope,
 } from "./parent-mailbox.ts";
 import {
   captureParentRef,
   isSafeParentRef,
+  parentRefKey,
   type ParentSessionContext,
   type ParentSessionManager,
 } from "./parent-ref.ts";
@@ -34,7 +36,10 @@ export interface ParentResultCoordinator {
   startSession(context: ParentFlushContext, epoch: number): void;
   capture(epoch: number, sessionManager: ParentSessionManager): ParentRef;
   onSettled(snapshot: SubagentSnapshot, consumed: boolean): void;
+  /** Enqueue one aggregate workflow terminal result on the same parent rail. */
+  onWorkflowSettled(envelope: WorkflowResultEnvelope, consumed: boolean): void;
   consume(owners: Iterable<ParentResultOwner>): void;
+  consumeWorkflow(runId: string, parentRef: ParentRef): void;
   flush(context: ParentFlushContext): boolean;
   close(): void;
 }
@@ -50,9 +55,13 @@ export function createParentResultCoordinator(
   const mailbox = options.mailbox ?? createParentMailbox();
   let current: CurrentParent | undefined;
   let closed = false;
+  const deliveredWorkflowResults = new Set<string>();
+  const workflowResultKey = (id: string, parentRef: ParentRef) =>
+    `${parentRefKey(parentRef)}\u0000${id}`;
 
   const startSession = (context: ParentFlushContext, epoch: number) => {
     mailbox.clear();
+    deliveredWorkflowResults.clear();
     current = { epoch, sessionManager: context.sessionManager };
     closed = false;
   };
@@ -73,6 +82,20 @@ export function createParentResultCoordinator(
     mailbox.enqueue(envelope);
   };
 
+  const onWorkflowSettled = (
+    envelope: WorkflowResultEnvelope,
+    consumed: boolean,
+  ) => {
+    if (closed) return;
+    const key = workflowResultKey(envelope.id, envelope.parentRef);
+    if (deliveredWorkflowResults.has(key)) return;
+    if (consumed) {
+      mailbox.consume([envelope.id], envelope.parentRef);
+      deliveredWorkflowResults.add(key);
+      return;
+    }
+    mailbox.enqueue(envelope);
+  };
   const consume = (owners: Iterable<ParentResultOwner>) => {
     if (closed) return;
     for (const owner of owners) {
@@ -84,6 +107,12 @@ export function createParentResultCoordinator(
         continue;
       mailbox.consume([owner.id], owner.parentRef);
     }
+  };
+
+  const consumeWorkflow = (runId: string, parentRef: ParentRef) => {
+    if (closed) return;
+    mailbox.consume([runId], parentRef);
+    deliveredWorkflowResults.add(workflowResultKey(runId, parentRef));
   };
 
   const flush = (context: ParentFlushContext): boolean => {
@@ -106,6 +135,13 @@ export function createParentResultCoordinator(
       // Keep the batch in the mailbox so a later idle/settled hook can retry.
       return false;
     }
+    for (const envelope of batch) {
+      if (envelope.kind === "workflow") {
+        deliveredWorkflowResults.add(
+          workflowResultKey(envelope.id, envelope.parentRef),
+        );
+      }
+    }
     mailbox.remove(batch);
     return true;
   };
@@ -113,6 +149,7 @@ export function createParentResultCoordinator(
   const close = () => {
     closed = true;
     current = undefined;
+    deliveredWorkflowResults.clear();
     mailbox.clear();
   };
 
@@ -121,7 +158,9 @@ export function createParentResultCoordinator(
     startSession,
     capture: captureParentRef,
     onSettled,
+    onWorkflowSettled,
     consume,
+    consumeWorkflow,
     flush,
     close,
   };

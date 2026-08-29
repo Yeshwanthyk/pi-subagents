@@ -12,4 +12,6 @@ export {
   type ParentMailbox,
   type ParentMailboxLimits,
   type ParentResultEnvelope,
+  type WorkflowResultEnvelope,
+  type ParentResultKind,
 } from "./parent-mailbox.ts";

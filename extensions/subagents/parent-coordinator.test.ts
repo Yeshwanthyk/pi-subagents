@@ -250,3 +250,53 @@ test("in-memory root captures reject descendant and sibling delivery", () => {
   assert.equal(coordinator.flush(context), true);
   assert.equal(sends, 1);
 });
+
+test("workflow aggregate delivery is idle-gated and not duplicated", () => {
+  const seam = sessionManager();
+  let idle = false;
+  const context = { sessionManager: seam.manager, isIdle: () => idle };
+  const sent: string[] = [];
+  const coordinator = createParentResultCoordinator({
+    sendBatch: (batch) => sent.push(...batch.map((result) => result.id)),
+  });
+  coordinator.startSession(context, 4);
+  const result = {
+    kind: "workflow" as const,
+    id: "wf-1",
+    title: "workflow visible",
+    status: "done" as const,
+    output: "Workflow wf-1 completed.",
+    parentRef: ref(),
+  };
+  coordinator.onWorkflowSettled(result, false);
+  assert.equal(coordinator.flush(context), false);
+  assert.deepEqual(sent, []);
+  idle = true;
+  assert.equal(coordinator.flush(context), true);
+  assert.equal(coordinator.flush(context), false);
+  assert.deepEqual(sent, ["wf-1"]);
+});
+
+test("workflow inspection consumption removes a queued aggregate before idle delivery", () => {
+  const seam = sessionManager();
+  const context = { sessionManager: seam.manager, isIdle: () => true };
+  const sent: string[] = [];
+  const coordinator = createParentResultCoordinator({
+    sendBatch: (batch) => sent.push(...batch.map((result) => result.id)),
+  });
+  coordinator.startSession(context, 4);
+  const result = {
+    kind: "workflow" as const,
+    id: "wf-inspected",
+    title: "workflow inspected",
+    status: "error" as const,
+    error: "failed",
+    output: "Workflow wf-inspected failed.",
+    parentRef: ref(),
+  };
+  coordinator.onWorkflowSettled(result, false);
+  coordinator.consumeWorkflow(result.id, result.parentRef);
+  coordinator.onWorkflowSettled(result, false);
+  assert.equal(coordinator.flush(context), false);
+  assert.deepEqual(sent, []);
+});

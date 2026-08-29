@@ -91,6 +91,7 @@ export function buildSubagentResultMessage(options: {
 }
 
 export interface SubagentResultCard {
+  readonly kind?: "workflow";
   readonly id: string;
   readonly title: string;
   readonly status: "done" | "error";
@@ -100,7 +101,8 @@ export interface SubagentResultCard {
 
 function resultCardText(card: SubagentResultCard) {
   const verb = card.status === "error" ? "failed" : "finished";
-  let text = `Subagent ${card.id} "${card.title}" ${verb}.`;
+  const subject = card.kind === "workflow" ? "Workflow" : "Subagent";
+  let text = `${subject} ${card.id} "${card.title}" ${verb}.`;
   if (card.error) text += `\nError: ${card.error}`;
   return `${text}\n\n${card.output}`;
 }

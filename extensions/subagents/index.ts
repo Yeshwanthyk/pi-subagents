@@ -47,6 +47,7 @@ import {
   isSubagentPending,
   latestText,
   REASONING_EFFORTS,
+  type ParentRef,
   type SubagentSnapshot,
 } from "./src/domain.ts";
 import {
@@ -54,6 +55,7 @@ import {
   formatContextUtilization,
 } from "./src/format.ts";
 import {
+  operatorSubagentView,
   parentSubagentView,
   SubagentManager,
   type SubagentManagerApi,
@@ -95,16 +97,32 @@ import {
   type WorkflowExecutionOptions,
 } from "./src/workflows/manager.ts";
 import {
+  isWorkflowTerminal,
+  type WorkflowReadModel,
+} from "./src/workflows/domain.ts";
+import {
   staticWorkflowDefinitionPreparer,
   WorkflowToolLifecycle,
 } from "./src/workflows/tools.ts";
 import {
+  WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS,
+  WORKFLOW_CHECK_TOOL_DESCRIPTION,
+  WORKFLOW_LIST_TOOL_DESCRIPTION,
   WORKFLOW_PARAMETER_DESCRIPTIONS,
   WORKFLOW_PROMPT_GUIDELINES,
   WORKFLOW_PROMPT_SNIPPET,
   WORKFLOW_TOOL_DESCRIPTION,
 } from "./src/workflows/prompt.ts";
 import { openSubagentPicker } from "./src/ui/takeover.ts";
+import {
+  formatWorkflowList,
+  formatWorkflowProjection,
+  projectWorkflowList,
+  projectWorkflowRun,
+  workflowActiveWorkItem,
+  workflowActiveWorkRemoval,
+  workflowResultEnvelope,
+} from "./src/workflows/projection.ts";
 import {
   ACTIVE_WORK_CHANNELS,
   subagentActiveWorkItem,
@@ -209,6 +227,7 @@ type HeadlessSubagentView = Pick<
 
 /** Structured details attached to subagent-result messages. */
 export interface SubagentResultDetails {
+  kind?: "workflow";
   id?: string;
   title?: string;
   status?: string;
@@ -409,7 +428,7 @@ export default function (pi: ExtensionAPI) {
   let disposeClientApi: (() => void) | undefined;
   let observabilityTimer: ReturnType<typeof setTimeout> | undefined;
   let renderView: SubagentReadModel | undefined;
-  const publishedActivity = new Map<`subagent:${string}`, ActiveWorkItem>();
+  const publishedActivity = new Map<ActiveWorkItem["key"], ActiveWorkItem>();
   let browserUI: ExtensionUIContext | undefined;
   let browserRevision = 0;
   let publishedStatus: string | undefined;
@@ -418,6 +437,9 @@ export default function (pi: ExtensionAPI) {
   let userInputRevision = 0;
   let workflowManager: WorkflowManager | undefined;
   let workflowLifecycle: WorkflowToolLifecycle | undefined;
+  const workflowParentRefs = new Map<string, ParentRef>();
+  let publishWorkflowResult:
+    ((run: WorkflowReadModel, parentRef: ParentRef) => void) | undefined;
 
   const getRuntime = () => (runtime ??= createSubagentRuntime());
 
@@ -447,20 +469,29 @@ export default function (pi: ExtensionAPI) {
   const workflowExecutionFor = (
     ctx: ExtensionContext,
     manager: SubagentManagerApi,
-  ): WorkflowExecutionOptions => ({
-    subagents: manager,
-    cwd: ctx.cwd,
-    parentRef: captureParentRef(sessionEpoch, ctx.sessionManager),
-    parent: {
-      parentCwd: ctx.cwd,
-      projectTrusted: ctx.isProjectTrusted(),
-      inheritedModel: ctx.model
-        ? { provider: ctx.model.provider, id: ctx.model.id }
-        : undefined,
-      inheritedThinkingLevel: pi.getThinkingLevel(),
-      modelRegistry: ctx.modelRegistry,
-    },
-  });
+  ): WorkflowExecutionOptions => {
+    const parentRef = captureParentRef(sessionEpoch, ctx.sessionManager);
+    return {
+      subagents: manager,
+      cwd: ctx.cwd,
+      parentRef,
+      onTerminal: (run) => {
+        if (sessionClosed) return;
+        workflowParentRefs.set(run.id, parentRef);
+        publishWorkflowResult?.(run, parentRef);
+        scheduleObservability(manager);
+      },
+      parent: {
+        parentCwd: ctx.cwd,
+        projectTrusted: ctx.isProjectTrusted(),
+        inheritedModel: ctx.model
+          ? { provider: ctx.model.provider, id: ctx.model.id }
+          : undefined,
+        inheritedThinkingLevel: pi.getThinkingLevel(),
+        modelRegistry: ctx.modelRegistry,
+      },
+    };
+  };
 
   pi.on("input", (event) => {
     if (event.source !== "extension") userInputRevision += 1;
@@ -468,13 +499,14 @@ export default function (pi: ExtensionAPI) {
   });
   const standardView = (manager: SubagentManagerApi) =>
     parentSubagentView(manager.view);
+  const operatorView = (manager: SubagentManagerApi) =>
+    operatorSubagentView(manager.view);
   const standardSnapshots = (manager: SubagentManagerApi) =>
     standardView(manager).list();
   const standardSnapshot = (manager: SubagentManagerApi, id: string) =>
     standardView(manager).get(id);
-
   const publishSubagentActivity = (manager: SubagentManagerApi) => {
-    const active = new Set<`subagent:${string}`>();
+    const active = new Set<ActiveWorkItem["key"]>();
     for (const snap of standardSnapshots(manager)) {
       const item = subagentActiveWorkItem(snap);
       const key = `subagent:${snap.id}` as const;
@@ -505,12 +537,46 @@ export default function (pi: ExtensionAPI) {
       }
     }
     for (const key of publishedActivity.keys()) {
-      if (active.has(key)) continue;
+      if (active.has(key) || key.startsWith("workflow:")) continue;
       publishedActivity.delete(key);
       pi.events.emit(ACTIVE_WORK_CHANNELS.remove, { version: 1, key });
     }
   };
 
+  const publishWorkflowActivity = (manager: SubagentManagerApi) => {
+    const workflowSnapshots = manager.view.list();
+    const active = new Set<ActiveWorkItem["key"]>();
+    for (const run of workflowManager?.list() ?? []) {
+      const item = workflowActiveWorkItem(run, workflowSnapshots);
+      if (item) {
+        active.add(item.key);
+        const previous = publishedActivity.get(item.key);
+        publishedActivity.set(item.key, item);
+        if (
+          !previous ||
+          previous.label !== item.label ||
+          previous.status !== item.status ||
+          previous.summary !== item.summary ||
+          previous.currentOperation !== item.currentOperation ||
+          previous.runningProcesses !== item.runningProcesses ||
+          previous.completedOperations !== item.completedOperations
+        ) {
+          pi.events.emit(ACTIVE_WORK_CHANNELS.update, item);
+        }
+        continue;
+      }
+
+      const removal = workflowActiveWorkRemoval(run, workflowSnapshots);
+      if (publishedActivity.delete(removal.key)) {
+        pi.events.emit(ACTIVE_WORK_CHANNELS.remove, removal);
+      }
+    }
+    for (const key of publishedActivity.keys()) {
+      if (!key.startsWith("workflow:") || active.has(key)) continue;
+      publishedActivity.delete(key);
+      pi.events.emit(ACTIVE_WORK_CHANNELS.remove, { version: 1, key });
+    }
+  };
   const publishBrowserActivity = (
     snapshots: ReadonlyArray<SubagentSnapshot>,
     terminal?: SubagentSnapshot,
@@ -540,6 +606,7 @@ export default function (pi: ExtensionAPI) {
   const refreshObservability = (manager: SubagentManagerApi) => {
     updateStatus(manager);
     publishSubagentActivity(manager);
+    publishWorkflowActivity(manager);
     publishBrowserActivity(standardSnapshots(manager));
   };
 
@@ -580,6 +647,28 @@ export default function (pi: ExtensionAPI) {
   const parentResults = createParentResultCoordinator({
     sendBatch: sendParentResultBatch,
   });
+  publishWorkflowResult = (run, parentRef) => {
+    const envelope = workflowResultEnvelope(run, parentRef);
+    if (!envelope) return;
+    parentResults.onWorkflowSettled(envelope, false);
+    if (sessionContext) parentResults.flush(sessionContext);
+  };
+
+  const inspectWorkflow = (manager: SubagentManagerApi, runId: string) => {
+    const run = workflowManager?.get(runId);
+    if (!run) {
+      throw new Error(`Unknown workflow run id "${runId}".`);
+    }
+    const projection = projectWorkflowRun(run, manager.view.list());
+    if (isWorkflowTerminal(run.status)) {
+      const parentRef = workflowParentRefs.get(run.id);
+      if (parentRef) parentResults.consumeWorkflow(run.id, parentRef);
+    }
+    return {
+      projection,
+      text: formatWorkflowProjection(projection),
+    };
+  };
 
   const onSettled = (snap: SubagentSnapshot, consumed: boolean) => {
     if (sessionClosed) return;
@@ -604,6 +693,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     sessionEpoch += 1;
+    workflowParentRefs.clear();
     sessionClosed = false;
     parentResults.startSession(ctx, sessionEpoch);
     browserUI?.setWidget(BROWSER_ACTIVITY_WIDGET_KEY, undefined);
@@ -661,6 +751,7 @@ export default function (pi: ExtensionAPI) {
     const closingWorkflow = workflowManager;
     workflowManager = undefined;
     workflowLifecycle = undefined;
+    workflowParentRefs.clear();
     const closing = runtime;
     runtime = undefined;
     managerPromise = undefined;
@@ -696,11 +787,12 @@ export default function (pi: ExtensionAPI) {
         userInput: userInputRevision,
       };
       if ("draftId" in params) {
-        const approved = lifecycle.approve(
-          params.draftId,
-          context,
-          workflowExecutionFor(ctx, manager),
-        );
+        const execution = workflowExecutionFor(ctx, manager);
+        const approved = lifecycle.approve(params.draftId, context, execution);
+        if (execution.parentRef) {
+          workflowParentRefs.set(approved.run.id, execution.parentRef);
+        }
+        scheduleObservability(manager);
         return {
           content: [{ type: "text", text: approved.message }],
           details: {
@@ -742,6 +834,40 @@ export default function (pi: ExtensionAPI) {
           artifactPath: prepared.artifactPath,
           executionSha256: prepared.draft.executionSha256,
         },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "workflow_list",
+    label: "List Workflows",
+    description: WORKFLOW_LIST_TOOL_DESCRIPTION,
+    parameters: Type.Object({}),
+    async execute() {
+      await getManager();
+      const runs = workflowManager?.list() ?? [];
+      return {
+        content: [{ type: "text", text: formatWorkflowList(runs) }],
+        details: { workflows: projectWorkflowList(runs) },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "workflow_check",
+    label: "Check Workflow",
+    description: WORKFLOW_CHECK_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      runId: Type.String({
+        description: WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS.runId,
+      }),
+    }),
+    async execute(_toolCallId, params) {
+      const manager = await getManager();
+      const inspected = inspectWorkflow(manager, params.runId);
+      return {
+        content: [{ type: "text", text: inspected.text }],
+        details: inspected.projection,
       };
     },
   });
@@ -1188,11 +1314,13 @@ export default function (pi: ExtensionAPI) {
       const results = details.results ?? [];
       const content = Array.isArray(message.content) ? "" : message.content;
       const cards = content.split("\n\n---\n\n");
+      const summaryLabel =
+        results.length === 1 && results[0]?.kind === "workflow"
+          ? "workflow result"
+          : `subagent result${results.length === 1 ? "" : "s"}`;
       const summary = theme.fg(
         "accent",
-        theme.bold(
-          `${results.length} subagent result${results.length === 1 ? "" : "s"}`,
-        ),
+        theme.bold(`${results.length} ${summaryLabel}`),
       );
 
       if (expanded) {
@@ -1216,9 +1344,10 @@ export default function (pi: ExtensionAPI) {
         if (result === undefined) continue;
         const failed = result.status === "error";
         const icon = failed ? theme.fg("error", "x") : theme.fg("success", "■");
+        const subject = result.kind === "workflow" ? "workflow" : "subagent";
         const header =
           `${icon} ` +
-          theme.fg("accent", theme.bold(`subagent ${result.id ?? "?"}`)) +
+          theme.fg("accent", theme.bold(`${subject} ${result.id ?? "?"}`)) +
           theme.fg(
             "muted",
             ` · ${result.title ?? ""} · ${failed ? "failed" : "finished"}`,
@@ -1251,23 +1380,23 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const manager = await getManager();
-        await runHeadlessSubagentsDialog(dialogUI, standardView(manager));
+        await runHeadlessSubagentsDialog(dialogUI, operatorView(manager));
         return;
       }
       const manager = await getManager();
-      if (standardView(manager).size() === 0) {
+      if (operatorView(manager).size() === 0) {
         ctx.ui.notify(
           "No subagents yet. The agent spawns them with subagent_spawn.",
           "info",
         );
         return;
       }
-      await openSubagentPicker(ctx, standardView(manager));
+      await openSubagentPicker(ctx, operatorView(manager));
     },
   });
 
   pi.registerShortcut("ctrl+shift+a", {
-    description: "Open the parent-owned subagents dashboard",
+    description: "Open the subagents and workflow-child dashboard",
     handler: async (ctx) => {
       if (ctx.mode !== "tui") {
         if (ctx.hasUI)
@@ -1278,14 +1407,14 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const manager = await getManager();
-      if (standardView(manager).size() === 0) {
+      if (operatorView(manager).size() === 0) {
         ctx.ui.notify(
           "No subagents yet. The agent spawns them with subagent_spawn.",
           "info",
         );
         return;
       }
-      await openSubagentPicker(ctx, standardView(manager));
+      await openSubagentPicker(ctx, operatorView(manager));
     },
   });
 }

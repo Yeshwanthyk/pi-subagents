@@ -184,3 +184,24 @@ test("parent message is one bounded batch with public details and follow-up opti
     /sessionFile|leafId|epoch|cwd|model/,
   );
 });
+
+test("workflow aggregate keeps its kind on the existing parent result rail", () => {
+  const aggregate: ParentResultEnvelope = {
+    kind: "workflow",
+    id: "wf-1",
+    title: "workflow one",
+    status: "done",
+    output: "Workflow wf-1 completed.",
+    parentRef: ref(),
+  };
+  const mailbox = createParentMailbox();
+  mailbox.enqueue(aggregate);
+  assert.equal(mailbox.list()[0]?.kind, "workflow");
+  const message = buildParentResultBatchMessage([aggregate]);
+  assert.deepEqual(message.details, {
+    results: [
+      { kind: "workflow", id: "wf-1", title: "workflow one", status: "done" },
+    ],
+  });
+  assert.match(message.content, /^Workflow wf-1/);
+});

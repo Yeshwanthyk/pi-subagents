@@ -185,6 +185,40 @@ export function parentSubagentView(view: SubagentReadModel): SubagentReadModel {
   };
 }
 
+/** Operator view adds workflow-owned children without changing parent delivery. */
+export function operatorSubagentView(
+  view: SubagentReadModel,
+): SubagentReadModel {
+  const isVisible = (snapshot: SubagentSnapshot) =>
+    snapshot.client === undefined &&
+    (snapshot.resultDelivery === "parent" ||
+      snapshot.resultDelivery === "workflow");
+  const included = (snapshot: SubagentSnapshot | undefined) =>
+    snapshot !== undefined && isVisible(snapshot) ? snapshot : undefined;
+
+  return {
+    list: () => view.list().filter(isVisible),
+    get: (id) => included(view.get(id)),
+    size: () => view.list().filter(isVisible).length,
+    subscribe: (listener) => view.subscribe(listener),
+    subscribeTo: (id, listener) =>
+      view.subscribeTo(id, () => {
+        if (included(view.get(id)) !== undefined) listener();
+      }),
+    requestSend: (id, text) => {
+      const snapshot = included(view.get(id));
+      if (snapshot?.resultDelivery === "parent") view.requestSend(id, text);
+    },
+    requestAbort: (id) => {
+      const snapshot = included(view.get(id));
+      if (snapshot?.resultDelivery === "parent") view.requestAbort(id);
+    },
+    setOnSettled: () => {
+      throw new Error("Filtered views cannot replace the manager settle hook.");
+    },
+  };
+}
+
 /** Compatibility name for the parent-owned subagent dashboard view. */
 export function standardSubagentView(
   view: SubagentReadModel,

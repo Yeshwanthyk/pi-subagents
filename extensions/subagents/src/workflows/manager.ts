@@ -88,6 +88,8 @@ export interface WorkflowExecutionOptions {
   readonly defaultBackend?: BackendName;
   /** Compatibility alias for the task field's backend terminology. */
   readonly defaultHarness?: BackendName;
+  /** Called once after the authoritative workflow terminal transition. */
+  readonly onTerminal?: (state: WorkflowReadModel) => void;
 }
 
 export interface WorkflowRunHandle {
@@ -117,6 +119,7 @@ interface ResolvedExecutionOptions {
   readonly cwd: string;
   readonly owner: string;
   readonly parent: ParentContext;
+  readonly onTerminal?: (state: WorkflowReadModel) => void;
   readonly parentRef?: ParentRef;
   readonly defaultBackend: BackendName;
 }
@@ -661,6 +664,7 @@ export class WorkflowManager {
       owner: merged.owner ?? `workflow:${runId}`,
       parent,
       parentRef: merged.parentRef,
+      onTerminal: merged.onTerminal,
       defaultBackend: merged.defaultBackend ?? merged.defaultHarness ?? "pi",
     };
   }
@@ -719,6 +723,11 @@ export class WorkflowManager {
     if (!state || !isWorkflowTerminal(state.status)) return;
     execution.completionResolved = true;
     execution.resolveCompletion(state);
+    try {
+      execution.options.onTerminal?.(state);
+    } catch {
+      // Result publication is outside workflow state ownership.
+    }
   }
 
   private kick(execution: WorkflowExecution): void {

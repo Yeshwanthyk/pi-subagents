@@ -5,6 +5,8 @@ import type {
 } from "./domain.ts";
 import { parentRefKey } from "./parent-ref.ts";
 
+export type ParentResultKind = "workflow";
+
 export interface ParentResultEnvelope {
   readonly id: string;
   readonly title: string;
@@ -12,6 +14,12 @@ export interface ParentResultEnvelope {
   readonly error?: string;
   readonly output: string;
   readonly parentRef: ParentRef;
+  /** Present only for the single aggregate workflow completion record. */
+  readonly kind?: ParentResultKind;
+}
+
+export interface WorkflowResultEnvelope extends ParentResultEnvelope {
+  readonly kind: "workflow";
 }
 
 export interface ParentMailboxLimits {
@@ -92,6 +100,7 @@ function terminalBytes(envelope: ParentResultEnvelope): number {
       status: envelope.status,
       error: envelope.error,
       output: envelope.output,
+      kind: envelope.kind,
     }),
     "utf8",
   );
@@ -104,7 +113,7 @@ function normalizeEnvelope(
     envelope.error === undefined
       ? undefined
       : boundedUtf8(envelope.error, PARENT_RESULT_LIMITS.maxErrorBytes);
-  return {
+  const normalized = {
     id: boundedUtf8(singleLine(envelope.id), PARENT_RESULT_LIMITS.maxIdLength),
     title: boundedTitle(envelope.title),
     status: envelope.status,
@@ -115,6 +124,8 @@ function normalizeEnvelope(
     ),
     parentRef: { ...envelope.parentRef },
   };
+  if (envelope.kind === undefined) return normalized;
+  return { ...normalized, kind: envelope.kind };
 }
 
 /**

@@ -24,6 +24,7 @@ import {
   SubagentManager,
   SubagentManagerLive,
   parentSubagentView,
+  operatorSubagentView,
   type SubagentManagerApi,
 } from "./src/manager.ts";
 import { createParentResultCoordinator } from "./src/parent-coordinator.ts";
@@ -699,6 +700,15 @@ test("workflow observation rejects mismatched ownership without replacing the se
     assert.equal(observed.ownership.runId, owner.runId);
     assert.equal(manager.view.get(snap.id)?.resultDelivery, "workflow");
     assert.equal(parentSubagentView(manager.view).get(snap.id), undefined);
+    const operatorView = operatorSubagentView(manager.view);
+    assert.equal(operatorView.get(snap.id)?.id, snap.id);
+    const statusBeforeOperatorActions = manager.view.get(snap.id)?.status;
+    operatorView.requestSend(snap.id, "must not steer workflow children");
+    operatorView.requestAbort(snap.id);
+    assert.equal(
+      manager.view.get(snap.id)?.status,
+      statusBeforeOperatorActions,
+    );
     await runTool(runtime, observed.admission);
 
     await controlled.complete("owner-check", "owned result");

@@ -7,6 +7,7 @@ import {
 
 export interface ParentResultBatchDetails {
   readonly results: ReadonlyArray<{
+    readonly kind?: "workflow";
     readonly id: string;
     readonly title: string;
     readonly status: TerminalSubagentStatus;
@@ -25,27 +26,41 @@ export const PARENT_RESULT_BATCH_OPTIONS = {
   triggerTurn: true,
 } as const;
 
-/** Build the public parent message without carrying runtime ParentRef data. */
-export function buildParentResultBatchMessage(
-  batch: ReadonlyArray<ParentResultEnvelope>,
-): ParentResultBatchMessage {
-  const cards: ReadonlyArray<SubagentResultCard> = batch.map((result) => ({
+function resultCard(result: ParentResultEnvelope): SubagentResultCard {
+  const card: SubagentResultCard = {
     id: result.id,
     title: result.title,
     status: result.status,
     error: result.error,
     output: result.output,
-  }));
+  };
+  if (result.kind === undefined) return card;
+  return { ...card, kind: result.kind };
+}
+
+function resultDetail(
+  result: ParentResultEnvelope,
+): ParentResultBatchDetails["results"][number] {
+  const detail = {
+    id: result.id,
+    title: result.title,
+    status: result.status,
+  };
+  if (result.kind === undefined) return detail;
+  return { ...detail, kind: result.kind };
+}
+
+/** Build the public parent message without carrying runtime ParentRef data. */
+export function buildParentResultBatchMessage(
+  batch: ReadonlyArray<ParentResultEnvelope>,
+): ParentResultBatchMessage {
+  const cards: ReadonlyArray<SubagentResultCard> = batch.map(resultCard);
   return {
     customType: "subagent-result-batch",
     content: buildSubagentResultBatchMessage(cards),
     display: true,
     details: {
-      results: batch.map((result) => ({
-        id: result.id,
-        title: result.title,
-        status: result.status,
-      })),
+      results: batch.map(resultDetail),
     },
   };
 }
