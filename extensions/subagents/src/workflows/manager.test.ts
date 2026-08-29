@@ -160,6 +160,55 @@ test("journal event bound rejects further state changes without corrupting repla
   assert.deepEqual(workflows.replay("wf-1"), terminal);
 });
 
+test("manager returns immutable authoritative snapshots for every nested projection", () => {
+  const workflows = manager();
+  const created = workflows.createRun(singleTask);
+  assert.equal(Object.isFrozen(created), true);
+  assert.equal(Object.isFrozen(created.definition), true);
+  assert.equal(Object.isFrozen(created.tasks), true);
+  assert.equal(Object.isFrozen(created.tasks.only), true);
+  assert.throws(
+    () =>
+      Object.defineProperty(created.definition.tasks[0]!, "label", {
+        value: "changed",
+      }),
+    TypeError,
+  );
+  assert.throws(
+    () =>
+      Object.defineProperty(created.tasks, "other", {
+        value: created.tasks.only,
+      }),
+    TypeError,
+  );
+  assert.throws(
+    () =>
+      Object.defineProperty(created.tasks.only!, "status", { value: "failed" }),
+    TypeError,
+  );
+  assert.equal(workflows.get(created.id)?.tasks.only?.status, "ready");
+  workflows.start(created.id);
+  const logged = workflows.log(created.id, "kept");
+  assert.equal(Object.isFrozen(logged.logs), true);
+  assert.equal(Object.isFrozen(logged.logs[0]), true);
+  assert.throws(
+    () =>
+      Object.defineProperty(logged.logs[0]!, "message", { value: "changed" }),
+    TypeError,
+  );
+  assert.equal(workflows.get(created.id)?.logs[0]?.message, "kept");
+  const failed = workflows.fail(created.id, "failure");
+  assert.equal(Object.isFrozen(failed.outcome), true);
+  assert.throws(
+    () => Object.defineProperty(failed.outcome!, "error", { value: "changed" }),
+    TypeError,
+  );
+  assert.deepEqual(workflows.get(created.id)?.outcome, {
+    _tag: "Failed",
+    error: "failure",
+  });
+});
+
 test("manager does not execute children or invent child records", () => {
   const workflows = manager();
   const state = workflows.createRun(singleTask);

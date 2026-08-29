@@ -12,6 +12,8 @@ import {
   type WorkflowDraft,
 } from "./drafts.ts";
 import type { WorkflowManager } from "./manager.ts";
+import { validateWorkflowDefinition } from "./graph.ts";
+import { decodeWorkflowSource } from "./sandbox.ts";
 import {
   buildWorkflowApprovalMessage,
   buildWorkflowDraftMessage,
@@ -30,15 +32,18 @@ export interface WorkflowPreparationContext {
   readonly userInput: number;
 }
 
-/**
- * Slice 3 owns the lifecycle boundary, not source evaluation. The implementation
- * must validate without running tasks; Slice 4 supplies the restricted source
- * evaluator and complete graph validator.
- */
+/** Source preparation is static and graph validation is complete before any
+ * draft persistence or manager call. Neither operation starts a child. */
 export interface WorkflowDefinitionPreparer {
   prepareSource(source: string): ValidatedWorkflowDefinition;
   prepareSpec(spec: ValidatedWorkflowDefinition): ValidatedWorkflowDefinition;
 }
+
+/** Default Slice 4 preparer for the single static flow(...) source surface. */
+export const staticWorkflowDefinitionPreparer: WorkflowDefinitionPreparer = {
+  prepareSource: decodeWorkflowSource,
+  prepareSpec: validateWorkflowDefinition,
+};
 
 interface PrepareCommon {
   readonly preview: string;
@@ -121,6 +126,7 @@ export class WorkflowToolLifecycle {
       definition = this.options.preparer.prepareSpec(request.spec);
     }
 
+    definition = validateWorkflowDefinition(definition);
     const draft = createWorkflowDraft(this.options.workflowsDir, {
       sessionId: context.sessionId,
       cwd: context.cwd,
@@ -176,7 +182,7 @@ export class WorkflowToolLifecycle {
     context: Pick<WorkflowPreparationContext, "cwd">,
   ): SavedWorkflow[] {
     return listSavedWorkflows(context.cwd, this.options.agentDir, (source) => {
-      this.options.preparer.prepareSource(source);
+      validateWorkflowDefinition(this.options.preparer.prepareSource(source));
     });
   }
 

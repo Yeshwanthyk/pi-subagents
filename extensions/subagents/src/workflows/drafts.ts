@@ -2,15 +2,9 @@
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type {
-  ValidatedWorkflowDefinition,
-  WorkflowTaskDefinition,
-} from "./domain.ts";
-import {
-  MAX_WORKFLOW_DEFINITION_BYTES,
-  MAX_WORKFLOW_TASKS,
-  utf8Bytes,
-} from "./events.ts";
+import type { ValidatedWorkflowDefinition } from "./domain.ts";
+import { validateWorkflowDefinition } from "./graph.ts";
+import { utf8Bytes } from "./events.ts";
 import {
   assertWorkflowProvenance,
   inlineWorkflowProvenance,
@@ -23,17 +17,6 @@ const DRAFT_MAX_BYTES = 2 * 1024 * 1024;
 const PREVIEW_MAX_BYTES = 64 * 1024;
 const SOURCE_MAX_BYTES = 512 * 1024;
 const ARGS_MAX_BYTES = 512 * 1024;
-const TASK_KINDS = new Set(["scout", "writer", "proof", "review", "repair"]);
-const BACKENDS = new Set(["pi", "codex"]);
-const EFFORTS = new Set([
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-]);
 
 export interface WorkflowDraft {
   readonly version: 1;
@@ -56,7 +39,7 @@ export interface CreateWorkflowDraftInput {
   readonly cwd: string;
   readonly preparedAtUserInput: number;
   readonly preview: string;
-  readonly definition: ValidatedWorkflowDefinition;
+  readonly definition: unknown;
   readonly source?: string;
   readonly args?: string;
   readonly background?: boolean;
@@ -91,136 +74,6 @@ function assertString(
   return value;
 }
 
-function assertOptionalStringArray(
-  value: unknown,
-  label: string,
-): asserts value is string[] | undefined {
-  if (value === undefined) return;
-  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
-    throw new Error(`Workflow draft has invalid task ${label}`);
-  }
-}
-
-function assertTaskDefinition(
-  value: unknown,
-): asserts value is WorkflowTaskDefinition {
-  if (!isRecord(value)) throw new Error("Workflow draft has an invalid task");
-  assertOnlyKeys(
-    value,
-    [
-      "id",
-      "label",
-      "kind",
-      "prompt",
-      "needs",
-      "consumes",
-      "readOnly",
-      "owns",
-      "harness",
-      "model",
-      "effort",
-      "retry",
-    ],
-    "Workflow draft task",
-  );
-  assertString(value.id, "task id");
-  assertString(value.label, "task label");
-  assertString(value.prompt, "task prompt");
-  if (typeof value.kind !== "string" || !TASK_KINDS.has(value.kind)) {
-    throw new Error("Workflow draft has an invalid task kind");
-  }
-  assertOptionalStringArray(value.needs, "needs");
-  assertOptionalStringArray(value.consumes, "consumes");
-  if (value.harness !== undefined && !BACKENDS.has(String(value.harness))) {
-    throw new Error("Workflow draft has an invalid task harness");
-  }
-  if (value.model !== undefined && typeof value.model !== "string") {
-    throw new Error("Workflow draft has an invalid task model");
-  }
-  if (value.effort !== undefined && !EFFORTS.has(String(value.effort))) {
-    throw new Error("Workflow draft has an invalid task effort");
-  }
-  const readOnly = value.readOnly === true && value.owns === undefined;
-  const owns =
-    value.readOnly === undefined &&
-    Array.isArray(value.owns) &&
-    value.owns.length > 0 &&
-    value.owns.every((item) => typeof item === "string" && item.length > 0);
-  if (readOnly === owns) {
-    throw new Error(
-      "Workflow draft tasks require exactly one of readOnly:true or non-empty owns",
-    );
-  }
-  if (value.retry !== undefined) {
-    if (!isRecord(value.retry)) {
-      throw new Error("Workflow draft has an invalid task retry policy");
-    }
-    assertOnlyKeys(
-      value.retry,
-      ["maxAttempts", "on"],
-      "Workflow task retry policy",
-    );
-    if (
-      !Number.isSafeInteger(value.retry.maxAttempts) ||
-      (value.retry.maxAttempts as number) < 1 ||
-      !Array.isArray(value.retry.on) ||
-      value.retry.on.some(
-        (item) => item !== "provider_stall" && item !== "backend_failure",
-      )
-    ) {
-      throw new Error("Workflow draft has an invalid task retry policy");
-    }
-  }
-}
-
-/**
- * Validate only the immutable definition envelope in this slice. Complete DAG,
- * dependency, consumes, and ownership-conflict validation belongs to Slice 4.
- */
-export function snapshotWorkflowDefinition(
-  value: unknown,
-): ValidatedWorkflowDefinition {
-  if (!isRecord(value) || !Array.isArray(value.tasks)) {
-    throw new Error("Workflow draft definition must contain a tasks array");
-  }
-  assertOnlyKeys(
-    value,
-    ["name", "description", "tasks"],
-    "Workflow draft definition",
-  );
-  if (value.tasks.length > MAX_WORKFLOW_TASKS) {
-    throw new Error(
-      `Workflow draft definitions are limited to ${MAX_WORKFLOW_TASKS} tasks`,
-    );
-  }
-  if (value.name !== undefined && typeof value.name !== "string") {
-    throw new Error("Workflow draft definition has an invalid name");
-  }
-  if (
-    value.description !== undefined &&
-    typeof value.description !== "string"
-  ) {
-    throw new Error("Workflow draft definition has an invalid description");
-  }
-  for (const task of value.tasks) assertTaskDefinition(task);
-
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(value);
-  } catch {
-    throw new Error("Workflow draft definition must be JSON serializable");
-  }
-  if (
-    serialized === undefined ||
-    utf8Bytes(serialized) > MAX_WORKFLOW_DEFINITION_BYTES
-  ) {
-    throw new Error(
-      `Workflow draft definitions are limited to ${MAX_WORKFLOW_DEFINITION_BYTES} UTF-8 bytes`,
-    );
-  }
-  return JSON.parse(serialized) as ValidatedWorkflowDefinition;
-}
-
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
     Object.freeze(value);
@@ -229,6 +82,13 @@ function deepFreeze<T>(value: T): T {
     }
   }
   return value;
+}
+
+/** Validate and snapshot the complete graph before it reaches persistence. */
+export function snapshotWorkflowDefinition(
+  value: unknown,
+): ValidatedWorkflowDefinition {
+  return validateWorkflowDefinition(value);
 }
 
 function draftsDir(workflowsDir: string): string {

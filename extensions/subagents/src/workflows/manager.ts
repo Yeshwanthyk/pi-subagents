@@ -1,13 +1,12 @@
+/* oxlint-disable anti-slop/no-unknown-parameters -- createRun is a runtime boundary; the complete graph parser runs before an ID, event, or manager entry is created. */
 import { randomUUID } from "node:crypto";
-import type {
-  ValidatedWorkflowDefinition,
-  WorkflowReadModel,
-} from "./domain.ts";
+import type { WorkflowReadModel } from "./domain.ts";
 import {
   boundWorkflowEvent,
   MAX_WORKFLOW_EVENTS,
   type WorkflowEvent,
 } from "./events.ts";
+import { validateWorkflowDefinition } from "./graph.ts";
 import { foldWorkflowEvents, reduceWorkflowEvent } from "./reducer.ts";
 
 interface WorkflowEntry {
@@ -64,7 +63,8 @@ export class WorkflowManager {
     }
   }
 
-  createRun(definition: ValidatedWorkflowDefinition): WorkflowReadModel {
+  createRun(definition: unknown): WorkflowReadModel {
+    const validatedDefinition = validateWorkflowDefinition(definition);
     const runId = this.createId();
     if (this.entries.has(runId)) {
       throw new Error(
@@ -75,7 +75,7 @@ export class WorkflowManager {
       _tag: "WorkflowCreated",
       runId,
       at: this.eventTime(),
-      definition,
+      definition: validatedDefinition,
     });
     const state = reduceWorkflowEvent(undefined, event);
     this.entries.set(runId, {

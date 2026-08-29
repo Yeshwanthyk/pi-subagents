@@ -13,6 +13,7 @@ import {
   type WorkflowEvent,
   utf8Bytes,
 } from "./events.ts";
+import { validateWorkflowDefinition } from "./graph.ts";
 
 export class WorkflowInvariantError extends Error {
   constructor(message: string) {
@@ -24,9 +25,41 @@ export class WorkflowInvariantError extends Error {
 function cloneDefinition(
   definition: ValidatedWorkflowDefinition,
 ): ValidatedWorkflowDefinition {
-  return structuredClone(definition);
+  return validateWorkflowDefinition(definition);
 }
 
+function createTaskIndex(): Record<string, WorkflowTaskReadModel> {
+  return Object.create(null);
+}
+
+function copyTaskIndex(
+  source: Readonly<Record<string, WorkflowTaskReadModel>>,
+): Record<string, WorkflowTaskReadModel> {
+  const copy = createTaskIndex();
+  for (const taskId of Object.keys(source)) {
+    copy[taskId] = source[taskId]!;
+  }
+  return copy;
+}
+
+/** Every read model exposed by the reducer is an immutable authority. */
+function freezeReadModel(state: WorkflowReadModel): WorkflowReadModel {
+  Object.freeze(state.definition);
+  Object.freeze(state.tasks);
+  for (const taskId of Object.getOwnPropertyNames(state.tasks)) {
+    const descriptor = Object.getOwnPropertyDescriptor(state.tasks, taskId);
+    if (descriptor && "value" in descriptor) {
+      const task = descriptor.value;
+      Object.freeze(task.definition);
+      if (task.outcome) Object.freeze(task.outcome);
+      Object.freeze(task);
+    }
+  }
+  for (const entry of state.logs) Object.freeze(entry);
+  Object.freeze(state.logs);
+  if (state.outcome) Object.freeze(state.outcome);
+  return Object.freeze(state);
+}
 function createReadModel(
   event: Extract<WorkflowEvent, { readonly _tag: "WorkflowCreated" }>,
 ): WorkflowReadModel {
@@ -59,7 +92,7 @@ function createReadModel(
     }
   }
 
-  const tasks: Record<string, WorkflowTaskReadModel> = {};
+  const tasks = createTaskIndex();
   for (const task of definition.tasks) {
     tasks[task.id] = {
       definition: task,
@@ -68,7 +101,7 @@ function createReadModel(
       lastActivityAt: event.at,
     };
   }
-  return {
+  return freezeReadModel({
     id: event.runId,
     definition,
     status: "pending_approval",
@@ -77,20 +110,24 @@ function createReadModel(
     lastActivityAt: event.at,
     tasks,
     logs: [],
-  };
+  });
 }
 
 function requireTask(
   state: WorkflowReadModel,
   taskId: string,
 ): WorkflowTaskReadModel {
-  const task = state.tasks[taskId];
-  if (!task) {
+  const descriptor = Object.getOwnPropertyDescriptor(state.tasks, taskId);
+  if (
+    descriptor === undefined ||
+    !("value" in descriptor) ||
+    !descriptor.value
+  ) {
     throw new WorkflowInvariantError(
       `Workflow "${state.id}" has no task "${taskId}".`,
     );
   }
-  return task;
+  return descriptor.value;
 }
 
 function replaceTask(
@@ -98,15 +135,17 @@ function replaceTask(
   taskId: string,
   task: WorkflowTaskReadModel,
 ): WorkflowReadModel {
-  return { ...state, tasks: { ...state.tasks, [taskId]: task } };
+  const tasks = copyTaskIndex(state.tasks);
+  tasks[taskId] = task;
+  return { ...state, tasks };
 }
 
 function withProgress(state: WorkflowReadModel, at: number): WorkflowReadModel {
-  return {
+  return freezeReadModel({
     ...state,
     version: state.version + 1,
     lastActivityAt: at,
-  };
+  });
 }
 
 function assertRunning(state: WorkflowReadModel, event: WorkflowEvent): void {
@@ -147,7 +186,7 @@ function skipFailedDescendants(
   }
 
   if (descendants.size === 0) return state;
-  const tasks = { ...state.tasks };
+  const tasks = copyTaskIndex(state.tasks);
   for (const taskId of descendants) {
     const task = requireTask(state, taskId);
     if (isWorkflowTaskTerminal(task.status)) continue;
@@ -176,7 +215,7 @@ function unlockReadyTasks(
   at: number,
 ): WorkflowReadModel {
   let changed = false;
-  const tasks = { ...state.tasks };
+  const tasks = copyTaskIndex(state.tasks);
   for (const definition of state.definition.tasks) {
     const task = tasks[definition.id]!;
     if (task.status !== "blocked") continue;
@@ -348,7 +387,10 @@ export function reduceWorkflowEvent(
     case "WorkflowCompleted":
       assertRunning(state, event);
       if (
-        Object.values(state.tasks).some((task) => task.status !== "completed")
+        state.definition.tasks.some(
+          (definition) =>
+            requireTask(state, definition.id).status !== "completed",
+        )
       ) {
         throw new WorkflowInvariantError(
           `Workflow "${state.id}" cannot complete before every task completes.`,
