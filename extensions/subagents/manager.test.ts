@@ -672,3 +672,170 @@ test("manager settlement seam never sends client jobs through the parent coordin
     assert.equal(coordinator.mailbox.size(), 0);
   });
 });
+
+test("workflow observation rejects mismatched ownership without replacing the settle hook", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const owner = { runId: "wf-owner", taskId: "task-1" } as const;
+    const snap = await runTool(
+      runtime,
+      manager.spawn("codex", { ...task("owner-check"), workflow: owner }),
+    );
+    const wrong = { runId: owner.runId, taskId: "other-task" } as const;
+
+    await assert.rejects(
+      runTool(runtime, manager.awaitSettlement(snap.id, wrong)),
+      /not owned by workflow/,
+    );
+    await assert.rejects(
+      runTool(runtime, manager.awaitAdmission!(snap.id, wrong)),
+      /not owned by workflow/,
+    );
+
+    const observed = await runTool(
+      runtime,
+      manager.observeWorkflow!(snap.id, owner),
+    );
+    assert.ok(observed);
+    assert.equal(observed.ownership.runId, owner.runId);
+    assert.equal(manager.view.get(snap.id)?.resultDelivery, "workflow");
+    assert.equal(parentSubagentView(manager.view).get(snap.id), undefined);
+    await runTool(runtime, observed.admission);
+
+    await controlled.complete("owner-check", "owned result");
+    assert.equal(
+      (await runTool(runtime, observed.settlement)).finalText,
+      "owned result",
+    );
+    await runTool(runtime, observed.release);
+  });
+});
+
+test("workflow observation closes the queued-to-running-to-terminal race", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    await runTool(
+      runtime,
+      Effect.forEach(
+        [1, 2, 3, 4],
+        (n) => manager.spawn("codex", task(`admission-hold-${n}`)),
+        { concurrency: "unbounded" },
+      ),
+    );
+    await waitUntil(
+      () => controlled.starts.length === 4,
+      "four slots should be full",
+    );
+
+    const owner = { runId: "wf-race", taskId: "queued" } as const;
+    const queued = await runTool(
+      runtime,
+      manager.spawn("codex", { ...task("admission-queued"), workflow: owner }),
+    );
+    assert.equal(queued.status, "queued");
+    const observed = await runTool(
+      runtime,
+      manager.observeWorkflow!(queued.id, owner),
+    );
+    assert.ok(observed);
+    const admitted = runTool(runtime, observed.admission);
+
+    await controlled.complete("admission-hold-1");
+    await waitUntil(
+      () => controlled.starts.includes("admission-queued"),
+      "queued workflow child should be admitted",
+    );
+    assert.equal((await admitted).status, "running");
+
+    const settled = runTool(runtime, observed.settlement);
+    await controlled.complete("admission-queued", "race-safe");
+    assert.equal((await settled).finalText, "race-safe");
+    await runTool(runtime, observed.release);
+  });
+});
+
+test("claimed workflow settlement survives terminal pruning and late lookup", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const owner = { runId: "wf-retention", taskId: "first" } as const;
+    const prompts = Array.from(
+      { length: 65 },
+      (_, index) => `retained-${index}`,
+    );
+    const snapshots = await runTool(
+      runtime,
+      Effect.forEach(
+        prompts,
+        (prompt, index) => {
+          const spawnTask = task(prompt);
+          return manager.spawn(
+            "codex",
+            index === 0 ? { ...spawnTask, workflow: owner } : spawnTask,
+          );
+        },
+        { concurrency: "unbounded" },
+      ),
+    );
+    const observed = await runTool(
+      runtime,
+      manager.observeWorkflow!(snapshots[0]!.id, owner),
+    );
+    assert.ok(observed);
+
+    for (const prompt of prompts) {
+      await waitUntil(
+        () => controlled.starts.includes(prompt),
+        `${prompt} should be admitted in FIFO order`,
+      );
+      await controlled.complete(prompt);
+    }
+    const first = await runTool(runtime, observed.settlement);
+    assert.equal(first.status, "done");
+    assert.ok(manager.view.get(first.id));
+
+    // A further terminal record forces pruning after the claim is released.
+    await runTool(runtime, observed.release);
+    const extra = await runTool(
+      runtime,
+      manager.spawn("codex", task("retained-extra")),
+    );
+    await controlled.complete("retained-extra");
+    await runTool(runtime, manager.awaitSettlement(extra.id));
+    assert.equal(manager.view.get(first.id), undefined);
+
+    // The bounded lifecycle handle remains usable after the display row is gone.
+    const late = await runTool(
+      runtime,
+      manager.awaitSettlement(first.id, owner),
+    );
+    assert.equal(late?.finalText, first.finalText);
+  });
+});
+
+test("workflow cancellation settles once and releases exactly one slot", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const settled: string[] = [];
+    manager.view.setOnSettled((snapshot) => settled.push(snapshot.id));
+    const owner = { runId: "wf-cancel", taskId: "cancelled" } as const;
+    const snap = await runTool(
+      runtime,
+      manager.spawn("codex", { ...task("cancel-observed"), workflow: owner }),
+    );
+    const observed = await runTool(
+      runtime,
+      manager.claimWorkflow!(snap.id, owner),
+    );
+    assert.ok(observed);
+
+    await runTool(runtime, manager.cancel([snap.id]));
+    const result = await runTool(runtime, observed.settlement);
+    assert.equal(result.outcome?._tag, "Interrupted");
+    assert.deepEqual(settled, [snap.id]);
+
+    // A late backend terminal notification cannot publish or release again.
+    await controlled.emit("cancel-observed", {
+      _tag: "RunSettled",
+      outcome: { _tag: "Completed", finalText: "late" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(settled, [snap.id]);
+    await runTool(runtime, observed.release);
+  });
+});

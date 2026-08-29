@@ -173,7 +173,12 @@ function clientSnapshot(snapshot: SubagentSnapshot): SubagentClientSnapshot {
 export function clientSettlement(
   snapshot: SubagentSnapshot,
 ): SubagentClientSettledEvent | undefined {
-  if (!snapshot.client || !snapshot.outcome) return undefined;
+  if (
+    snapshot.resultDelivery !== "client" ||
+    !snapshot.client ||
+    !snapshot.outcome
+  )
+    return undefined;
   const base = {
     version: SUBAGENT_CLIENT_PROTOCOL_VERSION,
     clientId: snapshot.client.id,

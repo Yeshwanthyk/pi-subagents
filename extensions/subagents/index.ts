@@ -40,7 +40,7 @@ import {
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import {
   BACKEND_NAMES,
   formatElapsed,
@@ -90,6 +90,20 @@ import {
   runTool,
   type SubagentRuntime,
 } from "./src/runtime.ts";
+import {
+  WorkflowManager,
+  type WorkflowExecutionOptions,
+} from "./src/workflows/manager.ts";
+import {
+  staticWorkflowDefinitionPreparer,
+  WorkflowToolLifecycle,
+} from "./src/workflows/tools.ts";
+import {
+  WORKFLOW_PARAMETER_DESCRIPTIONS,
+  WORKFLOW_PROMPT_GUIDELINES,
+  WORKFLOW_PROMPT_SNIPPET,
+  WORKFLOW_TOOL_DESCRIPTION,
+} from "./src/workflows/prompt.ts";
 import { openSubagentPicker } from "./src/ui/takeover.ts";
 import {
   ACTIVE_WORK_CHANNELS,
@@ -130,6 +144,55 @@ const PLAIN_THEME = {
   fg: (_color: string, text: string) => text,
   bold: (text: string) => text,
 } as Theme;
+
+const WORKFLOW_TOOL_PARAMS = Type.Union([
+  Type.Object({
+    preview: Type.String({
+      description: WORKFLOW_PARAMETER_DESCRIPTIONS.preview,
+    }),
+    source: Type.String({
+      description: WORKFLOW_PARAMETER_DESCRIPTIONS.source,
+    }),
+    args: Type.Optional(
+      Type.String({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.args }),
+    ),
+    background: Type.Optional(
+      Type.Boolean({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.background }),
+    ),
+  }),
+  Type.Object({
+    preview: Type.String({
+      description: WORKFLOW_PARAMETER_DESCRIPTIONS.preview,
+    }),
+    spec: Type.Any({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.spec }),
+    args: Type.Optional(
+      Type.String({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.args }),
+    ),
+    background: Type.Optional(
+      Type.Boolean({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.background }),
+    ),
+  }),
+  Type.Object({
+    preview: Type.String({
+      description: WORKFLOW_PARAMETER_DESCRIPTIONS.preview,
+    }),
+    savedWorkflow: Type.String({
+      description: WORKFLOW_PARAMETER_DESCRIPTIONS.savedWorkflow,
+    }),
+    args: Type.Optional(
+      Type.String({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.args }),
+    ),
+    background: Type.Optional(
+      Type.Boolean({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.background }),
+    ),
+  }),
+  Type.Object({
+    draftId: Type.String({
+      description: WORKFLOW_PARAMETER_DESCRIPTIONS.draftId,
+    }),
+  }),
+]);
+type WorkflowToolParams = Static<typeof WORKFLOW_TOOL_PARAMS>;
 
 export interface HeadlessSubagentsUI {
   select(title: string, options: string[]): Promise<string | undefined>;
@@ -352,6 +415,9 @@ export default function (pi: ExtensionAPI) {
   let publishedStatus: string | undefined;
   let sessionEpoch = 0;
   let sessionClosed = false;
+  let userInputRevision = 0;
+  let workflowManager: WorkflowManager | undefined;
+  let workflowLifecycle: WorkflowToolLifecycle | undefined;
 
   const getRuntime = () => (runtime ??= createSubagentRuntime());
 
@@ -362,6 +428,13 @@ export default function (pi: ExtensionAPI) {
       .then((manager) => {
         manager.view.setOnSettled(onSettled);
         renderView = parentSubagentView(manager.view);
+        workflowManager = new WorkflowManager({ subagents: manager });
+        workflowLifecycle = new WorkflowToolLifecycle({
+          workflowsDir: path.join(getAgentDir(), "workflows"),
+          agentDir: getAgentDir(),
+          manager: workflowManager,
+          preparer: staticWorkflowDefinitionPreparer,
+        });
         const schedule = () => scheduleObservability(manager);
         unsubStatus?.();
         unsubStatus = manager.view.subscribe(schedule);
@@ -371,6 +444,28 @@ export default function (pi: ExtensionAPI) {
     return managerPromise;
   };
 
+  const workflowExecutionFor = (
+    ctx: ExtensionContext,
+    manager: SubagentManagerApi,
+  ): WorkflowExecutionOptions => ({
+    subagents: manager,
+    cwd: ctx.cwd,
+    parentRef: captureParentRef(sessionEpoch, ctx.sessionManager),
+    parent: {
+      parentCwd: ctx.cwd,
+      projectTrusted: ctx.isProjectTrusted(),
+      inheritedModel: ctx.model
+        ? { provider: ctx.model.provider, id: ctx.model.id }
+        : undefined,
+      inheritedThinkingLevel: pi.getThinkingLevel(),
+      modelRegistry: ctx.modelRegistry,
+    },
+  });
+
+  pi.on("input", (event) => {
+    if (event.source !== "extension") userInputRevision += 1;
+    return { action: "continue" };
+  });
   const standardView = (manager: SubagentManagerApi) =>
     parentSubagentView(manager.view);
   const standardSnapshots = (manager: SubagentManagerApi) =>
@@ -488,6 +583,10 @@ export default function (pi: ExtensionAPI) {
 
   const onSettled = (snap: SubagentSnapshot, consumed: boolean) => {
     if (sessionClosed) return;
+    // Workflow children are observed by WorkflowManager through their stable
+    // settlement handles. They must never enter parent messages or client
+    // channels, even though the shared manager has one global settle hook.
+    if (snap.resultDelivery === "workflow") return;
     const parentVisible =
       snap.client === undefined && snap.resultDelivery === "parent";
     publishBrowserActivity(
@@ -559,12 +658,92 @@ export default function (pi: ExtensionAPI) {
     publishedActivity.clear();
     publishedStatus = undefined;
     ui?.setStatus("subagents", undefined);
+    const closingWorkflow = workflowManager;
+    workflowManager = undefined;
+    workflowLifecycle = undefined;
     const closing = runtime;
     runtime = undefined;
     managerPromise = undefined;
-    // Disposing the runtime runs the manager finalizer, which tears down all
-    // subagent scopes (and, later, their real child processes).
-    await closing?.dispose();
+    // Seal workflow state and propagate cancellation while the shared
+    // SubagentManager runtime is still alive, then dispose child scopes.
+    try {
+      await closingWorkflow?.shutdown("Session is shutting down");
+    } finally {
+      await closing?.dispose();
+    }
+  });
+
+  pi.registerTool({
+    name: "workflow",
+    label: "Workflow",
+    description: WORKFLOW_TOOL_DESCRIPTION,
+    promptSnippet: WORKFLOW_PROMPT_SNIPPET,
+    promptGuidelines: [...WORKFLOW_PROMPT_GUIDELINES],
+    parameters: WORKFLOW_TOOL_PARAMS,
+    async execute(
+      _toolCallId,
+      params: WorkflowToolParams,
+      _signal,
+      _onUpdate,
+      ctx,
+    ) {
+      const manager = await getManager();
+      const lifecycle = workflowLifecycle;
+      if (!lifecycle) throw new Error("Workflow lifecycle is not initialized.");
+      const context = {
+        sessionId: ctx.sessionManager.getSessionId(),
+        cwd: ctx.cwd,
+        userInput: userInputRevision,
+      };
+      if ("draftId" in params) {
+        const approved = lifecycle.approve(
+          params.draftId,
+          context,
+          workflowExecutionFor(ctx, manager),
+        );
+        return {
+          content: [{ type: "text", text: approved.message }],
+          details: {
+            kind: approved.kind,
+            draftId: approved.draftId,
+            runId: approved.run.id,
+            status: approved.run.status,
+          },
+        };
+      }
+
+      const request =
+        "source" in params
+          ? {
+              preview: params.preview,
+              source: params.source,
+              args: params.args,
+              background: params.background,
+            }
+          : "savedWorkflow" in params
+            ? {
+                preview: params.preview,
+                savedWorkflow: params.savedWorkflow,
+                args: params.args,
+                background: params.background,
+              }
+            : {
+                preview: params.preview,
+                spec: params.spec,
+                args: params.args,
+                background: params.background,
+              };
+      const prepared = lifecycle.prepare(request, context);
+      return {
+        content: [{ type: "text", text: prepared.message }],
+        details: {
+          kind: prepared.kind,
+          draftId: prepared.draft.draftId,
+          artifactPath: prepared.artifactPath,
+          executionSha256: prepared.draft.executionSha256,
+        },
+      };
+    },
   });
 
   // --- Tools -------------------------------------------------------------

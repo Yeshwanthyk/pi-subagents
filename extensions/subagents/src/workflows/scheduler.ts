@@ -596,8 +596,17 @@ export function computeSchedule(
   const readyTaskIds: string[] = [];
   const blockedTaskIds: string[] = [];
   const blockedByScope = new Map<string, ReadonlyArray<string>>();
+  // Queue admission is an ownership claim too. A queued writer must keep
+  // later overlapping writers out even before the shared manager admits it.
   const activeWriters = new Set(
-    [...active].filter((id) => owns(graph.tasksById.get(id)!).length > 0),
+    graph.declarationOrder.filter((id) => {
+      const task = graph.tasksById.get(id)!;
+      const status = statusOf(statuses, id);
+      return (
+        (active.has(id) || status === "queued" || status === "running") &&
+        owns(task).length > 0
+      );
+    }),
   );
 
   for (const taskId of graph.declarationOrder) {

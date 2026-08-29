@@ -11,7 +11,7 @@ import {
   workflowDraftArtifactPath,
   type WorkflowDraft,
 } from "./drafts.ts";
-import type { WorkflowManager } from "./manager.ts";
+import type { WorkflowExecutionOptions, WorkflowManager } from "./manager.ts";
 import { validateWorkflowDefinition } from "./graph.ts";
 import { decodeWorkflowSource } from "./sandbox.ts";
 import {
@@ -91,6 +91,8 @@ export interface WorkflowToolLifecycleOptions {
   readonly preparer: WorkflowDefinitionPreparer;
   readonly now?: () => number;
   readonly createDraftId?: () => string;
+  /** Detached execution context captured by the extension at approval time. */
+  readonly execution?: WorkflowExecutionOptions;
 }
 
 /** Tool-facing prepare/review/approve authority. It deliberately has no child executor. */
@@ -156,6 +158,7 @@ export class WorkflowToolLifecycle {
   approve(
     draftId: string,
     context: WorkflowPreparationContext,
+    execution?: WorkflowExecutionOptions,
   ): ApprovedWorkflowResult {
     const authoritative = this.pending.get(draftId);
     if (!authoritative) {
@@ -168,7 +171,10 @@ export class WorkflowToolLifecycle {
     assertWorkflowDraftApproved(authoritative, context);
 
     const created = this.options.manager.createRun(authoritative.definition);
-    const run = this.options.manager.start(created.id);
+    const run = this.options.manager.start(
+      created.id,
+      execution ?? this.options.execution,
+    );
     this.pending.delete(draftId);
     return {
       kind: "run",

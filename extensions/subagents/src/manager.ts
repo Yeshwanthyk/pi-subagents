@@ -40,7 +40,13 @@ import type {
   ParentRef,
   WorkflowOwnership,
 } from "./domain.ts";
-import { BackendUnavailableError, SendError, SpawnError } from "./domain.ts";
+import {
+  BackendUnavailableError,
+  SendError,
+  SpawnError,
+  WorkflowObservationLimitError,
+  WorkflowOwnershipError,
+} from "./domain.ts";
 
 export const MAX_RUNNING = 4;
 export const MAX_TRACKED = 64;
@@ -94,13 +100,32 @@ interface Entry {
   session?: SubagentSession;
   scope?: Scope.Closeable;
   pump?: Fiber.Fiber<void>;
-  admission?: Fiber.Fiber<void>;
+  admissionFiber?: Fiber.Fiber<void>;
+  /** Completes when admission starts, or when the entry settles before it. */
+  admission: Deferred.Deferred<SubagentSnapshot>;
   settlement: Deferred.Deferred<SubagentSnapshot>;
   slotHeld: boolean;
+  /** Number of active owner claims keeping this entry/handle available. */
+  workflowClaims: number;
   liveToolMap: Map<string, LiveToolState>;
   /** Idle restart dispatched but RunStarted not folded yet; counts as running
    * so concurrent restarts cannot race past the cap. */
   restarting?: boolean;
+}
+
+export interface WorkflowSubagentObservation {
+  readonly id: string;
+  readonly ownership: WorkflowOwnership;
+  /** Snapshot at claim time; use the manager view for live progress. */
+  readonly snapshot?: SubagentSnapshot;
+  /** Resolves once admission starts or reaches terminal state first. */
+  readonly admission: Effect.Effect<SubagentSnapshot>;
+  /** Resolves once the child reaches its first terminal settlement. */
+  readonly settlement: Effect.Effect<SubagentSnapshot>;
+  /** Current live snapshot, if it has not been pruned. */
+  readonly get: () => SubagentSnapshot | undefined;
+  /** Releases the retention claim. Safe to call more than once. */
+  readonly release: Effect.Effect<void>;
 }
 
 // --- Read model ----------------------------------------------------------------
@@ -135,7 +160,7 @@ export interface SubagentReadModel {
  */
 export function parentSubagentView(view: SubagentReadModel): SubagentReadModel {
   const isVisible = (snapshot: SubagentSnapshot) =>
-    snapshot.client === undefined;
+    snapshot.client === undefined && snapshot.resultDelivery !== "workflow";
   const included = (snapshot: SubagentSnapshot | undefined) =>
     snapshot !== undefined && isVisible(snapshot) ? snapshot : undefined;
 
@@ -186,7 +211,31 @@ export interface SubagentManagerApi {
    * safe even when the child is still queued; the per-entry settlement is
    * completed exactly once and survives later snapshot pruning.
    */
-  awaitSettlement(id: string): Effect.Effect<SubagentSnapshot | undefined>;
+  awaitSettlement(
+    id: string,
+    expectedWorkflow?: WorkflowOwnership,
+  ): Effect.Effect<SubagentSnapshot | undefined, WorkflowOwnershipError>;
+  /** Wait until admission starts or reaches terminal state first. */
+  readonly awaitAdmission?: (
+    id: string,
+    expectedWorkflow?: WorkflowOwnership,
+  ) => Effect.Effect<SubagentSnapshot | undefined, WorkflowOwnershipError>;
+  /** Claim a workflow child without replacing the manager's global settle hook. */
+  readonly observeWorkflow?: (
+    id: string,
+    expectedWorkflow: WorkflowOwnership,
+  ) => Effect.Effect<
+    WorkflowSubagentObservation | undefined,
+    WorkflowOwnershipError | WorkflowObservationLimitError
+  >;
+  /** Alias that makes the retention responsibility explicit at call sites. */
+  readonly claimWorkflow?: (
+    id: string,
+    expectedWorkflow: WorkflowOwnership,
+  ) => Effect.Effect<
+    WorkflowSubagentObservation | undefined,
+    WorkflowOwnershipError | WorkflowObservationLimitError
+  >;
   /**
    * Wait until all listed subagents are settled. Unknown ids are treated as
    * settled (the tool layer validates ids first). While waiting, settles for
@@ -215,6 +264,16 @@ export class SubagentManager extends Context.Service<
 
 // --- Implementation --------------------------------------------------------------
 
+/** Bounded late-lookup window for settlement/admission observations. */
+export const MAX_SETTLEMENT_HANDLES = MAX_TRACKED * 8;
+
+interface ObservationHandle {
+  readonly workflow?: WorkflowOwnership;
+  readonly admission: Deferred.Deferred<SubagentSnapshot>;
+  readonly settlement: Deferred.Deferred<SubagentSnapshot>;
+  claims: number;
+}
+
 const makeManager = Effect.gen(function* () {
   const registry = yield* BackendRegistry;
   // Detached forker for sync contexts (read-model commands, pruning) that
@@ -222,6 +281,10 @@ const makeManager = Effect.gen(function* () {
   const runDetached = Effect.runForkWith(yield* Effect.context());
 
   const entries = new Map<string, Entry>();
+  /** Stable lifecycle handles outlive snapshot pruning for bounded consumers. */
+  const settlementHandles = new Map<string, ObservationHandle>();
+  const settlementOrder: string[] = [];
+  let workflowClaimCount = 0;
   const waitInterest = new Map<string, number>();
   const listeners = new Set<() => void>();
   /** One-shot nextChange waiters, swapped out before invocation so waiters
@@ -292,7 +355,8 @@ const makeManager = Effect.gen(function* () {
       .filter(
         (e) =>
           (e.snapshot.status === "done" || e.snapshot.status === "error") &&
-          !waitInterest.has(e.snapshot.id),
+          !waitInterest.has(e.snapshot.id) &&
+          e.workflowClaims === 0,
       )
       .sort(
         (a, b) =>
@@ -314,6 +378,27 @@ const makeManager = Effect.gen(function* () {
     if (!entry.slotHeld) return;
     entry.slotHeld = false;
     activeSlots = Math.max(0, activeSlots - 1);
+  };
+
+  const trimSettlementHandles = () => {
+    let protectedSeen = 0;
+    while (
+      settlementHandles.size > MAX_SETTLEMENT_HANDLES &&
+      settlementOrder.length > 0
+    ) {
+      const id = settlementOrder.shift();
+      if (id === undefined) break;
+      const handle = settlementHandles.get(id);
+      if (!handle) continue;
+      if (entries.has(id) || handle.claims > 0) {
+        settlementOrder.push(id);
+        protectedSeen++;
+        if (protectedSeen >= settlementOrder.length) break;
+        continue;
+      }
+      settlementHandles.delete(id);
+      protectedSeen = 0;
+    }
   };
 
   const settle = (entry: Entry, outcome: RunOutcome) => {
@@ -345,7 +430,11 @@ const makeManager = Effect.gen(function* () {
     entry.liveToolMap.clear();
     s.liveTools = [];
     s.queued = [];
-    Deferred.doneUnsafe(entry.settlement, Effect.succeed<SubagentSnapshot>(s));
+    const terminal = Effect.succeed<SubagentSnapshot>(s);
+    // Per-entry deferreds plus the terminal guard make result publication and
+    // slot release exactly once even when cancellation races backend events.
+    Deferred.doneUnsafe(entry.admission, terminal);
+    Deferred.doneUnsafe(entry.settlement, terminal);
     releaseSlot(entry);
     // Refill capacity before publishing settlement so synchronous listeners
     // cannot let a restarted session leapfrog already-queued work.
@@ -359,6 +448,7 @@ const makeManager = Effect.gen(function* () {
       // The parent session may be unavailable; settlement stays final.
     }
     pruneSettled();
+    trimSettlementHandles();
   };
 
   const foldEvent = (entry: Entry, event: SubagentEvent) => {
@@ -495,6 +585,10 @@ const makeManager = Effect.gen(function* () {
           entry.snapshot.status = "running";
           entry.snapshot.startedAt = startedAt;
           entry.snapshot.lastActivityAt = startedAt;
+          Deferred.doneUnsafe(
+            entry.admission,
+            Effect.succeed<SubagentSnapshot>(entry.snapshot),
+          );
 
           // Pump: fold the event stream into the snapshot. Tied to the entry
           // scope, so closing the scope stops it. If the stream ends while the
@@ -543,9 +637,9 @@ const makeManager = Effect.gen(function* () {
       entry.slotHeld = true;
       activeSlots++;
       const fiber = runDetached(admitEntry(entry));
-      entry.admission = fiber;
+      entry.admissionFiber = fiber;
       fiber.addObserver(() => {
-        if (entry.admission === fiber) entry.admission = undefined;
+        if (entry.admissionFiber === fiber) entry.admissionFiber = undefined;
       });
     }
   };
@@ -568,6 +662,11 @@ const makeManager = Effect.gen(function* () {
           });
         }
 
+        if (task.resultDelivery === "workflow" && task.workflow === undefined) {
+          return new SpawnError({
+            message: 'resultDelivery "workflow" requires WorkflowOwnership.',
+          });
+        }
         const id = `sa-${++counter}`;
         const now = Date.now();
         const parentRef: ParentRef = task.parentRef
@@ -582,8 +681,16 @@ const makeManager = Effect.gen(function* () {
             backend: backendName,
             owner: task.owner ?? "subagents",
             workflow: task.workflow ? { ...task.workflow } : undefined,
-            resultDelivery: task.resultDelivery ?? "parent",
-            client: task.client ? { ...task.client } : undefined,
+            // Workflow children use a private result lane. Backends only see
+            // the opaque SpawnTask metadata and never learn workflow rules.
+            resultDelivery: task.workflow
+              ? "workflow"
+              : (task.resultDelivery ?? "parent"),
+            client: task.workflow
+              ? undefined
+              : task.client
+                ? { ...task.client }
+                : undefined,
             parentRef,
             title: task.title,
             prompt: task.prompt,
@@ -605,14 +712,28 @@ const makeManager = Effect.gen(function* () {
             finalText: "",
             turns: 0,
           },
+          admission: Deferred.makeUnsafe<SubagentSnapshot>(),
           settlement: Deferred.makeUnsafe<SubagentSnapshot>(),
           slotHeld: false,
+          workflowClaims: 0,
           liveToolMap: new Map(),
         };
         entries.set(id, entry);
+        settlementHandles.set(id, {
+          // Keep ownership separate from the mutable live snapshot; validation
+          // must not be bypassed by a reader mutating its returned object.
+          workflow: entry.snapshot.workflow
+            ? { ...entry.snapshot.workflow }
+            : undefined,
+          admission: entry.admission,
+          settlement: entry.settlement,
+          claims: 0,
+        });
+        settlementOrder.push(id);
         admissionQueue.push(entry);
         notify(id);
         drainQueue();
+        trimSettlementHandles();
         return Effect.succeed<SubagentSnapshot>(entry.snapshot);
       },
     );
@@ -649,8 +770,8 @@ const makeManager = Effect.gen(function* () {
   const abortEntry = (entry: Entry) =>
     Effect.gen(function* () {
       if (entry.snapshot.status === "queued") {
-        if (entry.admission) {
-          yield* Fiber.interrupt(entry.admission).pipe(Effect.ignore);
+        if (entry.admissionFiber) {
+          yield* Fiber.interrupt(entry.admissionFiber).pipe(Effect.ignore);
         }
         yield* closeEntryScope(entry).pipe(
           Effect.timeout(STOP_TIMEOUT_MS),
@@ -680,6 +801,11 @@ const makeManager = Effect.gen(function* () {
           Effect.timeout(STOP_TIMEOUT_MS),
           Effect.ignore,
         );
+      } else {
+        // Some backends acknowledge interrupt before their notification
+        // pump publishes RunSettled. Seal the manager record here so a
+        // concurrent cancel cannot wait forever; any late event is ignored.
+        yield* Effect.sync(() => settle(entry, { _tag: "Interrupted" }));
       }
     });
 
@@ -796,8 +922,8 @@ const makeManager = Effect.gen(function* () {
     yield* Effect.forEach(
       all,
       (entry) =>
-        entry.admission
-          ? Fiber.interrupt(entry.admission).pipe(Effect.ignore)
+        entry.admissionFiber
+          ? Fiber.interrupt(entry.admissionFiber).pipe(Effect.ignore)
           : Effect.void,
       { concurrency: "unbounded" },
     );
@@ -867,17 +993,90 @@ const makeManager = Effect.gen(function* () {
   // the extension forgot to call disposeAll explicitly.
   yield* Effect.addFinalizer(() => disposeAll);
 
-  const awaitSettlement = (id: string) =>
+  const sameWorkflow = (
+    actual: WorkflowOwnership | undefined,
+    expected: WorkflowOwnership,
+  ) => actual?.runId === expected.runId && actual.taskId === expected.taskId;
+
+  const handleFor = (id: string, expected?: WorkflowOwnership) =>
     Effect.suspend(() => {
-      const entry = entries.get(id);
-      return entry
-        ? Deferred.await(entry.settlement)
-        : Effect.succeed(undefined);
+      const handle = settlementHandles.get(id);
+      if (!handle || expected === undefined) return Effect.succeed(handle);
+      if (!sameWorkflow(handle.workflow, expected)) {
+        return Effect.fail(
+          new WorkflowOwnershipError({
+            message: `Subagent "${id}" is not owned by workflow "${expected.runId}/${expected.taskId}".`,
+            subagentId: id,
+            expected: { ...expected },
+            actual: handle.workflow ? { ...handle.workflow } : undefined,
+          }),
+        );
+      }
+      return Effect.succeed(handle);
     });
+
+  const awaitSettlement = (id: string, expectedWorkflow?: WorkflowOwnership) =>
+    handleFor(id, expectedWorkflow).pipe(
+      Effect.flatMap((handle) =>
+        handle ? Deferred.await(handle.settlement) : Effect.succeed(undefined),
+      ),
+    );
+
+  const awaitAdmission = (id: string, expectedWorkflow?: WorkflowOwnership) =>
+    handleFor(id, expectedWorkflow).pipe(
+      Effect.flatMap((handle) =>
+        handle ? Deferred.await(handle.admission) : Effect.succeed(undefined),
+      ),
+    );
+
+  const observeWorkflow = (id: string, expectedWorkflow: WorkflowOwnership) =>
+    handleFor(id, expectedWorkflow).pipe(
+      Effect.flatMap((handle) => {
+        if (!handle) return Effect.succeed(undefined);
+        if (
+          handle.claims === 0 &&
+          workflowClaimCount >= MAX_SETTLEMENT_HANDLES
+        ) {
+          return Effect.fail(
+            new WorkflowObservationLimitError({
+              message: `At most ${MAX_SETTLEMENT_HANDLES} workflow observations may be retained at once.`,
+            }),
+          );
+        }
+        handle.claims++;
+        workflowClaimCount++;
+        const entry = entries.get(id);
+        if (entry) entry.workflowClaims++;
+        let released = false;
+        const release = Effect.sync(() => {
+          if (released) return;
+          released = true;
+          handle.claims = Math.max(0, handle.claims - 1);
+          workflowClaimCount = Math.max(0, workflowClaimCount - 1);
+          const current = entries.get(id);
+          if (current)
+            current.workflowClaims = Math.max(0, current.workflowClaims - 1);
+          pruneSettled();
+          trimSettlementHandles();
+        });
+        return Effect.succeed<WorkflowSubagentObservation>({
+          id,
+          ownership: { ...expectedWorkflow },
+          snapshot: entries.get(id)?.snapshot,
+          admission: Deferred.await(handle.admission),
+          settlement: Deferred.await(handle.settlement),
+          get: () => entries.get(id)?.snapshot,
+          release,
+        });
+      }),
+    );
 
   return SubagentManager.of({
     spawn,
     awaitSettlement,
+    awaitAdmission,
+    observeWorkflow,
+    claimWorkflow: observeWorkflow,
     waitFor,
     cancel,
     send,

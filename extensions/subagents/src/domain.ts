@@ -40,7 +40,8 @@ export function isReasoningEffort(
 
 export type SubagentStatus = "queued" | "running" | "done" | "error";
 export type TerminalSubagentStatus = Extract<SubagentStatus, "done" | "error">;
-export type SubagentResultDelivery = "parent" | "client";
+/** Terminal output is consumed by the workflow owner and never delivered to a parent/client channel. */
+export type SubagentResultDelivery = "parent" | "client" | "workflow";
 
 /** Stable correlation for a child admitted on behalf of a workflow task. */
 export interface WorkflowOwnership {
@@ -323,5 +324,21 @@ export class ConcurrencyLimitError extends Data.TaggedError(
 }> {}
 
 export class SendError extends Data.TaggedError("SendError")<{
+  readonly message: string;
+}> {}
+
+/** A workflow observation may only read the child ownership it was given. */
+export class WorkflowOwnershipError extends Data.TaggedError(
+  "WorkflowOwnershipError",
+)<{
+  readonly message: string;
+  readonly subagentId: string;
+  readonly expected: WorkflowOwnership;
+  readonly actual?: WorkflowOwnership;
+}> {}
+
+export class WorkflowObservationLimitError extends Data.TaggedError(
+  "WorkflowObservationLimitError",
+)<{
   readonly message: string;
 }> {}

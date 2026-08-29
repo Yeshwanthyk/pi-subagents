@@ -24,7 +24,7 @@ export const WORKFLOW_TOOL_DESCRIPTION = [
   "Do not use concurrency, agent(), parallel(), or pipeline(); do not add imports, callbacks, identifiers, spreads, computed keys, templates, getters, filesystem/network/process/timer access, or imperative scheduling. The only source call is the outer flow(...).",
   "After showing the preview and exact immutable artifact to the user, wait for a newer explicit user response. Approval accepts only the exact draftId. It fails closed unless persisted and process-memory metadata agree and the session and project are unchanged.",
   "Saved definitions are discovered with project precedence and snapshotted at preparation. Later edits to the saved file never alter the reviewed draft.",
-  "Approval only creates the Slice 2 workflow run. Child scheduling and execution are separate later lifecycle stages.",
+  "Approval registers the immutable graph, returns its run ID immediately, and starts detached background scheduling; child results stay in the workflow owner and are not delivered to the parent/client channels.",
 ].join("\n");
 
 export const WORKFLOW_PROMPT_SNIPPET =
@@ -75,6 +75,6 @@ export function buildWorkflowApprovalMessage(options: {
 }): string {
   return [
     `Workflow draft ${options.draftId} approved as run ${options.runId}.`,
-    "The immutable graph is registered; child execution is not implemented in this slice.",
+    "The immutable graph is registered and detached background execution has started. Child results stay with this workflow; use the run ID to inspect it in a later workflow surface.",
   ].join("\n");
 }

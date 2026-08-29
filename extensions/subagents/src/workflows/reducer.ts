@@ -346,10 +346,14 @@ export function reduceWorkflowEvent(
     }
 
     case "TaskFailed": {
-      // running -> failed, descendants -> skipped
+      // running/queued/ready -> failed, descendants -> skipped
       assertRunning(state, event);
       const task = requireTask(state, event.taskId);
-      if (task.status !== "running") {
+      if (
+        task.status !== "running" &&
+        task.status !== "queued" &&
+        task.status !== "ready"
+      ) {
         throw new WorkflowInvariantError(
           `Task "${event.taskId}" cannot fail from ${task.status}.`,
         );
@@ -366,10 +370,15 @@ export function reduceWorkflowEvent(
     }
 
     case "TaskCancelled": {
-      // running -> cancelled
+      // running/queued/ready/blocked -> cancelled
       assertRunning(state, event);
       const task = requireTask(state, event.taskId);
-      if (task.status !== "running") {
+      if (
+        task.status !== "running" &&
+        task.status !== "queued" &&
+        task.status !== "ready" &&
+        task.status !== "blocked"
+      ) {
         throw new WorkflowInvariantError(
           `Task "${event.taskId}" cannot cancel from ${task.status}.`,
         );
