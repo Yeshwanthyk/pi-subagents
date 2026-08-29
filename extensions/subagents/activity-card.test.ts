@@ -164,6 +164,28 @@ test("active-work rail collapses to one useful row at phone widths", () => {
   assert.match(lines[0] ?? "", /ctrl\+shift\+a/);
 });
 
+test("workflow activity rail advertises the workflow dashboard shortcut", () => {
+  const item: ActiveWorkItem = {
+    version: 1,
+    key: "workflow:wf-1",
+    kind: "workflow",
+    label: "wf-1 · verify",
+    status: "running",
+    summary: "1 running",
+    runningProcesses: 1,
+    startedAt: 1_000,
+    lastActivityAt: 2_000,
+  };
+  assert.match(
+    renderActiveWorkRail([item], theme, 3_000, [], 48)[0] ?? "",
+    /ctrl\+shift\+z/,
+  );
+  assert.match(
+    renderActiveWorkRail([item], theme, 3_000, [], 32)[0] ?? "",
+    /\^⇧Z$/,
+  );
+});
+
 test("active-work rail retains essentials below 40 columns", () => {
   const items: ActiveWorkItem[] = [
     {

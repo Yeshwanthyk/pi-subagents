@@ -109,6 +109,7 @@ import {
 } from "./src/workflows/tools.ts";
 import { WorkflowControls } from "./src/workflows/controls.ts";
 import { showWorkflowDraftReview } from "./src/workflows/draft-review.ts";
+import { openWorkflowDashboard } from "./src/ui/workflow-dashboard.ts";
 import {
   loadWorkflowDraft,
   workflowDraftArtifactPath,
@@ -1725,23 +1726,23 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const manager = await getManager();
-        await runHeadlessSubagentsDialog(dialogUI, operatorView(manager));
+        await runHeadlessSubagentsDialog(dialogUI, standardView(manager));
         return;
       }
       const manager = await getManager();
-      if (operatorView(manager).size() === 0) {
+      if (standardView(manager).size() === 0) {
         ctx.ui.notify(
           "No subagents yet. The agent spawns them with subagent_spawn.",
           "info",
         );
         return;
       }
-      await openSubagentPicker(ctx, operatorView(manager));
+      await openSubagentPicker(ctx, standardView(manager));
     },
   });
 
   pi.registerShortcut("ctrl+shift+a", {
-    description: "Open the subagents and workflow-child dashboard",
+    description: "Toggle the direct subagents dashboard",
     handler: async (ctx) => {
       if (ctx.mode !== "tui") {
         if (ctx.hasUI)
@@ -1752,14 +1753,38 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const manager = await getManager();
-      if (operatorView(manager).size() === 0) {
+      if (standardView(manager).size() === 0) {
         ctx.ui.notify(
           "No subagents yet. The agent spawns them with subagent_spawn.",
           "info",
         );
         return;
       }
-      await openSubagentPicker(ctx, operatorView(manager));
+      await openSubagentPicker(ctx, standardView(manager));
+    },
+  });
+
+  pi.registerShortcut("ctrl+shift+z", {
+    description: "Toggle the workflow dashboard",
+    handler: async (ctx) => {
+      if (ctx.mode !== "tui") {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "Workflow dashboard is only available in the TUI",
+            "error",
+          );
+        return;
+      }
+      const manager = await getManager();
+      const workflows = workflowManager;
+      if (!workflows || workflows.list().length === 0) {
+        ctx.ui.notify(
+          "No workflow runs yet. Prepare and approve a workflow first.",
+          "info",
+        );
+        return;
+      }
+      await openWorkflowDashboard(ctx, workflows, operatorView(manager));
     },
   });
 }

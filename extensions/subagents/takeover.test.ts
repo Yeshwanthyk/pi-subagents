@@ -9,6 +9,7 @@ import type { TUI } from "@earendil-works/pi-tui";
 import type { SubagentSnapshot } from "./src/domain.ts";
 import {
   cycleSubagentId,
+  openSubagent,
   openSubagentPicker,
   orderDashboardSnapshots,
   reconcileDashboardSelection,
@@ -342,4 +343,78 @@ test("empty input stays empty and the input array is not mutated", () => {
     subs.map((s) => s.id),
     idsBefore,
   );
+});
+
+test("read-only takeover hides mutation controls and ignores mutation input", async () => {
+  const toggleInput = "\x1b[122;6u";
+  // SAFETY: This fixture provides the terminal and render callback used by TakeoverView.
+  const tui = Object.assign(Object.create(null) as TUI, {
+    terminal: { columns: 80, rows: 20 },
+    requestRender() {},
+  });
+  let sends = 0;
+  let aborts = 0;
+  const view = Object.assign(Object.create(null), {
+    get: (id: string) => (id === "sa-1" ? snapshot() : undefined),
+    list: () => [snapshot()],
+    subscribeTo: () => () => {},
+    subscribe: () => () => {},
+    requestSend: () => {
+      sends += 1;
+    },
+    requestAbort: () => {
+      aborts += 1;
+    },
+  });
+  const keybindings = Object.assign(Object.create(null), {
+    matches: (data: string, action: string) => {
+      if (action === "app.clear") return data === "abort";
+      if (action === "tui.input.submit") return data === "enter";
+      return false;
+    },
+    getKeys: () => [],
+  });
+  // SAFETY: This fixture implements the keybinding methods exercised by the read-only view.
+  const typedKeybindings = keybindings as KeybindingsManager;
+  type TestComponent = {
+    handleInput(data: string): void;
+    render(width: number): string[];
+  };
+  let component!: TestComponent;
+  const custom = async <T>(
+    factory: (
+      tui: TUI,
+      theme: Theme,
+      keybindings: KeybindingsManager,
+      done: (value: T) => void,
+    ) => TestComponent,
+  ): Promise<T> =>
+    new Promise((resolve) => {
+      component = factory(tui, theme, typedKeybindings, resolve);
+    });
+  // SAFETY: This fixture supplies the TUI custom overlay surface used by openSubagent.
+  const ctx = Object.assign(Object.create(null), {
+    mode: "tui",
+    ui: { custom },
+  }) as Parameters<typeof openSubagent>[0];
+  const promise = openSubagent(ctx, view, "sa-1", {
+    readOnly: true,
+    toggleShortcut: "ctrl+shift+z",
+  });
+
+  component.handleInput("x");
+  component.handleInput("enter");
+  component.handleInput("abort");
+  const rendered = component.render(80).join("\n");
+  assert.match(rendered, /READ ONLY/);
+  assert.doesNotMatch(rendered, /send|abort/);
+  assert.equal(sends, 0);
+  assert.equal(aborts, 0);
+  for (const rows of [5, 8]) {
+    tui.terminal.rows = rows;
+    assert.ok(component.render(80).length <= rows - 1);
+  }
+  component.handleInput(toggleInput);
+  component.handleInput(toggleInput);
+  assert.equal(await promise, true);
 });

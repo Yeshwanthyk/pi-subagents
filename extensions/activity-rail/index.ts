@@ -68,7 +68,14 @@ function compactRailLine(
   const extraNarrow = width < 40;
   // Below 40 columns, conventional key/state symbols preserve every useful
   // field instead of allowing truncation to hide the shortcut or identity.
-  const shortcut = extraNarrow ? "^⇧A" : "ctrl+shift+a";
+  const workflow = firstItem?.kind === "workflow";
+  const shortcut = extraNarrow
+    ? workflow
+      ? "^⇧Z"
+      : "^⇧A"
+    : workflow
+      ? "ctrl+shift+z"
+      : "ctrl+shift+a";
   const prefix = theme.fg(
     items.length > 0 ? "warning" : "muted",
     extraNarrow ? `${items.length}a · ` : `${items.length} active · `,
