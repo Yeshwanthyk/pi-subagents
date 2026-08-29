@@ -108,6 +108,8 @@ import {
   type WorkflowControlRequest,
 } from "./src/workflows/tools.ts";
 import { WorkflowControls } from "./src/workflows/controls.ts";
+import { showWorkflowDraftReview } from "./src/workflows/draft-review.ts";
+import { workflowDraftArtifactPath } from "./src/workflows/drafts.ts";
 import {
   WORKFLOW_CHECK_TOOL_DESCRIPTION,
   WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS,
@@ -1020,6 +1022,162 @@ export default function (pi: ExtensionAPI) {
         ],
         details,
       };
+    },
+  });
+
+  pi.registerCommand("workflow-draft", {
+    description: "Review a pending workflow draft and its exact source/spec",
+    getArgumentCompletions: (prefix) => {
+      const matches = (workflowLifecycle?.listPending() ?? [])
+        .filter((draft) => draft.draftId.startsWith(prefix))
+        .sort((left, right) => right.createdAt - left.createdAt)
+        .map((draft) => ({
+          value: draft.draftId,
+          label: draft.draftId,
+          description: draft.definition.name ?? draft.preview.split("\n", 1)[0],
+        }));
+      return matches.length > 0 ? matches : null;
+    },
+    handler: async (rawArgs, ctx) => {
+      await getManager();
+      const lifecycle = workflowLifecycle;
+      if (!lifecycle) {
+        ctx.ui.notify("Workflow lifecycle is not initialized.", "error");
+        return;
+      }
+      const query = rawArgs.trim();
+      const available = [
+        ...lifecycle.listPending({
+          sessionId: ctx.sessionManager.getSessionId(),
+          cwd: ctx.cwd,
+        }),
+      ].sort((left, right) => right.createdAt - left.createdAt);
+      const matches = query
+        ? available.filter(
+            (draft) => draft.draftId === query || draft.draftId.endsWith(query),
+          )
+        : available.slice(0, 1);
+      if (matches.length !== 1) {
+        ctx.ui.notify(
+          query
+            ? `No unique pending workflow draft matching "${query}".`
+            : "No pending workflow drafts in this session.",
+          "warning",
+        );
+        return;
+      }
+      const draft = matches[0];
+      if (!draft) return;
+      await showWorkflowDraftReview(
+        ctx,
+        draft,
+        workflowDraftArtifactPath(
+          path.join(getAgentDir(), "workflows"),
+          draft.draftId,
+        ),
+      );
+    },
+  });
+
+  pi.registerCommand("workflows", {
+    description: "List workflow runs (`/workflows <runId>` for detail)",
+    handler: async (rawArgs, ctx) => {
+      const manager = await getManager();
+      const runs = workflowManager?.list() ?? [];
+      if (runs.length === 0) {
+        ctx.ui.notify("No workflow runs yet.", "info");
+        return;
+      }
+      const query = rawArgs.trim();
+      if (query) {
+        const matches = runs.filter(
+          (run) => run.id === query || run.id.endsWith(query),
+        );
+        const run = matches.length === 1 ? matches[0] : undefined;
+        if (!run) {
+          ctx.ui.notify(
+            `No unique workflow run matching "${query}".`,
+            "warning",
+          );
+          return;
+        }
+        ctx.ui.notify(inspectWorkflow(manager, run.id).text, "info");
+        return;
+      }
+      if (!ctx.hasUI) {
+        ctx.ui.notify(formatWorkflowList(runs), "info");
+        return;
+      }
+      const labels = runs.map((run) => {
+        const completed = Object.values(run.tasks).filter(
+          (task) => task.status === "completed",
+        ).length;
+        return `${run.id}  ${run.status}  ${run.definition.name ?? "workflow"}  ${completed}/${run.definition.tasks.length}`;
+      });
+      const selected = await ctx.ui.select("Workflow runs", labels);
+      if (!selected) return;
+      const run = runs[labels.indexOf(selected)];
+      if (run) ctx.ui.notify(inspectWorkflow(manager, run.id).text, "info");
+    },
+  });
+
+  pi.registerCommand("workflow-saved", {
+    description: "List validated saved workflow definitions",
+    getArgumentCompletions: (prefix) => {
+      try {
+        const cwd = sessionContext?.cwd ?? process.cwd();
+        const matches = (workflowLifecycle?.discoverSaved({ cwd }) ?? [])
+          .filter((workflow) => workflow.name.startsWith(prefix))
+          .map((workflow) => ({
+            value: workflow.name,
+            label: workflow.name,
+            description: workflow.path,
+          }));
+        return matches.length > 0 ? matches : null;
+      } catch {
+        return null;
+      }
+    },
+    handler: async (rawArgs, ctx) => {
+      await getManager();
+      const lifecycle = workflowLifecycle;
+      if (!lifecycle) {
+        ctx.ui.notify("Workflow lifecycle is not initialized.", "error");
+        return;
+      }
+      let saved;
+      try {
+        saved = lifecycle.discoverSaved({ cwd: ctx.cwd });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Saved workflow discovery failed: ${message}`, "error");
+        return;
+      }
+      const query = rawArgs.trim();
+      const matches = query
+        ? saved.filter(
+            (workflow) =>
+              workflow.name === query || workflow.name.startsWith(query),
+          )
+        : saved;
+      if (matches.length === 0) {
+        ctx.ui.notify(
+          query
+            ? `No saved workflow matching "${query}".`
+            : "No saved workflows found.",
+          "warning",
+        );
+        return;
+      }
+      ctx.ui.notify(
+        matches
+          .map(
+            (workflow) =>
+              `${workflow.name} [${workflow.scope}]\n  ${workflow.path}`,
+          )
+          .join("\n"),
+        "info",
+      );
     },
   });
 

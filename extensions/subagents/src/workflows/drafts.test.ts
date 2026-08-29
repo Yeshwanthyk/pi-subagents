@@ -244,7 +244,7 @@ test("tool preparation never creates a run and exact later approval creates no c
   );
 
   assert.equal(manager.list().length, 0);
-  assert.match(prepared.message, /no workflow run or child agent started/i);
+  assert.match(prepared.message, /immutable · not started/i);
   assert.throws(
     () =>
       tools.approve(prepared.draft.draftId, {
@@ -402,8 +402,13 @@ test("prompt contract makes prepare, review, and exact later approval explicit",
   assert.match(WORKFLOW_TOOL_DESCRIPTION, /newer explicit user response/i);
   assert.match(WORKFLOW_TOOL_DESCRIPTION, /only the exact draftId/i);
   assert.match(WORKFLOW_TOOL_DESCRIPTION, /process-memory metadata agree/i);
-  assert.match(message, /Execution digest:/);
-  assert.match(message, /exact immutable source\/spec/i);
-  assert.match(message, /newer explicit user response/i);
-  assert.match(message, /using only the exact draftId/i);
+  assert.match(message, /Draft prepared/);
+  assert.match(message, /immutable · not started/);
+  assert.match(message, new RegExp(`/workflow-draft ${draft.draftId}`));
+  assert.match(
+    message,
+    new RegExp(`Approve later with only: ${draft.draftId}`),
+  );
+  assert.doesNotMatch(message, /Review this exact graph/);
+  assert.equal(message.split("\n").length, 5);
 });

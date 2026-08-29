@@ -78,17 +78,13 @@ export function buildWorkflowDraftMessage(options: {
   readonly artifactPath: string;
 }): string {
   const { draft } = options;
+  const name = draft.definition.name ?? "workflow";
   const lines = [
-    `Workflow draft ${draft.definition.name ? `"${draft.definition.name}"` : draft.draftId} prepared — no workflow run or child agent started.`,
-    `Draft: ${draft.draftId}`,
-    `Execution digest: ${draft.executionSha256}`,
+    `Draft prepared · ${name}`,
+    `${draft.draftId} · ${draft.executionSha256.slice(0, 12)} · immutable · not started`,
+    `Review: /workflow-draft ${draft.draftId}`,
     `Artifact: ${shortenHome(options.artifactPath)}`,
-    "Review the preview and exact immutable source/spec in that artifact.",
-    "",
-    "Preview:",
-    draft.preview,
-    "",
-    "Approve only after reviewing it. Approval requires a newer explicit user response in this same session and project, using only the exact draftId.",
+    `Approve later with only: ${draft.draftId}`,
   ];
   return lines.join("\n");
 }
