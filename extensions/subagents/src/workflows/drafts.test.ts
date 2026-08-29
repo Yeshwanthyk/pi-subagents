@@ -15,6 +15,7 @@ import { WorkflowManager } from "./manager.ts";
 import {
   buildWorkflowDraftMessage,
   WORKFLOW_TOOL_DESCRIPTION,
+  WORKFLOW_PROMPT_GUIDELINES,
 } from "./prompt.ts";
 import {
   listSavedWorkflows,
@@ -405,10 +406,8 @@ test("prompt contract makes prepare, review, and exact later approval explicit",
   assert.match(message, /Draft prepared/);
   assert.match(message, /immutable · not started/);
   assert.match(message, new RegExp(`/workflow-draft ${draft.draftId}`));
-  assert.match(
-    message,
-    new RegExp(`Approve later with only: ${draft.draftId}`),
-  );
   assert.doesNotMatch(message, /Review this exact graph/);
-  assert.equal(message.split("\n").length, 5);
+  assert.equal(message.split("\n").length, 2);
+  assert.match(WORKFLOW_TOOL_DESCRIPTION, /normal assistant response/i);
+  assert.match(WORKFLOW_PROMPT_GUIDELINES.join("\n"), /task wiring\/scopes/i);
 });

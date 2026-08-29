@@ -938,6 +938,15 @@ export default function (pi: ExtensionAPI) {
           draftId: prepared.draft.draftId,
           artifactPath: prepared.artifactPath,
           executionSha256: prepared.draft.executionSha256,
+          preview: prepared.draft.preview,
+          tasks: prepared.draft.definition.tasks.map((task) => ({
+            id: task.id,
+            label: task.label,
+            needs: task.needs ?? [],
+            readOnly: task.readOnly === true,
+            owns: task.owns ?? [],
+          })),
+          reviewCommand: `/workflow-draft ${prepared.draft.draftId}`,
         },
       };
     },
