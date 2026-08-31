@@ -39,7 +39,7 @@ This model is intentionally simpler than this checkout's workflow authority: it 
 
 ## Concrete minimal distinct shape: `Ctrl+Shift+Z`
 
-This is a recommendation, not an implementation. It should be a **workflow-only inspector**, not a copy of upstream's FleetView or a renamed `/subagents` dashboard.
+This is the implemented direction. The local surface is a **workflow-only inspector**, not a copy of upstream's FleetView or a renamed `/subagents` dashboard. Lifecycle controls remain tool-authoritative in this slice; the inspector is read-only apart from opening a child view.
 
 1. **Registration/entry:** register `Ctrl+Shift+Z` in `extensions/subagents/index.ts`. In TUI mode, call a new `openWorkflowPicker(ctx, workflowManager, manager.view)`; if there are no runs, notify `No workflow runs yet.` and do not open an empty frame. Keep `/workflows` and existing tools unchanged.
 2. **One overlay, two levels:** use a compact centered overlay with a stable two-column frame:

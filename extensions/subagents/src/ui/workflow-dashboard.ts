@@ -21,9 +21,10 @@ import type { WorkflowManager } from "../workflows/manager.ts";
 import { openSubagent } from "./takeover.ts";
 
 const TWO_PANE_MIN_WIDTH = 92;
+const MAX_DASHBOARD_ROWS = 22;
 
-type Pane = "runs" | "tasks";
-type NarrowLevel = "runs" | "tasks";
+type Mode = "overview" | "tasks";
+type Focus = "list" | "inspector";
 export type WorkflowDashboardResult =
   | { readonly kind: "close" }
   | { readonly kind: "toggle" }
@@ -80,6 +81,23 @@ function panel(
     truncateToWidth(theme.fg(color, `╰${"─".repeat(inner)}╯`), safeWidth, ""),
   );
   return output;
+}
+
+/** Fill a selected row so the focus cue remains visible without relying on color alone. */
+function selectedLine(text: string, width: number, theme: Theme): string {
+  const line = pad(text, width);
+  return theme.bg?.("selectedBg", line) ?? line;
+}
+
+export function workflowStatusLabel(status: string): string {
+  switch (status) {
+    case "completed":
+      return "DONE";
+    case "declared":
+      return "BLOCKED";
+    default:
+      return status.replace(/_/gu, " ").toUpperCase();
+  }
 }
 
 function statusColor(
@@ -195,21 +213,36 @@ export function renderWorkflowRunRow(
   const left = ` ${marker} ${glyph} ${identity}`;
   const right = theme.fg(
     "dim",
-    `${projection.counts.terminal}/${projection.counts.total} · ${projection.status} · ${elapsed(projection, now)}`,
+    `${projection.counts.completed}/${projection.counts.total} done · ${projection.counts.running} running · ${projection.counts.blocked} blocked${safeWidth >= 70 ? ` · ${elapsed(projection, now)}` : ""}`,
   );
   const room = Math.max(1, safeWidth - visibleWidth(right) - 2);
   const clipped = truncateToWidth(left, room, "…");
-  return truncateToWidth(
+  const line = truncateToWidth(
     `${clipped}${" ".repeat(Math.max(1, safeWidth - visibleWidth(clipped) - visibleWidth(right)))}${right}`,
     safeWidth,
     "",
   );
+  return selected ? selectedLine(line, safeWidth, theme) : line;
 }
 
 function scopeLabel(task: WorkflowTaskProjection): string {
   if (task.readOnly) return "read only";
   if (task.owns.length === 0) return "owned scope";
   return `owns ${task.owns.join(",")}`;
+}
+
+function blockedReason(
+  task: WorkflowTaskProjection,
+  projection: WorkflowProjection,
+): string {
+  const waitingOn = task.dependencies.filter(
+    (dependencyId) =>
+      projection.tasks.find((dependency) => dependency.id === dependencyId)
+        ?.status !== "completed",
+  );
+  return waitingOn.length > 0
+    ? `BLOCKED <- ${waitingOn.join(", ")}`
+    : "BLOCKED · waiting for admission";
 }
 
 export function renderWorkflowTaskRows(
@@ -228,34 +261,40 @@ export function renderWorkflowTaskRows(
     const label = selected
       ? theme.fg("accent", theme.bold(task.label))
       : theme.fg("text", task.label);
-    const state = theme.fg("dim", task.status);
-    rows.push(
-      truncateToWidth(
-        ` ${marker} ${theme.fg("dim", branch)} ${glyph} ${label} ${state}`,
-        safeWidth,
-        "…",
+    const state = theme.fg(
+      "dim",
+      workflowStatusLabel(
+        task.displayStatus === "blocked" ? "blocked" : task.status,
       ),
     );
-    const needs =
+    const primary = truncateToWidth(
+      ` ${marker} ${theme.fg("dim", branch)} ${glyph} ${label} ${state}`,
+      safeWidth,
+      "…",
+    );
+    rows.push(selected ? selectedLine(primary, safeWidth, theme) : primary);
+    const metadata = [
       task.dependencies.length > 0
-        ? `needs:${task.dependencies.join(",")} · `
-        : "";
-    const runtime = [task.backend, task.model, task.effort]
-      .filter((value) => value !== undefined)
-      .join("/");
-    const activity = task.currentTool ? ` · ${task.currentTool}` : "";
-    const attempts =
-      task.attemptNumber > 1 ? ` · try ${task.attemptNumber}` : "";
-    rows.push(
-      truncateToWidth(
-        theme.fg(
-          "dim",
-          `     ${needs}${scopeLabel(task)} · ${runtime}${attempts}${activity}`,
-        ),
-        safeWidth,
-        "…",
-      ),
+        ? `needs:${task.dependencies.join(",")}`
+        : undefined,
+      scopeLabel(task),
+      [task.backend, task.model, task.effort]
+        .filter((value) => value !== undefined)
+        .join("/"),
+      task.attemptNumber > 1 ? `try ${task.attemptNumber}` : undefined,
+      task.currentTool ? `tool:${task.currentTool}` : undefined,
+      task.displayStatus === "blocked"
+        ? blockedReason(task, projection)
+        : undefined,
+    ]
+      .filter((value): value is string => value !== undefined && value !== "")
+      .join(" · ");
+    const secondary = truncateToWidth(
+      theme.fg("dim", `     ${metadata}`),
+      safeWidth,
+      "…",
     );
+    rows.push(selected ? selectedLine(secondary, safeWidth, theme) : secondary);
     if (selected && task.error) {
       rows.push(
         truncateToWidth(
@@ -269,25 +308,48 @@ export function renderWorkflowTaskRows(
   return rows;
 }
 
-function runSummary(projection: WorkflowProjection, theme: Theme): string[] {
+function runSummary(
+  projection: WorkflowProjection,
+  currentTask: WorkflowTaskProjection | undefined,
+  theme: Theme,
+): string[] {
   const counts = projection.counts;
+  const status = workflowStatusLabel(projection.status);
   const rows = [
     `${theme.fg(statusColor(projection.status), runGlyph(projection.status))} ${theme.bold(
       projection.name ?? projection.id,
-    )}`,
+    )} ${theme.fg(statusColor(projection.status), theme.bold(status))}`,
     theme.fg(
       "dim",
-      `${projection.status} · ${counts.terminal}/${counts.total} terminal · v${projection.version}`,
+      `${projection.id} · ${counts.completed}/${counts.total} done · ${counts.running} running · ${counts.blocked} blocked · v${projection.version}`,
     ),
   ];
-  const live = [
-    counts.running ? `${counts.running} running` : undefined,
+  if (projection.description) {
+    rows.push(theme.fg("muted", `“${projection.description}”`));
+  }
+  const terminal = [
+    counts.completed ? `${counts.completed} done` : undefined,
+    counts.failed ? `${counts.failed} failed` : undefined,
+    counts.cancelled ? `${counts.cancelled} cancelled` : undefined,
+  ].filter((value): value is string => value !== undefined);
+  if (terminal.length > 0) rows.push(theme.fg("muted", terminal.join(" · ")));
+  const other = [
     counts.queued ? `${counts.queued} queued` : undefined,
     counts.ready ? `${counts.ready} ready` : undefined,
-    counts.blocked ? `${counts.blocked} blocked` : undefined,
     counts.skipped ? `${counts.skipped} skipped` : undefined,
   ].filter((value): value is string => value !== undefined);
-  if (live.length > 0) rows.push(theme.fg("muted", live.join(" · ")));
+  if (other.length > 0) rows.push(theme.fg("accent", other.join(" · ")));
+  if (currentTask) {
+    rows.push(
+      theme.fg(
+        "accent",
+        `current: ${currentTask.id} · ${currentTask.label} · ${workflowStatusLabel(currentTask.status)}`,
+      ),
+    );
+  }
+  if (projection.outcome?.recovery) {
+    rows.push(theme.fg("warning", `recovery: ${projection.outcome.recovery}`));
+  }
   if (projection.outcome?.message) {
     rows.push(
       theme.fg(
@@ -299,8 +361,53 @@ function runSummary(projection: WorkflowProjection, theme: Theme): string[] {
   return rows;
 }
 
-function projections(source: WorkflowDashboardSource): WorkflowProjection[] {
-  const children = source.children();
+function taskDetail(
+  task: WorkflowTaskProjection,
+  projection: WorkflowProjection,
+  theme: Theme,
+): string[] {
+  const runtime = [task.backend, task.model, task.effort]
+    .filter((value) => value !== undefined)
+    .join("/");
+  const scope = scopeLabel(task);
+  const attempt =
+    task.attemptNumber > 0 ? `attempt ${task.attemptNumber}` : "not started";
+  const lines = [
+    `${theme.fg(taskColor(task), taskGlyph(task))} ${theme.bold(task.label)}`,
+    theme.fg(
+      "dim",
+      `state: ${task.status} (${workflowStatusLabel(task.status)}) · ${attempt}`,
+    ),
+    theme.fg("muted", runtime ? `${runtime} · ${scope}` : scope),
+  ];
+  if (task.dependencies.length > 0) {
+    lines.push(theme.fg("dim", `needs: ${task.dependencies.join(", ")}`));
+  }
+  if (task.displayStatus === "blocked") {
+    lines.push(theme.fg("warning", blockedReason(task, projection)));
+  }
+  const history = task.attempts.map(
+    (item) => `#${item.number} ${workflowStatusLabel(item.status)}`,
+  );
+  if (history.length > 0) {
+    lines.push(theme.fg("dim", `history: ${history.join(" · ")}`));
+  }
+  const activity = [
+    task.currentTool ? `tool: ${task.currentTool}` : undefined,
+    task.completedOperations > 0
+      ? `${task.completedOperations} ops`
+      : undefined,
+    task.turns > 0 ? `${task.turns} turns` : undefined,
+  ].filter((value): value is string => value !== undefined);
+  if (activity.length > 0) lines.push(theme.fg("dim", activity.join(" · ")));
+  if (task.error) lines.push(theme.fg("error", task.error));
+  return lines;
+}
+
+function projections(
+  source: WorkflowDashboardSource,
+  children = source.children(),
+): WorkflowProjection[] {
   return [...source.list()]
     .sort((left, right) => right.createdAt - left.createdAt)
     .map((run) => projectWorkflowRun(run, children));
@@ -313,8 +420,8 @@ export class WorkflowDashboard implements Component {
   private readonly source: WorkflowDashboardSource;
   private readonly selection: WorkflowDashboardSelection;
   private readonly done: (result: WorkflowDashboardResult) => void;
-  private pane: Pane = "runs";
-  private narrowLevel: NarrowLevel = "runs";
+  private mode: Mode = "overview";
+  private focus: Focus = "list";
   private runIndex = 0;
   private taskIndex = 0;
   private runOffset = 0;
@@ -325,6 +432,8 @@ export class WorkflowDashboard implements Component {
   private renderTimer?: ReturnType<typeof setTimeout>;
   private closed = false;
   private lastWidth: number;
+  private availableChildIds = new Set<string>();
+  private selectedTaskChildId?: string;
 
   constructor(
     tui: TUI,
@@ -349,7 +458,9 @@ export class WorkflowDashboard implements Component {
   }
 
   private snapshot(): WorkflowProjection[] {
-    const items = projections(this.source);
+    const children = this.source.children();
+    this.availableChildIds = new Set(children.map((child) => child.id));
+    const items = projections(this.source, children);
     this.syncSubscriptions();
     if (items.length === 0) return items;
     const selectedRunIndex = this.selection.runId
@@ -367,6 +478,7 @@ export class WorkflowDashboard implements Component {
       selectedTaskIndex >= 0
         ? selectedTaskIndex
         : Math.max(0, Math.min(this.taskIndex, Math.max(0, tasks.length - 1)));
+    this.selectedTaskChildId = tasks[this.taskIndex]?.childId;
     this.selection.runId = items[this.runIndex]?.id;
     this.selection.taskId = tasks[this.taskIndex]?.id;
     return items;
@@ -400,6 +512,20 @@ export class WorkflowDashboard implements Component {
     return this.lastWidth < TWO_PANE_MIN_WIDTH;
   }
 
+  private selectedChildAvailable(run: WorkflowProjection): boolean {
+    const task = run.tasks[this.taskIndex];
+    return (
+      task?.childId !== undefined && this.availableChildIds.has(task.childId)
+    );
+  }
+
+  private get currentChildAvailable(): boolean {
+    return (
+      this.selectedTaskChildId !== undefined &&
+      this.availableChildIds.has(this.selectedTaskChildId)
+    );
+  }
+
   private cleanup(): boolean {
     if (this.closed) return false;
     this.closed = true;
@@ -428,41 +554,51 @@ export class WorkflowDashboard implements Component {
       this.close({ kind: "toggle" });
       return;
     }
-    const cancel =
-      this.keybindings.matches(data, "app.interrupt") ||
-      this.keybindings.matches(data, "tui.select.cancel");
+    const left =
+      data === "h" || this.keybindings.matches(data, "tui.editor.cursorLeft");
+    const right =
+      data === "l" || this.keybindings.matches(data, "tui.editor.cursorRight");
+    const quit =
+      data === "q" || this.keybindings.matches(data, "app.interrupt");
+    const back = this.keybindings.matches(data, "tui.select.cancel");
     const narrow = this.narrow();
-    if (cancel) {
-      if (narrow && this.narrowLevel === "tasks") {
-        this.narrowLevel = "runs";
-        this.pane = "runs";
+    if (quit) {
+      this.close({ kind: "close" });
+      return;
+    }
+    if (back) {
+      if (this.mode === "tasks") {
+        this.mode = "overview";
+        this.focus = "list";
         this.tui.requestRender();
       } else {
         this.close({ kind: "close" });
       }
       return;
     }
-    const left =
-      data === "h" || this.keybindings.matches(data, "tui.editor.cursorLeft");
-    const right =
-      data === "l" || this.keybindings.matches(data, "tui.editor.cursorRight");
+    if (narrow && this.mode === "tasks" && left) {
+      this.mode = "overview";
+      this.focus = "list";
+      this.tui.requestRender();
+      return;
+    }
     const up = data === "k" || this.keybindings.matches(data, "tui.select.up");
     const down =
       data === "j" || this.keybindings.matches(data, "tui.select.down");
     const enter = this.keybindings.matches(data, "tui.select.confirm");
 
-    if (!narrow && left) this.pane = "runs";
-    else if (!narrow && right) this.pane = "tasks";
+    if (!narrow && left) this.focus = "list";
+    else if (!narrow && right) this.focus = "inspector";
     else if (up) this.move(-1);
     else if (down) this.move(1);
-    else if (enter || (narrow && right)) this.activate(narrow);
+    else if (enter || (narrow && right)) this.activate();
     else return;
     this.tui.requestRender();
   }
 
   private move(direction: -1 | 1): void {
     const items = this.snapshot();
-    if (this.pane === "runs") {
+    if (this.mode === "overview") {
       this.runIndex = Math.max(
         0,
         Math.min(items.length - 1, this.runIndex + direction),
@@ -480,37 +616,42 @@ export class WorkflowDashboard implements Component {
     this.selection.taskId = tasks[this.taskIndex]?.id;
   }
 
-  private activate(narrow: boolean): void {
+  private activate(): void {
     const items = this.snapshot();
     const run = items[this.runIndex];
     if (!run) return;
-    if (this.pane === "runs") {
-      this.pane = "tasks";
-      if (narrow) this.narrowLevel = "tasks";
+    if (this.mode === "overview") {
+      this.mode = "tasks";
+      this.focus = "list";
       return;
     }
     const childId = run.tasks[this.taskIndex]?.childId;
-    if (childId) this.close({ kind: "child", childId });
+    if (childId && this.selectedChildAvailable(run))
+      this.close({ kind: "child", childId });
   }
 
   private footer(width: number): string {
     const narrow = this.narrow();
-    const state = narrow
-      ? `narrow ${this.narrowLevel} pane`
-      : `wide ${this.pane} pane`;
-    const back =
-      narrow && this.narrowLevel === "tasks" ? "esc back" : "esc close";
-    const essential = ` ${back} · Ctrl+Shift+Z close`;
-    if (visibleWidth(essential) >= width) {
-      return truncateToWidth(` esc · Ctrl+Shift+Z`, width, "");
-    }
+    const state = narrow ? `narrow ${this.mode}` : `wide ${this.mode}`;
+    const back = this.mode === "tasks" ? "esc back" : "esc close";
+    const childHint =
+      this.mode === "tasks" && this.currentChildAvailable
+        ? " · enter child"
+        : "";
     const actions = narrow
-      ? this.narrowLevel === "tasks"
-        ? "j/k move · enter child"
-        : "j/k move · enter tasks"
-      : "j/k move · h/l pane · enter child";
+      ? this.mode === "tasks"
+        ? `j/k${childHint} · ${back}`
+        : "j/k · enter tasks"
+      : this.mode === "overview"
+        ? "j/k move · h/l focus · enter tasks"
+        : `j/k move · h/l focus${childHint}`;
+    const primary = ` ${state} · ${actions}`;
+    const essential = ` · ${back} · q · Ctrl+Shift+Z`;
+    if (visibleWidth(primary) + visibleWidth(essential) >= width) {
+      return truncateToWidth(primary, width, "");
+    }
     return truncateToWidth(
-      this.theme.fg("dim", `${essential} · ${state} · ${actions}`),
+      this.theme.fg("dim", `${primary}${essential}`),
       width,
       "",
     );
@@ -533,12 +674,18 @@ export class WorkflowDashboard implements Component {
   render(width: number): string[] {
     this.lastWidth = width;
     const items = this.snapshot();
-    const lineBudget = Math.max(0, (this.tui.terminal.rows || 30) - 1);
+    const lineBudget = Math.max(
+      0,
+      Math.min(MAX_DASHBOARD_ROWS, (this.tui.terminal.rows || 30) - 1),
+    );
     if (lineBudget === 0) return [];
+    const activeRuns = items.filter(
+      (run) => run.status === "running" || run.status === "paused",
+    ).length;
     const header = truncateToWidth(
       ` ${this.theme.fg("accent", "◆")} ${this.theme.bold("Workflows")} ${this.theme.fg(
         "dim",
-        `· ${items.length} run${items.length === 1 ? "" : "s"} · Ctrl+Shift+Z`,
+        `· ${items.length} run${items.length === 1 ? "" : "s"}${activeRuns > 0 ? ` · ${activeRuns} active` : ""} · Ctrl+Shift+Z toggle`,
       )}`,
       width,
       "",
@@ -549,13 +696,19 @@ export class WorkflowDashboard implements Component {
       if (lineBudget === 2) return [header, footer()];
       return [
         header,
-        this.theme.fg("muted", " No workflow runs yet."),
+        truncateToWidth(
+          this.theme.fg(
+            "muted",
+            " No workflow runs yet. Approve a workflow to see it here.",
+          ),
+          width,
+          "…",
+        ),
         footer(),
       ];
     }
     const current = items[this.runIndex] ?? items[0]!;
-    if (width >= TWO_PANE_MIN_WIDTH) this.narrowLevel = this.pane;
-    else if (this.pane === "tasks") this.narrowLevel = "tasks";
+    const currentTask = current.tasks[this.taskIndex];
     if (lineBudget < 5) {
       if (lineBudget === 1) return [footer()];
       return [header, footer()];
@@ -563,8 +716,14 @@ export class WorkflowDashboard implements Component {
     const bodyHeight = lineBudget - 2;
 
     if (width < TWO_PANE_MIN_WIDTH) {
-      if (this.narrowLevel === "runs") {
-        const available = Math.max(1, bodyHeight - 2);
+      if (this.mode === "overview") {
+        const summary = [
+          "Overview",
+          ...runSummary(current, currentTask, this.theme),
+        ].slice(0, Math.max(1, lineBudget - 6));
+        const panelHeight = lineBudget - 2 - summary.length;
+        if (panelHeight < 3) return [header, footer()];
+        const available = Math.max(1, panelHeight - 2);
         this.runOffset = this.selectedOffset(
           this.runIndex,
           items.length,
@@ -583,13 +742,19 @@ export class WorkflowDashboard implements Component {
           );
         return [
           header,
-          ...panel("Runs", rows, width, bodyHeight, true, this.theme),
+          ...summary.map((line) => truncateToWidth(` ${line}`, width, "…")),
+          ...panel("Runs", rows, width, panelHeight, true, this.theme),
           footer(),
         ];
       }
-      const summary = runSummary(current, this.theme)
-        .slice(0, Math.max(1, lineBudget - 5))
-        .map((line) => truncateToWidth(` ${line}`, width, "…"));
+      const detail = currentTask
+        ? taskDetail(currentTask, current, this.theme).slice(
+            0,
+            Math.max(1, lineBudget - 6),
+          )
+        : ["No task selected"];
+      const panelHeight = lineBudget - 2 - detail.length;
+      if (panelHeight < 3) return [header, footer()];
       const allRows = renderWorkflowTaskRows(
         current,
         width - 2,
@@ -597,8 +762,6 @@ export class WorkflowDashboard implements Component {
         this.theme,
       );
       const selectedRow = this.taskIndex * 2;
-      const panelHeight = lineBudget - 2 - summary.length;
-      if (panelHeight < 3) return [header, footer()];
       const room = Math.max(1, panelHeight - 2);
       this.taskOffset = this.selectedOffset(
         selectedRow,
@@ -609,7 +772,13 @@ export class WorkflowDashboard implements Component {
       const rows = allRows.slice(this.taskOffset, this.taskOffset + room);
       return [
         header,
-        ...summary,
+        ...detail.map((line, index) =>
+          truncateToWidth(
+            `${index === 0 ? " Task · " : " "}${line}`,
+            width,
+            "…",
+          ),
+        ),
         ...panel("Tasks", rows, width, panelHeight, true, this.theme),
         footer(),
       ];
@@ -637,18 +806,38 @@ export class WorkflowDashboard implements Component {
       this.runOffset,
       this.runOffset + runCapacity,
     );
-    const bodyCapacity = bodyHeight - 2;
-    const summary = runSummary(current, this.theme).slice(
-      0,
-      Math.max(1, bodyCapacity - 2),
+    const left = panel(
+      "Runs",
+      runRows,
+      leftWidth,
+      bodyHeight,
+      this.mode === "overview" && this.focus === "list",
+      this.theme,
     );
+    if (this.mode === "overview") {
+      const overview = runSummary(current, currentTask, this.theme);
+      const right = panel(
+        "Overview",
+        overview,
+        rightWidth,
+        bodyHeight,
+        this.focus === "inspector",
+        this.theme,
+      );
+      return [
+        header,
+        ...left.map((line, index) => `${line} ${right[index] ?? ""}`),
+        footer(),
+      ].map((line) => truncateToWidth(line, width, ""));
+    }
+
     const allTaskRows = renderWorkflowTaskRows(
       current,
-      rightWidth - 2,
+      leftWidth - 2,
       this.selection.taskId,
       this.theme,
     );
-    const taskCapacity = Math.max(1, bodyCapacity - summary.length - 1);
+    const taskCapacity = Math.max(1, bodyHeight - 2);
     const selectedTaskRow = this.taskIndex * 2;
     this.taskOffset = this.selectedOffset(
       selectedTaskRow,
@@ -656,30 +845,32 @@ export class WorkflowDashboard implements Component {
       this.taskOffset,
       taskCapacity,
     );
-    const details = [
-      ...summary,
-      "",
-      ...allTaskRows.slice(this.taskOffset, this.taskOffset + taskCapacity),
-    ];
-    const left = panel(
-      "Runs",
-      runRows,
-      leftWidth,
-      bodyHeight,
-      this.pane === "runs",
-      this.theme,
+    const taskRows = allTaskRows.slice(
+      this.taskOffset,
+      this.taskOffset + taskCapacity,
     );
-    const right = panel(
-      "Run · tasks",
-      details,
+    const task = currentTask
+      ? taskDetail(currentTask, current, this.theme)
+      : ["No task selected"];
+    const taskPanel = panel(
+      "Task",
+      task,
       rightWidth,
       bodyHeight,
-      this.pane === "tasks",
+      this.focus === "inspector",
+      this.theme,
+    );
+    const taskList = panel(
+      "Tasks",
+      taskRows,
+      leftWidth,
+      bodyHeight,
+      this.focus === "list",
       this.theme,
     );
     return [
       header,
-      ...left.map((line, index) => `${line} ${right[index] ?? ""}`),
+      ...taskList.map((line, index) => `${line} ${taskPanel[index] ?? ""}`),
       footer(),
     ].map((line) => truncateToWidth(line, width, ""));
   }
@@ -695,7 +886,10 @@ export async function openWorkflowDashboard(
 ): Promise<boolean> {
   while (true) {
     if (manager.list().length === 0) {
-      ctx.ui.notify("No workflow runs yet.", "info");
+      ctx.ui.notify(
+        "No workflow runs yet. Approve a workflow to see it here.",
+        "info",
+      );
       return false;
     }
     const source: WorkflowDashboardSource = {
@@ -709,11 +903,23 @@ export async function openWorkflowDashboard(
         new WorkflowDashboard(tui, theme, keybindings, source, selection, done),
       {
         overlay: true,
-        overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%" },
+        overlayOptions: {
+          anchor: "center",
+          width: "94%",
+          maxHeight: MAX_DASHBOARD_ROWS,
+          margin: 1,
+        },
       },
     );
     if (result.kind === "toggle") return true;
     if (result.kind !== "child") return false;
+    if (!childView.get(result.childId)) {
+      ctx.ui.notify(
+        "Workflow child is not available in this session.",
+        "warning",
+      );
+      continue;
+    }
     const toggled = await openSubagent(ctx, childView, result.childId, {
       title: "Workflow child",
       readOnly: true,

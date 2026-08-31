@@ -14,6 +14,7 @@ import { foldWorkflowEvents } from "../workflows/reducer.ts";
 import {
   renderWorkflowRunRow,
   renderWorkflowTaskRows,
+  workflowStatusLabel,
   WorkflowDashboard,
   openWorkflowDashboard,
   type WorkflowDashboardResult,
@@ -98,6 +99,24 @@ function run(failed = false) {
   return foldWorkflowEvents(events);
 }
 
+function blockedRun() {
+  return foldWorkflowEvents([
+    event(1, { _tag: "WorkflowCreated", definition }),
+    event(2, { _tag: "WorkflowStarted" }),
+    event(3, {
+      _tag: "TaskQueued",
+      taskId: "inspect",
+      childId: "sa-inspect",
+      attemptId: "attempt-1",
+    }),
+    event(4, {
+      _tag: "TaskStarted",
+      taskId: "inspect",
+      attemptId: "attempt-1",
+    }),
+  ]);
+}
+
 const child = {
   id: "sa-review",
   backend: "pi",
@@ -127,6 +146,7 @@ const child = {
 
 const theme = {
   fg: (_color: string, text: string) => text,
+  bg: (_color: string, text: string) => text,
   bold: (text: string) => text,
 } as unknown as Theme;
 
@@ -146,6 +166,7 @@ function dashboard(
   sourceRuns: ReadonlyArray<ReturnType<typeof run>> = [run()],
   selection: WorkflowDashboardSelection = {},
   terminalRows = 24,
+  sourceChildren: ReadonlyArray<SubagentSnapshot> = [child],
 ) {
   const tui = {
     terminal: { rows: terminalRows },
@@ -154,7 +175,7 @@ function dashboard(
   const source: WorkflowDashboardSource = {
     list: () => sourceRuns,
     subscribe: () => () => {},
-    children: () => [child],
+    children: () => sourceChildren,
     subscribeChildren: () => () => {},
   };
   const view = new WorkflowDashboard(
@@ -171,10 +192,11 @@ function dashboard(
 
 test("workflow rows preserve status and task wiring within fixed widths", () => {
   const projection = projectWorkflowRun(run(), [child]);
-  const runRow = renderWorkflowRunRow(projection, 52, true, theme, 10);
-  assert.ok(visibleWidth(runRow) <= 52);
+  const runRow = renderWorkflowRunRow(projection, 90, true, theme, 10);
+  assert.ok(visibleWidth(runRow) <= 90);
   assert.match(runRow, /responsive workflow/);
-  assert.match(runRow, /1\/2/);
+  assert.match(runRow, /1\/2 done/);
+  assert.doesNotMatch(runRow, /terminal/);
 
   const tasks = renderWorkflowTaskRows(projection, 60, "review", theme);
   assert.ok(tasks.every((line) => visibleWidth(line) <= 60));
@@ -190,8 +212,29 @@ test("workflow dashboard uses two panes on wide terminals", () => {
     assert.ok(lines.every((line) => visibleWidth(line) <= 120));
     assert.match(lines.join("\n"), /Workflows/);
     assert.match(lines.join("\n"), /Runs/);
-    assert.match(lines.join("\n"), /Run · tasks/);
+    assert.match(lines.join("\n"), /Overview/);
+    assert.doesNotMatch(lines.join("\n"), /Run · tasks/);
     assert.match(lines.join("\n"), /Inspect repository boundaries/);
+  } finally {
+    view.dispose();
+  }
+});
+
+test("workflow inspector keeps the selected task detail visible", () => {
+  const selection: WorkflowDashboardSelection = {
+    runId: "wf-responsive",
+    taskId: "review",
+  };
+  const { view } = dashboard(120, () => {}, [run()], selection);
+  try {
+    view.handleInput("enter");
+    const rendered = view.render(120).join("\n");
+    assert.match(rendered, /Tasks/);
+    assert.match(rendered, /Task/);
+    assert.match(rendered, /RUNNING/);
+    assert.match(rendered, /attempt 1/);
+    assert.match(rendered, /pi\/luna\/high/);
+    assert.match(rendered, /owns src\/workflows/);
   } finally {
     view.dispose();
   }
@@ -199,16 +242,16 @@ test("workflow dashboard uses two panes on wide terminals", () => {
 
 test("workflow dashboard switches layout at the 92-column boundary", () => {
   for (const [width, expected] of [
-    [91, "Tasks"],
-    [92, "Run · tasks"],
+    [91, "narrow"],
+    [92, "Overview"],
   ] as const) {
     const { view, lines } = dashboard(width, () => {});
     try {
       assert.ok(lines.every((line) => visibleWidth(line) <= width));
       assert.match(lines.join("\n"), /Runs/);
-      if (expected === "Tasks")
-        assert.doesNotMatch(lines.join("\n"), /Run · tasks/);
-      else assert.match(lines.join("\n"), /Run · tasks/);
+      if (expected === "narrow")
+        assert.match(lines.join("\n"), /narrow overview/);
+      else assert.match(lines.join("\n"), /Overview/);
     } finally {
       view.dispose();
     }
@@ -218,16 +261,19 @@ test("workflow dashboard switches layout at the 92-column boundary", () => {
 test("workflow dashboard keeps drill-down coherent when width changes", () => {
   const { view } = dashboard(120, () => {});
   try {
+    assert.match(view.render(48).join("\n"), /narrow overview/);
     view.handleInput("enter");
-    assert.match(view.render(48).join("\n"), /Tasks/);
+    assert.match(view.render(48).join("\n"), /narrow tasks/);
+    assert.match(view.render(120).join("\n"), /Tasks/);
+    assert.match(view.render(120).join("\n"), /Task/);
     view.handleInput("escape");
-    assert.match(view.render(48).join("\n"), /Runs/);
+    assert.match(view.render(48).join("\n"), /narrow overview/);
 
-    view.render(120);
     view.handleInput("enter");
-    assert.match(view.render(48).join("\n"), /Tasks/);
+    assert.match(view.render(48).join("\n"), /narrow tasks/);
+    assert.match(view.render(120).join("\n"), /Tasks/);
     view.handleInput("escape");
-    assert.match(view.render(48).join("\n"), /Runs/);
+    assert.match(view.render(48).join("\n"), /narrow overview/);
   } finally {
     view.dispose();
   }
@@ -276,7 +322,7 @@ test("workflow dashboard drills down and back on small terminals", () => {
     const taskLines = view.render(48);
     assert.ok(taskLines.every((line) => visibleWidth(line) <= 48));
     assert.match(taskLines.join("\n"), /Tasks/);
-    assert.match(taskLines.join("\n"), /responsive workflow/);
+    assert.match(taskLines.join("\n"), /Task ·/);
     assert.match(taskLines.at(-1) ?? "", /narrow tasks/);
     assert.match(taskLines.at(-1) ?? "", /esc back/);
 
@@ -295,9 +341,7 @@ test("workflow dashboard stays within the terminal line budget", () => {
     try {
       assert.ok(lines.length <= terminalRows - 1);
       assert.ok(lines.every((line) => visibleWidth(line) <= 48));
-      assert.match(lines.at(-1) ?? "", /esc/);
-      assert.match(lines.at(-1) ?? "", /Ctrl\+Shift\+Z/);
-      if (terminalRows > 4) assert.match(lines.at(-1) ?? "", /narrow runs/);
+      if (terminalRows > 4) assert.match(lines.at(-1) ?? "", /narrow overview/);
     } finally {
       view.dispose();
     }
@@ -322,9 +366,112 @@ test("wide panes independently keep selected run and task visible", () => {
     const rendered = lines.join("\n");
     assert.ok(lines.length <= 7);
     assert.match(rendered, /run-19/);
-    assert.match(rendered, /Review the bounded result/);
+    assert.match(rendered, /Overview/);
+    view.handleInput("enter");
+    const taskRendered = view.render(120).join("\n");
+    assert.match(taskRendered, /Review the bounded result/);
+    assert.match(taskRendered, /Task/);
   } finally {
     view.dispose();
+  }
+});
+
+test("workflow status labels keep progress semantic", () => {
+  for (const [status, label] of [
+    ["completed", "DONE"],
+    ["running", "RUNNING"],
+    ["blocked", "BLOCKED"],
+    ["ready", "READY"],
+    ["queued", "QUEUED"],
+    ["failed", "FAILED"],
+    ["cancelled", "CANCELLED"],
+    ["skipped", "SKIPPED"],
+  ] as const) {
+    assert.equal(workflowStatusLabel(status), label);
+  }
+  const rendered = renderWorkflowRunRow(
+    projectWorkflowRun(run(true)),
+    100,
+    false,
+    theme,
+    10,
+  );
+  assert.match(rendered, /1\/2 done · 0 running · 0 blocked/);
+  assert.doesNotMatch(rendered, /terminal/);
+});
+
+test("blocked tasks expose only projected causal dependencies", () => {
+  const blocked = projectWorkflowRun(blockedRun());
+  const blockedRows = renderWorkflowTaskRows(blocked, 100, "review", theme);
+  assert.match(blockedRows.join("\n"), /BLOCKED <- inspect/);
+  assert.doesNotMatch(blockedRows.join("\n"), /will run|guarantee|scheduler/iu);
+
+  const waiting = {
+    ...blocked,
+    tasks: blocked.tasks.map((task, index) =>
+      index === 1
+        ? { ...task, status: "blocked" as const, dependencies: [] }
+        : task,
+    ),
+  };
+  const waitingRows = renderWorkflowTaskRows(waiting, 100, "inspect", theme);
+  assert.match(waitingRows.join("\n"), /BLOCKED · waiting for admission/);
+});
+
+test("selection has a non-color cue and child hints stay truthful", () => {
+  const projection = projectWorkflowRun(run(), [child]);
+  const rows = renderWorkflowTaskRows(projection, 80, "review", theme);
+  assert.match(rows[2] ?? "", /❯/);
+
+  const availableResults: WorkflowDashboardResult[] = [];
+  const available = dashboard(48, (result) => availableResults.push(result));
+  try {
+    available.view.handleInput("enter");
+    available.view.handleInput("j");
+    assert.match(available.view.render(48).at(-1) ?? "", /enter child/);
+    available.view.handleInput("enter");
+    assert.deepEqual(availableResults, [
+      { kind: "child", childId: "sa-review" },
+    ]);
+  } finally {
+    available.view.dispose();
+  }
+
+  const missingResults: WorkflowDashboardResult[] = [];
+  const missing = dashboard(
+    48,
+    (result) => missingResults.push(result),
+    [run()],
+    {},
+    24,
+    [],
+  );
+  try {
+    missing.view.handleInput("enter");
+    assert.doesNotMatch(missing.view.render(48).at(-1) ?? "", /enter child/);
+    missing.view.handleInput("enter");
+    assert.deepEqual(missingResults, []);
+    missing.view.handleInput("q");
+    assert.deepEqual(missingResults, [{ kind: "close" }]);
+  } finally {
+    missing.view.dispose();
+  }
+});
+
+test("workflow renderer stays within width and 22-row budgets in both modes", () => {
+  for (const width of [1, 48, 91, 92, 120]) {
+    const { view } = dashboard(width, () => {}, [run()], {}, 40);
+    try {
+      let lines = view.render(width);
+      assert.ok(lines.length <= 22);
+      assert.ok(lines.every((line) => visibleWidth(line) <= width));
+      view.handleInput("enter");
+      lines = view.render(width);
+      assert.ok(lines.length <= 22);
+      assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    } finally {
+      view.dispose();
+    }
   }
 });
 
@@ -369,6 +516,7 @@ test("nested workflow child toggle closes the child and dashboard", async () => 
       opens += 1;
       if (opens === 1) {
         component.handleInput("enter");
+        component.handleInput("j");
         component.handleInput("enter");
       } else {
         component.handleInput(toggleInput);

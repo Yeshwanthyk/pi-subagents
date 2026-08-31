@@ -589,6 +589,35 @@ export default function (pi: ExtensionAPI) {
     parentSubagentView(manager.view);
   const operatorView = (manager: SubagentManagerApi) =>
     operatorSubagentView(manager.view);
+  const openWorkflowEntry = async (
+    ctx: Pick<ExtensionContext, "mode" | "hasUI" | "ui">,
+    manager: SubagentManagerApi,
+    selection: { runId?: string } = {},
+  ): Promise<boolean> => {
+    if (ctx.mode !== "tui") {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          "Workflow dashboard is only available in the TUI",
+          "error",
+        );
+      }
+      return false;
+    }
+    const workflows = workflowManager;
+    if (!workflows || workflows.list().length === 0) {
+      ctx.ui.notify(
+        "No workflow runs yet. Prepare and approve a workflow first.",
+        "info",
+      );
+      return false;
+    }
+    return openWorkflowDashboard(
+      ctx,
+      workflows,
+      operatorView(manager),
+      selection,
+    );
+  };
   const standardSnapshots = (manager: SubagentManagerApi) =>
     standardView(manager).list();
   const standardSnapshot = (manager: SubagentManagerApi, id: string) =>
@@ -1117,12 +1146,17 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("workflows", {
-    description: "List workflow runs (`/workflows <runId>` for detail)",
+    description:
+      "Open the workflow inspector (`/workflows <runId>` focuses a run)",
     handler: async (rawArgs, ctx) => {
       const manager = await getManager();
-      const runs = workflowManager?.list() ?? [];
-      if (runs.length === 0) {
-        ctx.ui.notify("No workflow runs yet.", "info");
+      const workflows = workflowManager;
+      const runs = workflows?.list() ?? [];
+      if (!workflows || runs.length === 0) {
+        ctx.ui.notify(
+          "No workflow runs yet. Prepare and approve a workflow first.",
+          "info",
+        );
         return;
       }
       const query = rawArgs.trim();
@@ -1138,7 +1172,15 @@ export default function (pi: ExtensionAPI) {
           );
           return;
         }
+        if (ctx.mode === "tui" && ctx.hasUI) {
+          await openWorkflowEntry(ctx, manager, { runId: run.id });
+          return;
+        }
         ctx.ui.notify(inspectWorkflow(manager, run.id).text, "info");
+        return;
+      }
+      if (ctx.mode === "tui" && ctx.hasUI) {
+        await openWorkflowEntry(ctx, manager);
         return;
       }
       if (!ctx.hasUI) {
@@ -1765,7 +1807,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerShortcut("ctrl+shift+z", {
-    description: "Toggle the workflow dashboard",
+    description: "Toggle the workflow inspector (also opened by /workflows)",
     handler: async (ctx) => {
       if (ctx.mode !== "tui") {
         if (ctx.hasUI)
@@ -1776,15 +1818,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const manager = await getManager();
-      const workflows = workflowManager;
-      if (!workflows || workflows.list().length === 0) {
-        ctx.ui.notify(
-          "No workflow runs yet. Prepare and approve a workflow first.",
-          "info",
-        );
-        return;
-      }
-      await openWorkflowDashboard(ctx, workflows, operatorView(manager));
+      await openWorkflowEntry(ctx, manager);
     },
   });
 }

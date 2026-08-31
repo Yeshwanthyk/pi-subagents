@@ -3,6 +3,7 @@ import test from "node:test";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
+  ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import subagentsExtension, {
   runHeadlessSubagentsDialog,
@@ -100,13 +101,28 @@ test("RPC command without dialogs keeps the TUI-only notification fallback", asy
   let commandHandler:
     | ((args: string, ctx: ExtensionCommandContext) => Promise<void> | void)
     | undefined;
+  let workflowsDescription: string | undefined;
+  let workflowShortcutDescription: string | undefined;
   const pi = {
     on() {},
     registerTool() {},
-    registerCommand(name: string, command: { handler: typeof commandHandler }) {
+    registerCommand(
+      name: string,
+      command: { handler: typeof commandHandler; description?: string },
+    ) {
       if (name === "subagents") commandHandler = command.handler;
+      if (name === "workflows") workflowsDescription = command.description;
     },
-    registerShortcut() {},
+    registerShortcut(
+      shortcut: string,
+      options: {
+        description?: string;
+        handler: (ctx: ExtensionContext) => Promise<void> | void;
+      },
+    ) {
+      if (shortcut === "ctrl+shift+z")
+        workflowShortcutDescription = options.description;
+    },
     registerFlag() {},
     getFlag: () => undefined,
     registerMessageRenderer() {},
@@ -133,6 +149,9 @@ test("RPC command without dialogs keeps the TUI-only notification fallback", asy
     },
   } satisfies ExtensionAPI;
   subagentsExtension(pi);
+
+  assert.match(workflowsDescription ?? "", /workflow inspector/u);
+  assert.match(workflowShortcutDescription ?? "", /\/workflows/u);
 
   const notifications: Array<[string, string | undefined]> = [];
   // SAFETY: This fixture implements the command-context fields read by the

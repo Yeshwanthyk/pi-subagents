@@ -35,6 +35,12 @@ Tools:
 - `workflow_check` — inspect and consume one terminal aggregate
 - `workflow_control` — pause, resume, cancel, retry, or skip through workflow authority
 
+Interactive TUI:
+
+- `/workflows` opens the workflow inspector; `/workflows <runId>` focuses a run.
+- `Ctrl+Shift+Z` toggles the same inspector from anywhere in the TUI.
+- Select a run, inspect its task graph, and press `Enter` on a live child for a read-only transcript view.
+
 A workflow is a declarative `flow({ tasks })` graph. Tasks declare dependencies and either `readOnly: true` or explicit owned paths. The scheduler derives safe parallelism; `SubagentManager` alone owns global execution capacity.
 
 Workflow guarantees:
@@ -75,7 +81,7 @@ Historical `pi-workflows` runs remain frozen and readable at:
 
 The legacy `workflow.json`, `result.json`, `script.js`, and transcript artifacts are not rewritten or deleted. New project-isolated journals live under the separate `~/.pi/agent/workflows/runs/` namespace.
 
-The unified package replaces the legacy `/workflows`, `/workflow-draft`, `/workflow-saved`, and `workflow_cancel` surfaces with `workflow_list`, `workflow_check`, and `workflow_control`.
+The unified package keeps `/workflows` as the interactive TUI inspector (and `/workflow-draft` / `/workflow-saved` for local inspection). The agent-facing API is `workflow_list`, `workflow_check`, and `workflow_control`; legacy `workflow_cancel` is replaced by `workflow_control`.
 
 Rollback requires restoring a pre-workflow `pi-subagents` revision for direct subagents and re-enabling `pi-workflows`, then restarting Pi. Do not load a unified `pi-subagents` revision and `pi-workflows` simultaneously.
 
