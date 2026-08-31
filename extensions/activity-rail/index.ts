@@ -147,7 +147,7 @@ export default function activityRail(pi: ExtensionAPI) {
           renderActiveWorkRail(itemSnapshot, theme, now, flashSnapshot, width),
         invalidate() {},
       }),
-      { placement: "belowEditor" },
+      { placement: "aboveEditor" },
     );
   };
 
