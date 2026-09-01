@@ -45,8 +45,6 @@ Call `subagent_spawn` with a complete `prompt`, short `name`, chosen `harness`, 
 
 - `subagent_check({ id })`: peek without blocking.
 - `subagent_list()`: list all runs.
-- `subagent_wait({ ids })`: block only when results are required to proceed.
+- `subagent_wait({ ids })`: collect final outputs after all listed runs settle.
 - `subagent_cancel({ ids })`: stop runs while preserving partial transcripts.
 - `/subagents`: inspect or take over a run interactively.
-
-Results return automatically. After spawning, continue useful parent work instead of immediately waiting.

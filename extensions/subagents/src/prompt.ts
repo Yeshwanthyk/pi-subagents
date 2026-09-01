@@ -2,17 +2,18 @@
 
 /** Describes subagent_spawn, including harnesses and the fixed concurrency cap. */
 export const SUBAGENT_SPAWN_TOOL_DESCRIPTION =
-  "Spawn a background subagent: background work is normal and this returns immediately with an id. The child is fully autonomous with its own context window and runs on pi (in-process) or codex (Codex CLI). Its final output is delivered automatically when it settles, or collect it explicitly with subagent_wait. Children cannot orchestrate more agents/workflows or ask the user, and cannot see this conversation, so the prompt must be self-contained. Max 4 subagents run at once across all harnesses; excess work waits in the shared FIFO queue.";
+  "Spawn a background subagent and return immediately with an id. The child is fully autonomous with its own context window and runs on pi (in-process) or codex (Codex CLI). Its final output is delivered automatically when it settles, or collect it explicitly with subagent_wait. Children cannot orchestrate more agents/workflows or ask the user, and cannot see this conversation, so the prompt must be self-contained. Max 4 subagents run at once across all harnesses; excess work waits in the shared FIFO queue.";
 
 /** Adds background subagent delegation to the parent model's available-tools prompt. */
 export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
-  "Spawn a background subagent by default on a chosen harness (Pi or Codex; own context, normal tools) for a self-contained task";
+  "Delegate a clearly scoped, self-contained task to a Pi or Codex subagent running in the background";
 
-/** Guides the parent model to delegate standalone tasks and avoid unnecessary blocking waits. */
+/** Guides the parent model to delegate scoped work and coordinate with results. */
 export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
-  "Use subagent_spawn freely for self-contained work that can run in the background; background execution is the normal path, so give the child a complete standalone prompt.",
-  "Pick the subagent harness deliberately: pi unless you have a reason to prefer Codex (e.g. the user asked for it, or the task suits that harness).",
-  "After subagent_spawn, keep working; results arrive automatically. Call subagent_wait only when the next step has a real prerequisite on that result, not merely to check progress.",
+  "Use subagent_spawn for self-contained work with a clear scope, purpose, and expected output. Parallel delegation is appropriate when scopes can proceed independently, whether separate or complementary.",
+  "Pick the subagent harness deliberately: pi unless there is a reason to prefer Codex.",
+  "Coordinate by scope: while a child runs, continue parent work outside its delegated scope. When its result arrives, use it as the basis for synthesis, validation, integration, or follow-up in that scope.",
+  "Use subagent_wait when the next parent step requires a child's result, such as synthesis or integration that includes its work, review of its findings, or a dependent decision.",
 ];
 
 /** Model-facing schema descriptions for subagent_spawn task and execution options. */
@@ -39,14 +40,15 @@ export function buildSubagentSpawnResult(options: {
 }) {
   return (
     `Spawned subagent ${options.id} "${options.title}" (${options.harness}: ${options.modelLabel}, ${options.cwd}).\n` +
-    `It runs in the background normally. Its result will be delivered to you when it finishes, ` +
-    `or use subagent_wait(ids: ["${options.id}"]) only when you have a real prerequisite; use subagent_cancel to stop it, subagent_check to peek, and subagent_list to see all.`
+    `It runs in the background, and its result will be delivered automatically. ` +
+    `Use subagent_wait(ids: ["${options.id}"]) when your next step requires that result; otherwise continue outside its delegated scope. ` +
+    `Use subagent_cancel to stop it, subagent_check to peek, and subagent_list to see all.`
   );
 }
 
 /** Describes explicit blocking collection of one or more subagent results. */
 export const SUBAGENT_WAIT_TOOL_DESCRIPTION =
-  "Block until all listed parent-owned subagents have settled, then return their final outputs. Background delivery is normal; use this only when a real next-step prerequisite requires the result before continuing, not to monitor progress.";
+  "Block until all listed parent-owned subagents have settled, then return their final outputs. Use this when the next parent step requires those outputs.";
 
 /** Model-facing schema description for the subagent ids to await. */
 export const SUBAGENT_WAIT_PARAMETER_DESCRIPTIONS = {
