@@ -6,7 +6,8 @@
  * - real session files visible in /resume, child resources loaded per-cwd
  *   with trust gating, and the child tool denylist;
  * - `session.subscribe()` events translated to normalized SubagentEvents;
- * - send() steers a streaming run or starts a fresh prompt() when idle;
+ * - send() uses Pi's native steer/follow-up queues while streaming and starts
+ *   a fresh prompt() when idle;
  * - interrupt clears the queue and aborts; closing the session scope emits
  *   the child session_shutdown hook and disposes the session.
  */
@@ -41,6 +42,7 @@ import type {
   SubagentFailureProvenance,
   SubagentMeta,
   TranscriptPart,
+  EffectiveSubagentSendMode,
 } from "../domain.ts";
 import {
   failureKindFromProvenance,
@@ -57,6 +59,8 @@ const CHILD_EXCLUDED_TOOL_NAMES = [
   "subagent_spawn",
   "subagent_wait",
   "subagent_cancel",
+  "subagent_send",
+  "subagent_inspect",
   "subagent_check",
   "subagent_list",
   "workflow",
@@ -633,17 +637,18 @@ const makePiSession = (
     return {
       meta: Effect.sync(currentMeta),
       events: Stream.fromQueue(events),
-      send: (text) =>
+      send: (text, mode: EffectiveSubagentSendMode) =>
         Effect.suspend((): Effect.Effect<void, SendError> => {
           if (state.closed) {
             return new SendError({ message: "Subagent session is closed." });
           }
           if (session.isStreaming) {
-            // Steer the active run via the SDK's queue; queue_update events
-            // render it, message_end(user) lands it in the transcript. A
-            // rejected steer is a real send failure, not a diagnostic.
+            // Use the selected native queue; queue_update events render it,
+            // and message_end(user) lands it in the transcript. A rejected
+            // delivery is a real send failure, not a diagnostic.
             return Effect.tryPromise({
-              try: () => session.steer(text),
+              try: () =>
+                mode === "steer" ? session.steer(text) : session.followUp(text),
               catch: (error) =>
                 new SendError({
                   message: boundedError(

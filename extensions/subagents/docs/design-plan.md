@@ -31,7 +31,8 @@ Source: `/Users/davis/.pi/agent/extensions/subagents/` (`index.ts`, `manager.ts`
 | `subagent_spawn` | `prompt`, `title`, `working_dir?`, `model?`, `provider?`, `reasoning_effort?` | Fire-and-forget spawn. Returns immediately with an id (`sa-N`). Enforces `MAX_RUNNING = 4` with a synchronous reservation so parallel tool calls can't race past the cap. Validates `working_dir`, resolves model against the registry (inherit parent model/thinking level by default), truncates title to 160 chars. |
 | `subagent_wait` | `ids[]` (max 64) | Blocks until all listed subagents settle; respects the tool `AbortSignal`; streams `Waiting for ...` via `onUpdate`. Marks the awaited results "consumed" so they are not also auto-delivered. Output budgets: 48KB total, 16KB per agent, with per-section fallbacks (`[omitted: ...]`). Errors on unknown ids (lists known ids). |
 | `subagent_cancel` | `ids[]` | Aborts running subagents (marks consumed first to avoid duplicate delivery), waits for settlement, reports per-id `Cancelled ...` / `was already <status>`. Partial transcripts remain on disk. |
-| `subagent_check` | `id` | Non-blocking peek: status line, turn count, error text, up to 2KB/20 lines of latest output (includes the live streaming assistant message). Does not consume the result. |
+| `subagent_send` | `id`, `message`, `mode?` | Returns immediately with the effective `steer` or `follow_up` delivery mode. Explicit unsupported steering fails; settled restarts reuse shared manager admission, and queued children reject sends. |
+| `subagent_inspect` (`subagent_check` compatibility alias) | `id` | Non-blocking bounded inspection: status, current tools, last activity, queued message previews, completed operations, capabilities, and latest output. Does not consume the result. |
 | `subagent_list` | — | One `describeSubagent()` line per agent: `id [status] "title" (provider/model, ctx%, elapsed, cwd)`. |
 
 Prompt metadata (all strings live in `prompt.ts`): `subagent_spawn` has a
@@ -329,7 +330,7 @@ interface SubagentSnapshot {      // what the UI and tools read; plain immutable
   queued: ReadonlyArray<{ text: string; kind: "steer" | "follow-up" }>;
   finalText: string;             // last Completed finalText (v1 finalOutput)
   latestText: string;            // finalText or live buffer (v1 latestOutput)
-  turns: number;                 // count of AssistantMessage events (for subagent_check)
+  turns: number;                 // count of AssistantMessage events (for subagent_inspect)
 }
 
 class SubagentManager extends ServiceMap.Key<SubagentManager, {

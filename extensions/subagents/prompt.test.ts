@@ -36,7 +36,7 @@ test("spawn result makes dependency-based waiting explicit", () => {
   assert.match(result, /next step requires that result/);
   assert.match(result, /continue outside its delegated scope/);
   assert.match(result, /subagent_cancel/);
-  assert.match(result, /subagent_check/);
+  assert.match(result, /subagent_inspect/);
   assert.match(result, /subagent_list/);
 });
 

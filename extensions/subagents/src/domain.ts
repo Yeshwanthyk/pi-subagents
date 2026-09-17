@@ -41,6 +41,13 @@ export function isReasoningEffort(
 export type SubagentStatus = "queued" | "running" | "done" | "error";
 export type TerminalSubagentStatus = Extract<SubagentStatus, "done" | "error">;
 export type SubagentFailureKind = "provider_stall" | "backend_failure";
+export type SubagentSendMode = "auto" | "steer" | "follow_up";
+export type EffectiveSubagentSendMode = Exclude<SubagentSendMode, "auto">;
+export interface SubagentCapabilities {
+  readonly steering: boolean;
+  readonly modelSelection: boolean;
+  readonly reasoningEffort: boolean;
+}
 /** Provenance is supplied by the backend boundary; it is never inferred from text. */
 export type SubagentFailureProvenance =
   | { readonly _tag: "provider_deadline" }
@@ -302,6 +309,8 @@ export interface SubagentSnapshot {
   readonly failureKind?: SubagentFailureKind;
   readonly outcome?: RunOutcome;
   readonly meta: SubagentMeta;
+  /** Native delivery support; manager-owned live snapshots always provide it. */
+  readonly capabilities?: SubagentCapabilities;
   readonly usage: { readonly tokens?: number; readonly contextWindow?: number };
   readonly transcript: ReadonlyArray<TranscriptItem>;
   /** Streaming assistant buffers, cleared when the finalized message lands. */
@@ -313,7 +322,7 @@ export interface SubagentSnapshot {
   readonly queued: ReadonlyArray<QueuedMessage>;
   /** Final text of the most recent completed run (v1 `finalOutput`). */
   readonly finalText: string;
-  /** Count of finalized assistant messages (for subagent_check). */
+  /** Count of finalized assistant messages (for subagent_inspect). */
   readonly turns: number;
 }
 

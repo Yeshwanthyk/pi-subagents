@@ -43,7 +43,8 @@ Requires the Codex CLI to be installed and authenticated.
 
 Call `subagent_spawn` with a complete `prompt`, short `name`, chosen `harness`, and optional `working_dir`, `model`, and `reasoning_effort`. At most four subagents run concurrently.
 
-- `subagent_check({ id })`: peek without blocking.
+- `subagent_inspect({ id })`: inspect bounded current activity and output without blocking or consuming completion. `subagent_check` is a compatibility alias.
+- `subagent_send({ id, message, mode? })`: send another instruction immediately. Use `mode: "steer"` to inject into the current run, `mode: "follow_up"` to wait until it would otherwise stop, or omit it for `auto`. The result reports the effective mode; explicit steering fails when unsupported instead of silently downgrading. Queued, workflow-owned, and client-owned children are not sendable through the parent surface.
 - `subagent_list()`: list all runs.
 - `subagent_wait({ ids })`: collect final outputs after all listed runs settle.
 - `subagent_cancel({ ids })`: stop runs while preserving partial transcripts.

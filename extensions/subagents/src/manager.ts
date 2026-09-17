@@ -22,7 +22,11 @@ import {
   Scope,
   Stream,
 } from "effect";
-import type { SubagentBackend, SubagentSession } from "./backend.ts";
+import type {
+  BackendCapabilities,
+  SubagentBackend,
+  SubagentSession,
+} from "./backend.ts";
 import { BackendRegistry } from "./backend.ts";
 import type {
   BackendName,
@@ -40,6 +44,8 @@ import type {
   ParentRef,
   WorkflowOwnership,
   SubagentFailureKind,
+  EffectiveSubagentSendMode,
+  SubagentSendMode,
 } from "./domain.ts";
 import {
   failureKindFromProvenance,
@@ -83,6 +89,7 @@ interface MutableSnapshot {
   failureKind?: SubagentFailureKind;
   outcome?: RunOutcome;
   meta: SubagentMeta;
+  capabilities: BackendCapabilities;
   usage: { tokens?: number; contextWindow?: number };
   transcript: TranscriptItem[];
   liveAssistant?: { text: string; thinking: string };
@@ -238,6 +245,11 @@ export interface CancelResult {
   readonly cancelled: boolean;
 }
 
+export interface SubagentSendResult {
+  readonly id: string;
+  readonly mode: EffectiveSubagentSendMode;
+}
+
 export interface SubagentManagerApi {
   spawn(
     backend: BackendName,
@@ -287,7 +299,11 @@ export interface SubagentManagerApi {
   cancel(
     ids: ReadonlyArray<string>,
   ): Effect.Effect<ReadonlyArray<CancelResult>>;
-  send(id: string, text: string): Effect.Effect<void, SendError>;
+  send(
+    id: string,
+    text: string,
+    mode?: SubagentSendMode,
+  ): Effect.Effect<SubagentSendResult, SendError>;
   get(id: string): Effect.Effect<SubagentSnapshot | undefined>;
   readonly list: Effect.Effect<ReadonlyArray<SubagentSnapshot>>;
   readonly disposeAll: Effect.Effect<void>;
@@ -753,6 +769,7 @@ const makeManager = Effect.gen(function* () {
               modelLabel: task.model,
               reasoningEffort: task.reasoningEffort,
             },
+            capabilities: { ...backend.capabilities },
             usage: {},
             transcript: [],
             liveTools: [],
@@ -908,8 +925,12 @@ const makeManager = Effect.gen(function* () {
       );
     });
 
-  const send = (id: string, text: string) =>
-    Effect.suspend((): Effect.Effect<void, SendError> => {
+  const send = (
+    id: string,
+    text: string,
+    requestedMode: SubagentSendMode = "auto",
+  ) =>
+    Effect.suspend((): Effect.Effect<SubagentSendResult, SendError> => {
       const entry = entries.get(id);
       if (!entry || disposed) {
         return new SendError({
@@ -919,6 +940,18 @@ const makeManager = Effect.gen(function* () {
       if (entry.snapshot.status === "queued") {
         return new SendError({
           message: `Subagent "${id}" is queued and cannot receive messages until it starts.`,
+        });
+      }
+      const effectiveMode: EffectiveSubagentSendMode =
+        requestedMode === "auto"
+          ? entry.snapshot.status === "running" &&
+            entry.backend.capabilities.steering
+            ? "steer"
+            : "follow_up"
+          : requestedMode;
+      if (effectiveMode === "steer" && !entry.backend.capabilities.steering) {
+        return new SendError({
+          message: `Subagent "${id}" on the ${entry.snapshot.backend} harness does not support steering; use mode "follow_up" or "auto".`,
         });
       }
       // Restarting a settled subagent occupies a running slot again, so it
@@ -942,7 +975,8 @@ const makeManager = Effect.gen(function* () {
         entry.slotHeld = true;
         activeSlots++;
         entry.restarting = true;
-        return entry.session.send(text).pipe(
+        return entry.session.send(text, effectiveMode).pipe(
+          Effect.map(() => ({ id, mode: effectiveMode })),
           Effect.onError(() =>
             Effect.sync(() => {
               entry.restarting = false;
@@ -957,7 +991,9 @@ const makeManager = Effect.gen(function* () {
           message: `Subagent "${id}" has no active backend session.`,
         });
       }
-      return entry.session.send(text);
+      return entry.session
+        .send(text, effectiveMode)
+        .pipe(Effect.map(() => ({ id, mode: effectiveMode })));
     });
 
   const disposeAll = Effect.gen(function* () {

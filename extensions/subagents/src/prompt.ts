@@ -42,7 +42,7 @@ export function buildSubagentSpawnResult(options: {
     `Spawned subagent ${options.id} "${options.title}" (${options.harness}: ${options.modelLabel}, ${options.cwd}).\n` +
     `It runs in the background, and its result will be delivered automatically. ` +
     `Use subagent_wait(ids: ["${options.id}"]) when your next step requires that result; otherwise continue outside its delegated scope. ` +
-    `Use subagent_cancel to stop it, subagent_check to peek, and subagent_list to see all.`
+    `Use subagent_cancel to stop it, subagent_inspect to peek, and subagent_list to see all.`
   );
 }
 
@@ -64,12 +64,23 @@ export const SUBAGENT_CANCEL_PARAMETER_DESCRIPTIONS = {
   ids: 'Parent-owned subagent ids to cancel, e.g. ["sa-1", "sa-2"]',
 };
 
+/** Describes sending another instruction to a parent-owned child. */
+export const SUBAGENT_SEND_TOOL_DESCRIPTION =
+  'Send another instruction to a parent-owned subagent and return immediately. Use mode "steer" to inject into the current run, "follow_up" to wait until the current run would otherwise stop, or "auto" to select the harness-supported mode. The result reports the effective delivery mode. Explicit steering fails when the harness does not support it; it is never downgraded silently. Queued children cannot receive messages.';
+
+/** Model-facing schema descriptions for subagent_send. */
+export const SUBAGENT_SEND_PARAMETER_DESCRIPTIONS = {
+  id: "Parent-owned subagent id",
+  message: "Instruction to send to the subagent",
+  mode: 'Delivery mode: "auto", "steer", or "follow_up"',
+};
+
 /** Describes nonblocking inspection of a subagent without consuming its result. */
-export const SUBAGENT_CHECK_TOOL_DESCRIPTION =
-  "Peek at a parent-owned subagent's status and recent activity without blocking. Does not consume its result.";
+export const SUBAGENT_INSPECT_TOOL_DESCRIPTION =
+  "Peek at a parent-owned subagent without blocking or consuming its result. Reports bounded current-tool activity, last activity, queued instruction previews, completed-operation counts, capabilities, and latest output; it never returns the child transcript.";
 
 /** Model-facing schema description for the subagent id to inspect. */
-export const SUBAGENT_CHECK_PARAMETER_DESCRIPTIONS = {
+export const SUBAGENT_INSPECT_PARAMETER_DESCRIPTIONS = {
   id: "Parent-owned subagent id",
 };
 

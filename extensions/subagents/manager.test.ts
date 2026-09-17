@@ -61,13 +61,14 @@ function task(prompt: string): SpawnTask {
   return { prompt, title: "test", cwd: process.cwd(), parent };
 }
 
-function makeControlledBackend() {
+function makeControlledBackend(steering = true) {
   const starts: string[] = [];
+  const sends: Array<{ prompt: string; text: string; mode: string }> = [];
   const sessions = new Map<string, Queue.Queue<SubagentEvent>>();
   const backend: SubagentBackend = {
     name: "codex",
     capabilities: {
-      steering: true,
+      steering,
       modelSelection: true,
       reasoningEffort: true,
     },
@@ -86,7 +87,10 @@ function makeControlledBackend() {
             modelLabel: "controlled/codex",
           }),
           events: Stream.fromQueue(events),
-          send: () => Effect.void,
+          send: (text, mode) =>
+            Effect.sync(() =>
+              sends.push({ prompt: spawnTask.prompt, text, mode }),
+            ),
           interrupt: Queue.offer(events, {
             _tag: "RunSettled",
             outcome: { _tag: "Interrupted" },
@@ -104,6 +108,7 @@ function makeControlledBackend() {
   return {
     backend,
     starts,
+    sends,
     complete: (prompt: string, finalText = prompt) =>
       emit(prompt, {
         _tag: "RunSettled",
@@ -595,6 +600,97 @@ test("send steers an idle subagent into another turn", async () => {
     const afterSecond = manager.view.get(snap.id);
     assert.equal(afterSecond?.status, "done");
     assert.match(afterSecond?.finalText ?? "", /Second turn/);
+  });
+});
+
+test("send resolves auto and preserves explicit follow-up semantics", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const snap = await runTool(
+      runtime,
+      manager.spawn("codex", task("mode test")),
+    );
+    await waitUntil(
+      () => manager.view.get(snap.id)?.status === "running",
+      "mode-test child should be admitted",
+    );
+
+    const automatic = await runTool(runtime, manager.send(snap.id, "steer me"));
+    assert.deepEqual(automatic, { id: snap.id, mode: "steer" });
+    const followUp = await runTool(
+      runtime,
+      manager.send(snap.id, "follow later", "follow_up"),
+    );
+    assert.deepEqual(followUp, { id: snap.id, mode: "follow_up" });
+    assert.deepEqual(
+      controlled.sends.map(({ text, mode }) => ({ text, mode })),
+      [
+        { text: "steer me", mode: "steer" },
+        { text: "follow later", mode: "follow_up" },
+      ],
+    );
+  });
+});
+
+test("explicit steering fails when a backend does not support it", async () => {
+  const controlled = makeControlledBackend(false);
+  const runtime = createRuntimeWith(controlled.backend);
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const snap = await runTool(
+      runtime,
+      manager.spawn("codex", task("unsupported steer")),
+    );
+    await waitUntil(
+      () => manager.view.get(snap.id)?.status === "running",
+      "unsupported-steer child should be admitted",
+    );
+
+    await assert.rejects(
+      runTool(runtime, manager.send(snap.id, "must steer", "steer")),
+      /does not support steering/,
+    );
+    const result = await runTool(
+      runtime,
+      manager.send(snap.id, "follow instead", "auto"),
+    );
+    assert.deepEqual(result, { id: snap.id, mode: "follow_up" });
+    assert.deepEqual(controlled.sends, [
+      {
+        prompt: "unsupported steer",
+        text: "follow instead",
+        mode: "follow_up",
+      },
+    ]);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("running follow-up stays live and settles after the queued turn", async () => {
+  await withManager(async (manager, runtime) => {
+    const child = await runTool(
+      runtime,
+      manager.spawn("codex", task("follow-up-lifecycle")),
+    );
+    await waitUntil(
+      () => manager.view.get(child.id)?.status === "running",
+      "child should be running",
+    );
+    const sent = await runTool(
+      runtime,
+      manager.send(child.id, "queued continuation", "follow_up"),
+    );
+    assert.equal(sent.mode, "follow_up");
+    await waitUntil(
+      () => (manager.view.get(child.id)?.turns ?? 0) >= 2,
+      "initial turn should finish before the continuation",
+    );
+    assert.equal(manager.view.get(child.id)?.status, "running");
+
+    await runTool(runtime, manager.waitFor([child.id]));
+    const settled = manager.view.get(child.id);
+    assert.equal(settled?.turns, 4);
+    assert.match(settled?.finalText ?? "", /queued continuation/);
   });
 });
 

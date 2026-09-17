@@ -17,7 +17,8 @@ Tools:
 - `subagent_spawn`
 - `subagent_wait`
 - `subagent_cancel`
-- `subagent_check`
+- `subagent_send`
+- `subagent_inspect` (`subagent_check` remains a compatibility alias)
 - `subagent_list`
 
 Command:
@@ -25,6 +26,10 @@ Command:
 - `/subagents` — compact fleet view, transcript inspection, and takeover for parent-owned subagents
 
 `Ctrl+Shift+A` toggles the fleet view. Workflow children are inspectable there but remain read-only; workflow lifecycle changes go through `workflow_control`.
+
+`subagent_send({ id, message, mode? })` sends another instruction immediately. `mode` is `auto`, `steer`, or `follow_up`; explicit steering fails on a harness that does not support it, while `auto` selects the effective supported mode. Queued children remain unavailable for sending.
+
+`subagent_inspect({ id })` returns a bounded, read-only snapshot of current tools, last activity, queued instruction previews, completed operations, latest output, and harness capabilities. It never waits for or consumes completion.
 
 ## Workflows
 

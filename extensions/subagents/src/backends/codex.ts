@@ -27,6 +27,7 @@ import type {
   SubagentFailureProvenance,
   SubagentMeta,
   TranscriptPart,
+  EffectiveSubagentSendMode,
 } from "../domain.ts";
 import {
   failureKindFromProvenance,
@@ -649,8 +650,22 @@ const makeCodexSession = (
       state.activeTurnId = undefined;
       state.interruptRequested = false;
       tools.clear();
+      if (
+        outcome._tag === "Completed" &&
+        state.pendingPrompts.length > 0 &&
+        !state.closed
+      ) {
+        // A queued follow-up is part of the same manager-owned run. Keep the
+        // admission slot and automatic-completion lifecycle open until the
+        // final queued turn settles.
+        queueMicrotask(startNextQueued);
+        return;
+      }
+      if (state.pendingPrompts.length > 0) {
+        state.pendingPrompts = [];
+        emit({ _tag: "QueueChanged", queued: [] });
+      }
       emit({ _tag: "RunSettled", outcome });
-      queueMicrotask(startNextQueued);
     };
 
     const sendInterrupt = (serial: number) => {
@@ -1192,10 +1207,15 @@ const makeCodexSession = (
     return {
       meta: Effect.sync(() => state.meta),
       events: Stream.fromQueue(events),
-      send: (text) =>
+      send: (text, mode: EffectiveSubagentSendMode) =>
         Effect.suspend((): Effect.Effect<void, SendError> => {
           if (state.closed) {
             return new SendError({ message: "Subagent session is closed." });
+          }
+          if (mode === "steer") {
+            return new SendError({
+              message: "Codex subagents do not support steering.",
+            });
           }
           if (state.activeRun) {
             state.pendingPrompts.push(text);

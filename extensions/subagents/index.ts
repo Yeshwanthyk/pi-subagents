@@ -7,7 +7,9 @@
  *   model, reasoning_effort). Max 4 running at once across all backends.
  * - subagent_wait: block until the listed parent-owned subagents settle, return results.
  * - subagent_cancel: stop one or more queued/running parent-owned subagents.
- * - subagent_check: peek at a parent-owned subagent's status and recent activity.
+ * - subagent_send: send another instruction to one parent-owned subagent.
+ * - subagent_inspect: peek at a parent-owned subagent's status and recent activity.
+ * - subagent_check: compatibility alias for subagent_inspect.
  * - subagent_list: list all parent-owned subagents.
  *
  * Unawaited parent-owned subagents queue their result as a follow-up message
@@ -45,7 +47,6 @@ import {
   BACKEND_NAMES,
   formatElapsed,
   isSubagentPending,
-  latestText,
   REASONING_EFFORTS,
   type ParentRef,
   type SubagentSnapshot,
@@ -70,8 +71,6 @@ import {
   buildSubagentSpawnResult,
   SUBAGENT_CANCEL_PARAMETER_DESCRIPTIONS,
   SUBAGENT_CANCEL_TOOL_DESCRIPTION,
-  SUBAGENT_CHECK_PARAMETER_DESCRIPTIONS,
-  SUBAGENT_CHECK_TOOL_DESCRIPTION,
   SUBAGENT_LIST_TOOL_DESCRIPTION,
   SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS,
   SUBAGENT_SPAWN_PROMPT_GUIDELINES,
@@ -80,6 +79,7 @@ import {
   SUBAGENT_WAIT_PARAMETER_DESCRIPTIONS,
   SUBAGENT_WAIT_TOOL_DESCRIPTION,
 } from "./src/prompt.ts";
+import { registerSubagentParentTools } from "./src/parent-tools.ts";
 import { createParentResultCoordinator } from "./src/parent-coordinator.ts";
 import type { ParentResultEnvelope } from "./src/parent-mailbox.ts";
 import {
@@ -1583,44 +1583,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
-    name: "subagent_check",
-    label: "Check Subagent",
-    description: SUBAGENT_CHECK_TOOL_DESCRIPTION,
-    parameters: Type.Object({
-      id: Type.String({
-        description: SUBAGENT_CHECK_PARAMETER_DESCRIPTIONS.id,
-      }),
-    }),
-    async execute(_toolCallId, params) {
-      const manager = await getManager();
-      const snap = standardSnapshot(manager, params.id);
-      if (!snap) {
-        const known = standardSnapshots(manager).map((s) => s.id);
-        throw new Error(
-          `Unknown subagent id "${params.id}". Known: ${known.join(", ") || "none"}.`,
-        );
-      }
-
-      let text = `${describeSubagent(snap)}\nTurns: ${snap.turns}`;
-      if (snap.errorText) text += `\nError: ${snap.errorText}`;
-
-      const output = latestText(snap);
-      if (output) {
-        const preview = truncateHead(output, { maxBytes: 2048, maxLines: 20 });
-        text += `\n\nLatest output:\n${preview.content}`;
-        if (preview.truncated) text += "\n[...]";
-      } else if (snap.status === "queued") {
-        text += "\n\n(waiting for an execution slot)";
-      } else if (snap.status === "running") {
-        text += "\n\n(no text output yet)";
-      }
-
-      return {
-        content: [{ type: "text", text }],
-        details: { id: snap.id, status: snap.status, turns: snap.turns },
-      };
-    },
+  registerSubagentParentTools(pi, {
+    getManager,
+    runEffect: (effect) => runTool(getRuntime(), effect),
   });
 
   pi.registerTool({

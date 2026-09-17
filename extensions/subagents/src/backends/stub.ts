@@ -5,8 +5,8 @@
  * - streams a plausible turn (thinking deltas, one fake tool cycle, text
  *   deltas, usage ramp, a final assistant message, RunSettled) over a few
  *   seconds so streaming UI, wait, and the footer counters are observable;
- * - supports send() while running (queued-steer rendering) and while idle
- *   (fresh run);
+ * - supports send() with steer/follow-up queue kinds while running and with a
+ *   fresh run while idle;
  * - supports interrupt (RunSettled Interrupted -> status "error", matching v1);
  * - fails the run when the prompt starts with "FAIL:" (error-path testing);
  * - appends every event to a JSONL "session file" in tmpdir so the
@@ -25,6 +25,7 @@ import type {
   SpawnTask,
   SubagentEvent,
   SubagentMeta,
+  EffectiveSubagentSendMode,
 } from "../domain.ts";
 import { SendError } from "../domain.ts";
 
@@ -90,9 +91,12 @@ const makeStubSession = (
         sessionFilePath: sessionFile,
         nativeSessionId: sessionId,
       } satisfies SubagentMeta as SubagentMeta,
-      // SAFETY: `pending` is only appended via submit(text: string) and
-      // cleared wholesale, so the empty literal is a string[].
-      pending: [] as string[],
+      // SAFETY: pending entries are only appended by submit() and removed from
+      // the front by the single driver fiber.
+      pending: [] as Array<{
+        text: string;
+        kind: QueuedMessage["kind"];
+      }>,
       turnCount: 0,
       closed: false,
       /** True between the driver dequeuing a prompt and registering its turn fiber. */
@@ -171,6 +175,9 @@ const makeStubSession = (
         });
 
         if (failing) {
+          yield* Queue.clear(inbox).pipe(Effect.ignore);
+          state.pending = [];
+          yield* emit({ _tag: "QueueChanged", queued: [] });
           yield* pause;
           yield* emit({
             _tag: "RunSettled",
@@ -199,14 +206,16 @@ const makeStubSession = (
           tokens: Math.min(profile.contextWindow, 2400 * (turn + 1) + 900),
           contextWindow: profile.contextWindow,
         });
-        yield* emit({
-          _tag: "RunSettled",
-          outcome: { _tag: "Completed", finalText },
-        });
+        if (state.pending.length === 0) {
+          yield* emit({
+            _tag: "RunSettled",
+            outcome: { _tag: "Completed", finalText },
+          });
+        }
       });
 
     const queuedView = (): ReadonlyArray<QueuedMessage> =>
-      state.pending.map((text) => ({ text, kind: "steer" as const }));
+      state.pending.map(({ text, kind }) => ({ text, kind }));
 
     // Driver: one turn at a time, in submission order. Turns run as child
     // fibers so interrupt() stops the turn without killing the driver.
@@ -244,14 +253,17 @@ const makeStubSession = (
       }),
     );
 
-    const submit = (text: string) =>
+    const submit = (text: string, mode: EffectiveSubagentSendMode) =>
       Effect.gen(function* () {
         if (state.closed) {
           return yield* new SendError({
             message: "Subagent session is closed.",
           });
         }
-        state.pending.push(text);
+        state.pending.push({
+          text,
+          kind: mode === "follow_up" ? "follow-up" : "steer",
+        });
         const busy = (yield* Ref.get(activeTurn)) !== undefined;
         if (busy) {
           // Show the queued steer line until the driver picks it up.
@@ -266,7 +278,7 @@ const makeStubSession = (
     );
     yield* emit({ _tag: "MetaChanged", meta: state.meta });
     // The session cannot be closed yet, so the initial submit cannot fail.
-    yield* submit(task.prompt).pipe(Effect.orDie);
+    yield* submit(task.prompt, "steer").pipe(Effect.orDie);
 
     return {
       meta: Effect.sync(() => state.meta),

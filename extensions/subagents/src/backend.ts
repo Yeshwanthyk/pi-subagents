@@ -16,14 +16,12 @@ import type {
   SpawnTask,
   SubagentEvent,
   SubagentMeta,
+  EffectiveSubagentSendMode,
+  SubagentCapabilities,
 } from "./domain.ts";
 
-export interface BackendCapabilities {
-  /** Can send() steer a live run (vs. only starting a fresh run when idle). */
-  readonly steering: boolean;
-  readonly modelSelection: boolean;
-  readonly reasoningEffort: boolean;
-}
+/** Capabilities fixed by a backend and copied into each child snapshot. */
+export type BackendCapabilities = SubagentCapabilities;
 
 /**
  * A live subagent session. The manager is the single consumer of `events`;
@@ -41,7 +39,10 @@ export interface SubagentSession {
    * Steer the active run, or start a fresh run when idle (v1 `manager.send`
    * semantics — the "is a run active" decision is backend-native state).
    */
-  send(text: string): Effect.Effect<void, SendError>;
+  send(
+    text: string,
+    mode: EffectiveSubagentSendMode,
+  ): Effect.Effect<void, SendError>;
   /**
    * Interrupt the active run. Resolves once the backend acknowledges; the
    * corresponding RunSettled(Interrupted) arrives on `events`. Callers bound
