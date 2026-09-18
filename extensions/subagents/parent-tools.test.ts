@@ -227,6 +227,26 @@ test("inspection reports acceptance independently from process status", async ()
   assert.equal(result.details.acceptance?.status, "reject");
   assert.match(result.content[0]!.text, /Acceptance: reject/);
   assert.match(result.content[0]!.text, /required evidence was missing/);
+  assert.match(result.content[0]!.text, /process completed/);
+});
+
+test("inspection explicitly retrieves a gated report beyond the routine preview limit", async () => {
+  const report = `report start\n${"evidence line\n".repeat(180)}report end`;
+  assert.ok(Buffer.byteLength(report, "utf8") > 2_048);
+  const inspected = snapshot("sa-gated-report", {
+    status: "done",
+    outcome: { _tag: "Completed", finalText: report },
+    acceptance: { status: "pass" },
+    finalText: report,
+  });
+  const { tools } = fixture([inspected]);
+  const result = await tools.inspect.execute("inspect-gated-report", {
+    id: inspected.id,
+  });
+
+  assert.equal(result.details.latestOutput, report);
+  assert.equal(result.details.latestOutputTruncated, false);
+  assert.match(result.content[0]!.text, /report end/);
 });
 
 test("routed admission requires a newer user message and is idempotent", async () => {

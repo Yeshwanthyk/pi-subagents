@@ -1,13 +1,15 @@
 /** Describes the optional, bounded parent-only Jev evaluation tool. */
 export const ASK_JEV_TOOL_DESCRIPTION =
-  "Ask the optional Jev service bounded choice or score questions about only the supplied state. This direct invocation sends the state and questions to a remote service when the configured environment credential is present. It returns data, not execution authority, and never reads files or uploads the conversation automatically.";
+  "Ask the optional Jev service bounded choice or score questions about only the supplied state. This direct invocation sends the state and questions to a remote service when the configured environment credential is present. Jev is an advisory evaluator, not an agent or proof, and never reads files or uploads the conversation automatically.";
 
 export const ASK_JEV_PROMPT_SNIPPET =
   "Ask optional remote Jev choice or score questions about explicitly selected bounded state";
 
 export const ASK_JEV_PROMPT_GUIDELINES = [
-  "Use ask_jev only when remote Jev evaluation is useful and send only the minimum explicitly selected state needed for the questions.",
-  "Treat ask_jev answers as advisory data, never as permission to execute, proof that checks passed, or authority to change routing or scope.",
+  "On each request, and while planning or delegating, consider whether Jev can replace a larger model call or avoid reading a long report. Prefer it for bounded classification, scoring, and report judgments, but invoke it only when useful rather than automatically.",
+  "Batch related questions and send only the minimum explicitly selected evidence needed to answer them; Jev never reads files or uploads context on its own.",
+  "When continuation depends on judging a child's result, declare a Jev gate. Show planned gates before any required approval, and keep exact code checks and tests in the task rather than asking Jev to prove correctness.",
+  "Treat Jev answers as advisory data, never as permission to execute, proof that checks passed, or authority to change routing or scope.",
 ];
 
 export const ASK_JEV_PARAMETER_DESCRIPTIONS = {
@@ -21,7 +23,7 @@ export const ASK_JEV_PARAMETER_DESCRIPTIONS = {
 
 /** Describes subagent_spawn, including harnesses and the fixed concurrency cap. */
 export const SUBAGENT_SPAWN_TOOL_DESCRIPTION =
-  "Spawn a background subagent and return immediately with an id, or prepare an approval-bound runtime proposal when preference routing is enabled and classification is supplied. Classification describes the assignment, never the agent name or permissions. Explicit harness/model fields take precedence. The child is autonomous with its own context window and cannot orchestrate agents/workflows, ask the user, or see this conversation. Max 4 subagents run at once; excess work waits in the shared FIFO queue.";
+  "Spawn a background subagent and return immediately with an id, or prepare an approval-bound runtime proposal when preference routing is enabled and classification is supplied. Classification describes the actual deliverable, never the agent name or permissions. Explicit harness/model fields take precedence. The child is autonomous with its own context window and cannot orchestrate agents/workflows, ask the user, or see this conversation. Max 4 subagents run at once; excess work waits in the shared FIFO queue.";
 
 /** Adds background subagent delegation to the parent model's available-tools prompt. */
 export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
@@ -30,9 +32,10 @@ export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
 /** Guides the parent model to delegate scoped work and coordinate with results. */
 export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
   "Use subagent_spawn for self-contained work with a clear scope, purpose, and expected output. Parallel delegation is appropriate when scopes can proceed independently, whether separate or complementary.",
-  "Classify the assignment explicitly when using preference routing: scout for information gathering, small_slice for a narrow change, lint for mechanical checks, implementation for product changes, and validation for review or proof. Complexity hard is separate from intent and never changes permissions.",
-  "A preference-derived subagent_spawn proposal starts no child. Wait for a newer user approval, then call subagent_approve with the exact proposal id and binding digest.",
+  "Classify the actual deliverable when using preference routing: scout for information gathering, small_slice for a narrow change, lint for mechanical checks, implementation for product changes, and validation for review or proof. Use validation with simple complexity for lightweight validation; it selects simple_validation. Hard complexity is separate from intent. Classification never comes from the agent name and never grants permissions.",
+  "Treat a preference-derived runtime as a recommendation: its subagent_spawn proposal starts no child. Present the proposal, wait for a newer user approval, then call subagent_approve with the exact proposal id and binding digest.",
   "Pick the subagent harness deliberately: pi unless there is a reason to prefer Codex.",
+  "A gated standalone result delivers compact acceptance by default; request the full report explicitly when needed. Workflow consumers that truly need a dependency report retain its content—never strip dependency evidence for compact delivery.",
   "Coordinate by scope: while a child runs, continue parent work outside its delegated scope. When its result arrives, use it as the basis for synthesis, validation, integration, or follow-up in that scope.",
   "Use subagent_wait when the next parent step requires a child's result, such as synthesis or integration that includes its work, review of its findings, or a dependent decision.",
 ];
@@ -43,7 +46,7 @@ export const SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS = {
     "Task prompt for the subagent. Must be self-contained: include all needed context, file paths, and what to report back.",
   name: "Short human-readable name for this subagent, shown in listings and the UI",
   classification:
-    "Explicit assignment classification for preference routing; this does not grant permissions or infer scope",
+    "Actual deliverable classification for preference routing; validation plus simple complexity selects simple_validation. It does not come from the agent name or grant permissions.",
   harness:
     'Harness to run the subagent on: "pi" or "codex". Required for direct spawning while routing is disabled; optional when an enabled classified route supplies it.',
   workingDir: "Working directory (default: current working directory)",

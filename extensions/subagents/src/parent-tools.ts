@@ -19,6 +19,7 @@ const INSPECT_MAX_TOOLS = 4;
 const INSPECT_MAX_QUEUED = 4;
 const INSPECT_PREVIEW_MAX_LENGTH = 512;
 const INSPECT_OUTPUT_MAX_BYTES = 2_048;
+const INSPECT_GATED_REPORT_MAX_BYTES = 24 * 1024;
 
 function singleLine(text: string) {
   return text.replace(/\s+/gu, " ").trim();
@@ -70,10 +71,15 @@ export function projectSubagentInspection(snap: SubagentSnapshot) {
       text: boundedPreview(message.text) ?? "",
     }));
   const output = latestInspectionOutput(snap);
+  const latestOutputMaxBytes =
+    snap.acceptance !== undefined && snap.acceptance.status !== "pending"
+      ? INSPECT_GATED_REPORT_MAX_BYTES
+      : INSPECT_OUTPUT_MAX_BYTES;
   const latestOutput = output
     ? truncateHead(output, {
-        maxBytes: INSPECT_OUTPUT_MAX_BYTES,
-        maxLines: 20,
+        maxBytes: latestOutputMaxBytes,
+        maxLines:
+          latestOutputMaxBytes === INSPECT_GATED_REPORT_MAX_BYTES ? 600 : 20,
       })
     : undefined;
   const lastCompletedOperation = snap.lastCompletedOperation

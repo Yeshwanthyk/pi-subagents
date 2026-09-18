@@ -251,6 +251,10 @@ A score gate uses the zero-based criterion index as its threshold:
 
 Standalone gate predicates use snake-case `question_id`; `timeout_ms` is optional, defaults to 10 seconds, and must be between 1 and 120,000 milliseconds. The predicate must reference a declared question, choice values must be declared options, and score thresholds must be valid criterion indexes. The gate sends a bounded evidence envelope containing the task goal, final report, process outcome, and completeness flags. Missing or oversized evidence fails the gate rather than silently passing it.
 
+For standalone gated children, routine result delivery is deliberately compact. Automatic parent messages and `subagent_wait` return the pass/reject/error verdict, plus a bounded single-line reason for reject or error, without duplicating the report in message or tool details. The full work product remains owned by the subagent manager. Call `subagent_inspect({ id })` to retrieve the terminal gated report explicitly; inspection returns up to 24 KiB and 600 lines. If a larger report exceeds that inspection bound, use `/subagents` to inspect the retained transcript. Ungated children continue to return their report directly.
+
+This compact verdict is not a correctness proof. Jev judges the bounded report supplied by the child against the declared questions and predicate; it does not independently inspect the repository, rerun checks, or establish that the report is true. Retrieve the report and use deterministic verification when correctness depends on its claims.
+
 ## Typed workflow evaluations and gates
 
 In a static `flow({ tasks: [...] })` definition, a read-only task can use `execution.type: "evaluation"`. Its payload contains explicit state and the same choice/score question shapes used by `ask_jev`. It does not spawn a coding child or consume a coding slot. `needs` controls readiness, while `consumes` explicitly appends bounded completed dependency results to the evaluation input.
@@ -334,7 +338,7 @@ Evaluation tasks must be `readOnly: true` and cannot also declare a gate. Workfl
 
 ## Acceptance state
 
-A standalone child may expose an acceptance state in `subagent_inspect`, list/wait output, and final result delivery:
+A standalone child may expose an acceptance state in `subagent_inspect`, list output, and compact wait/final result delivery:
 
 - `pending`: the coding process has finished, but final wait and parent delivery are held;
 - `pass`: acceptance completed successfully;

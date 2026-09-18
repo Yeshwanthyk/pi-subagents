@@ -234,6 +234,24 @@ test("handoffs include only explicit completed consumes and are delimited, label
   assert.equal(handoff.entries.length, 1);
   assert.equal(handoff.entries[0]?.truncated, false);
 
+  const gatedHandoff = buildTaskHandoff(
+    { id: "verify", label: "Verify", consumes: ["implementation"] },
+    new Map([
+      [
+        "implementation",
+        {
+          status: "completed",
+          output: {
+            report: "FULL GATED WORKFLOW REPORT",
+            gate: { answers: { verdict: "pass" } },
+          },
+        },
+      ],
+    ]),
+  );
+  assert.match(gatedHandoff.text, /FULL GATED WORKFLOW REPORT/);
+  assert.match(gatedHandoff.text, /verdict/);
+
   const empty = buildTaskHandoff(
     { id: "writer", consumes: [] },
     new Map([["scout", { status: "completed", output: "not selected" }]]),

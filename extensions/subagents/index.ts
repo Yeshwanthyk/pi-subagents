@@ -35,13 +35,9 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
-  DEFAULT_MAX_BYTES,
-  DEFAULT_MAX_LINES,
-  formatSize,
   getAgentDir,
   getMarkdownTheme,
   ProjectTrustStore,
-  truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
@@ -84,6 +80,7 @@ import {
 import { registerSubagentParentTools } from "./src/parent-tools.ts";
 import { createParentResultCoordinator } from "./src/parent-coordinator.ts";
 import type { ParentResultEnvelope } from "./src/parent-mailbox.ts";
+import { buildSubagentWaitResult } from "./src/result-delivery.ts";
 import {
   buildParentResultBatchMessage,
   PARENT_RESULT_BATCH_OPTIONS,
@@ -183,9 +180,6 @@ import {
   renderSubagentWaitSummary,
 } from "./src/ui/activity-card.ts";
 
-const SUBAGENT_OUTPUT_MAX_BYTES = 24 * 1024;
-const WAIT_OUTPUT_MAX_BYTES = 48 * 1024;
-const WAIT_PER_AGENT_MAX_BYTES = 16 * 1024;
 const HEADLESS_LABEL_MAX_LENGTH = 80;
 const HEADLESS_OUTPUT_MAX_LENGTH = 2_000;
 const HEADLESS_NOTIFY_MAX_LENGTH = 300;
@@ -461,22 +455,6 @@ function describeSubagent(snap: SubagentSnapshot) {
     snap.cwd,
   ].filter(Boolean);
   return `${snap.id} [${snap.status}${acceptance}] "${snap.title}" (${details.join(", ")})`;
-}
-
-function truncatedOutput(
-  snap: SubagentSnapshot,
-  maxBytes = SUBAGENT_OUTPUT_MAX_BYTES,
-): string {
-  const output = snap.finalText || "(no output)";
-  const truncation = truncateHead(output, {
-    maxBytes: Math.min(maxBytes, DEFAULT_MAX_BYTES),
-    maxLines: Math.min(600, DEFAULT_MAX_LINES),
-  });
-  let text = truncation.content;
-  if (truncation.truncated) {
-    text += `\n\n[Output truncated: ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)} shown. Full transcript in session file: ${snap.meta.sessionFilePath ?? "?"}]`;
-  }
-  return text;
 }
 
 /**
@@ -1926,64 +1904,12 @@ export default function (pi: ExtensionAPI) {
       // automatic delivery now that the tool is returning the result.
       parentResults.consume(waitOwners);
 
-      const sections: string[] = [];
-      let remainingBytes = WAIT_OUTPUT_MAX_BYTES;
-      for (const id of ids) {
-        const snap = standardSnapshot(manager, id);
-        if (!snap) {
-          sections.push(`## ${id}\n\n(no longer tracked)`);
-          continue;
-        }
-        const verb =
-          snap.status === "error" ||
-          snap.acceptance?.status === "reject" ||
-          snap.acceptance?.status === "error"
-            ? "failed"
-            : snap.acceptance?.status === "pending"
-              ? "finished process; acceptance pending"
-              : "finished";
-        let section = `## ${snap.id} "${snap.title}" ${verb}`;
-        if (snap.errorText) section += `\nError: ${snap.errorText}`;
-        if (
-          snap.acceptance &&
-          "reason" in snap.acceptance &&
-          snap.acceptance.reason
-        ) {
-          section += `\nAcceptance: ${snap.acceptance.status} — ${snap.acceptance.reason}`;
-        }
-        const headerBytes = Buffer.byteLength(section, "utf8") + 2;
-        const outputBudget = Math.max(
-          512,
-          Math.min(WAIT_PER_AGENT_MAX_BYTES, remainingBytes - headerBytes),
-        );
-        section += `\n\n${truncatedOutput(snap, outputBudget)}`;
-        const sectionBytes = Buffer.byteLength(section, "utf8");
-        if (sectionBytes > remainingBytes) {
-          sections.push(
-            `## ${snap.id} "${snap.title}"\n\n[omitted: total wait output limit reached]`,
-          );
-          break;
-        }
-        sections.push(section);
-        remainingBytes -= sectionBytes;
-      }
-
-      const combined = sections.join("\n\n---\n\n");
-      const bounded = truncateHead(combined, {
-        maxBytes: WAIT_OUTPUT_MAX_BYTES - 128,
-        maxLines: DEFAULT_MAX_LINES,
-      });
-      const text = bounded.truncated
-        ? `${bounded.content}\n\n[wait output truncated at the total output limit]`
-        : bounded.content;
+      const delivery = buildSubagentWaitResult(
+        ids.map((id) => ({ id, snapshot: standardSnapshot(manager, id) })),
+      );
       return {
-        content: [{ type: "text", text }],
-        details: {
-          results: ids.map((id) => {
-            const snap = standardSnapshot(manager, id);
-            return { id, title: snap?.title, status: snap?.status };
-          }),
-        },
+        content: [{ type: "text", text: delivery.text }],
+        details: delivery.details,
       };
     },
   });

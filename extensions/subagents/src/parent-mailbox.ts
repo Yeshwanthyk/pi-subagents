@@ -39,7 +39,7 @@ export const PARENT_RESULT_LIMITS = {
   maxTitleLength: 160,
   maxErrorBytes: 4 * 1024,
   maxOutputBytes: 24 * 1024,
-  maxAcceptanceReasonBytes: 4 * 1024,
+  maxAcceptanceReasonBytes: 512,
 } as const;
 
 interface MailboxEntry {

@@ -1,51 +1,18 @@
 ---
 name: subagents
-description: invoke this skill when the user asks you to use subagents
+description: Orchestrate subagents when the user asks to delegate work or use subagents.
 ---
 
 # Subagents
 
-Each subagent is headless, has its own context window, cannot see the parent conversation, cannot ask the user, and cannot spawn subagents or workflows. Give every child a self-contained prompt with paths, constraints, and the expected report.
+Each child is headless, has separate context, cannot ask the user, and cannot spawn subagents or workflows.
 
-## Pi Harness
+1. Choose standalone delegation for bounded tasks or `workflow` for a reviewed dependency graph. Keep decomposition proportional and give every child a self-contained prompt with paths, constraints, scope, and expected report.
+2. Classify the actual deliverable, not the child name or permissions. Use `validation` with `complexity: "simple"` for lightweight validation; this selects `simple_validation`. Use `complexity: "hard"` only for genuinely hard work.
+3. Choose runtime explicitly when required. Explicit harness/model fields win. Otherwise use `subagent_route`, or classified `subagent_spawn`, as a preference recommendation: show the proposed runtime, wait for a newer user approval, then pass the exact proposal ID and binding digest to `subagent_approve`.
+4. For a workflow, prepare the immutable draft with `workflow`, review the outcome and every task's purpose, wiring, scope, and requested runtime, then wait for a newer explicit user response before approving the exact draft ID.
+5. Coordinate standalone children with `subagent_inspect`, `subagent_send`, `subagent_list`, `subagent_wait`, and `subagent_cancel`. Continue only outside delegated scope until a required result arrives.
+6. Consider Jev on each request and while planning or delegating, without calling it automatically. Prefer it for bounded classification, scoring, or report judgments when it replaces a larger model call or avoids reading a long report. Batch related questions and send minimal selected evidence; Jev is advisory, not proof or authority.
+7. When continuation depends on judging a child's result, add a Jev gate. Show planned gates before required approval, and put exact code checks and tests in the child task. Gated standalone delivery is compact acceptance by default; request its full report explicitly when needed. Workflow consumers that truly need a report retain its content—never strip dependency evidence.
 
-**Harness:** `pi`
-**Prompt nicknames:** “pi”, “pi agent”, “pi subagent”
-**Best default:** Use when the user does not request another harness. It inherits the parent model and thinking level when `model` or `reasoning_effort` is omitted.
-
-Pi can use any model shown by `pi --list-models`. Prefer `provider/model-id`; a bare model id only works when unambiguous. Common picks in this environment:
-
-| Model                            | Recommended effort |
-| -------------------------------- | ------------------ |
-| inherited parent model (default) | inherited          |
-| `openai-codex/gpt-5.6-sol`       | `high`             |
-| `openai-codex/gpt-5.6-terra`     | `high`             |
-
-**Thinking budgets:** `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. These map directly to pi thinking levels.
-
-## Codex Harness
-
-**Harness:** `codex`
-**Prompt nicknames:** “codex”, “Codex CLI”, “codex agent”, “codex subagent”
-**Best default:** `gpt-5.6-sol` with `high` effort for coding work. Do not use anything other than sol unless the user specifically asks for it.
-
-| Model           | Recommended effort |
-| --------------- | ------------------ |
-| `gpt-5.6-sol`   | `high`             |
-| `gpt-5.6-terra` | `high`             |
-| `gpt-5.6-luna`  | `high`             |
-
-**Thinking budgets accepted by the extension:** `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Codex maps these to the nearest effort supported by the selected model; `off`/`minimal` become `minimal`, while `max` becomes the highest extension-supported Codex effort.
-
-Requires the Codex CLI to be installed and authenticated.
-
-## Spawn and Manage
-
-Call `subagent_spawn` with a complete `prompt`, short `name`, chosen `harness`, and optional `working_dir`, `model`, and `reasoning_effort`. At most four subagents run concurrently.
-
-- `subagent_inspect({ id })`: inspect bounded current activity and output without blocking or consuming completion. `subagent_check` is a compatibility alias.
-- `subagent_send({ id, message, mode? })`: send another instruction immediately. Use `mode: "steer"` to inject into the current run, `mode: "follow_up"` to wait until it would otherwise stop, or omit it for `auto`. The result reports the effective mode; explicit steering fails when unsupported instead of silently downgrading. Queued, workflow-owned, and client-owned children are not sendable through the parent surface.
-- `subagent_list()`: list all runs.
-- `subagent_wait({ ids })`: collect final outputs after all listed runs settle.
-- `subagent_cancel({ ids })`: stop runs while preserving partial transcripts.
-- `/subagents`: inspect or take over a run interactively.
+Read [Jev and standalone routing usage](../../extensions/subagents/docs/jev-routing-usage.md) for gate schemas and workflow forms. Use effective settings for runtime preferences and registered tool schemas for arguments.

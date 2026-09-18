@@ -4,6 +4,7 @@ import {
   buildSubagentResultBatchMessage,
   type SubagentResultCard,
 } from "./prompt.ts";
+import { compactGatedReportNotice } from "./result-delivery.ts";
 
 export interface ParentResultBatchDetails {
   readonly results: ReadonlyArray<{
@@ -33,7 +34,10 @@ function resultCard(result: ParentResultEnvelope): SubagentResultCard {
     title: result.title,
     status: result.status,
     error: result.error,
-    output: result.output,
+    output:
+      result.acceptance === undefined
+        ? result.output
+        : compactGatedReportNotice(result.id),
     acceptance: result.acceptance,
   };
   if (result.kind === undefined) return card;

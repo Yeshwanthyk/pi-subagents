@@ -11,6 +11,7 @@ import {
   buildParentResultBatchMessage,
   PARENT_RESULT_BATCH_OPTIONS,
 } from "./src/parent-message.ts";
+import { buildSubagentWaitResult } from "./src/result-delivery.ts";
 
 function ref(overrides: Partial<ParentRef> = {}): ParentRef {
   return {
@@ -223,9 +224,12 @@ test("automatic parent delivery preserves pass, reject, and error acceptance", (
     createdAt: 1,
     settledAt: 2,
     lastActivityAt: 2,
-    outcome: { _tag: "Completed", finalText: `${id} output` },
+    outcome: {
+      _tag: "Completed",
+      finalText: `SECRET FULL REPORT ${id}`,
+    },
     acceptance,
-    finalText: `${id} output`,
+    finalText: `SECRET FULL REPORT ${id}`,
     meta: { backend: "pi" },
     usage: {},
     transcript: [],
@@ -282,6 +286,66 @@ test("automatic parent delivery preserves pass, reject, and error acceptance", (
   assert.match(batch.content, /acceptance failed/);
   assert.match(batch.content, /Acceptance: reject — proof is incomplete/);
   assert.match(batch.content, /Acceptance: error — evaluation timed out/);
+  assert.doesNotMatch(batch.content, /SECRET FULL REPORT/);
+  assert.doesNotMatch(JSON.stringify(batch.details), /SECRET FULL REPORT/);
+  assert.match(batch.content, /subagent_inspect/);
+
+  const wait = buildSubagentWaitResult(
+    envelopes.map((result) => {
+      assert.ok(result);
+      const acceptance = result.acceptance;
+      assert.ok(acceptance);
+      return {
+        id: result.id,
+        snapshot: snapshot(result.id, acceptance),
+      };
+    }),
+  );
+  assert.match(wait.text, /passed acceptance/);
+  assert.match(wait.text, /rejected by acceptance/);
+  assert.match(wait.text, /acceptance failed/);
+  assert.doesNotMatch(wait.text, /SECRET FULL REPORT/);
+  assert.doesNotMatch(JSON.stringify(wait.details), /SECRET FULL REPORT/);
+  assert.deepEqual(
+    wait.details.results.map((result) => result.acceptance?.status),
+    ["pass", "reject", "error"],
+  );
+});
+
+test("ungated automatic and wait delivery retain report content", () => {
+  const ungated = envelope("ungated", ref(), "UNCHANGED FULL REPORT");
+  const automatic = buildParentResultBatchMessage([ungated]);
+  assert.match(automatic.content, /UNCHANGED FULL REPORT/);
+
+  const snap: SubagentSnapshot = {
+    id: "ungated",
+    backend: "pi",
+    owner: "subagents",
+    resultDelivery: "parent",
+    parentRef: ref(),
+    title: "ungated",
+    prompt: "report",
+    cwd: "/project",
+    status: "done",
+    createdAt: 1,
+    settledAt: 2,
+    lastActivityAt: 2,
+    outcome: { _tag: "Completed", finalText: "UNCHANGED FULL REPORT" },
+    finalText: "UNCHANGED FULL REPORT",
+    meta: { backend: "pi" },
+    usage: {},
+    transcript: [],
+    liveTools: [],
+    completedOperations: 0,
+    processTelemetry: "unavailable",
+    queued: [],
+    turns: 0,
+  };
+  const wait = buildSubagentWaitResult([{ id: snap.id, snapshot: snap }]);
+  assert.match(wait.text, /UNCHANGED FULL REPORT/);
+  assert.deepEqual(wait.details.results, [
+    { id: "ungated", title: "ungated", status: "done" },
+  ]);
 });
 
 test("automatic parent delivery bounds acceptance reasons", () => {
