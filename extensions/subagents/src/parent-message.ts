@@ -11,6 +11,7 @@ export interface ParentResultBatchDetails {
     readonly id: string;
     readonly title: string;
     readonly status: TerminalSubagentStatus;
+    readonly acceptance?: ParentResultEnvelope["acceptance"];
   }>;
 }
 
@@ -33,6 +34,7 @@ function resultCard(result: ParentResultEnvelope): SubagentResultCard {
     status: result.status,
     error: result.error,
     output: result.output,
+    acceptance: result.acceptance,
   };
   if (result.kind === undefined) return card;
   return { ...card, kind: result.kind };
@@ -46,8 +48,17 @@ function resultDetail(
     title: result.title,
     status: result.status,
   };
-  if (result.kind === undefined) return detail;
-  return { ...detail, kind: result.kind };
+  if (result.kind === undefined && result.acceptance === undefined)
+    return detail;
+  if (result.kind === undefined) {
+    return { ...detail, acceptance: result.acceptance };
+  }
+  if (result.acceptance === undefined) return { ...detail, kind: result.kind };
+  return {
+    ...detail,
+    kind: result.kind,
+    acceptance: result.acceptance,
+  };
 }
 
 /** Build the public parent message without carrying runtime ParentRef data. */

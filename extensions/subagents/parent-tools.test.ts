@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
 import type { SubagentSendMode, SubagentSnapshot } from "./src/domain.ts";
@@ -7,6 +10,14 @@ import {
   createSubagentParentTools,
   projectSubagentInspection,
 } from "./src/parent-tools.ts";
+import { StandaloneRoutingController } from "./src/integration/routing.ts";
+import { loadSubagentSettings } from "./src/routing/settings.ts";
+import type { ConcreteRuntimeSelection } from "./src/routing/domain.ts";
+import { createAskJevTool } from "./src/integration/jev.ts";
+import { createSubagentsSettingsCommand } from "./src/integration/settings-command.ts";
+import { createStandaloneJevAcceptance } from "./src/integration/standalone-gate.ts";
+import { createWorkflowRoutingPreparer } from "./src/integration/workflow-routing.ts";
+import { staticWorkflowDefinitionPreparer } from "./src/workflows/tools.ts";
 
 function snapshot(
   id: string,
@@ -199,4 +210,300 @@ test("projection exposes conservative capabilities when metadata is absent", () 
     modelSelection: false,
     reasoningEffort: false,
   });
+});
+
+test("inspection reports acceptance independently from process status", async () => {
+  const inspected = snapshot("sa-gated", {
+    status: "done",
+    outcome: { _tag: "Completed", finalText: "process completed" },
+    acceptance: { status: "reject", reason: "required evidence was missing" },
+    finalText: "process completed",
+  });
+  const { tools } = fixture([inspected]);
+  const result = await tools.inspect.execute("inspect-gated", {
+    id: inspected.id,
+  });
+
+  assert.equal(result.details.acceptance?.status, "reject");
+  assert.match(result.content[0]!.text, /Acceptance: reject/);
+  assert.match(result.content[0]!.text, /required evidence was missing/);
+});
+
+test("routed admission requires a newer user message and is idempotent", async () => {
+  const settings = loadSubagentSettings({
+    cwd: "/workspace",
+    projectTrusted: true,
+    globalPath: "/global.json",
+    readFile: (file) =>
+      file === "/global.json"
+        ? JSON.stringify({
+            version: 1,
+            routing: {
+              enabled: true,
+              routes: {
+                scout: {
+                  harness: "pi",
+                  model: "provider/scout",
+                  effort: "high",
+                },
+              },
+            },
+          })
+        : undefined,
+  });
+  const controller = new StandaloneRoutingController();
+  const context = {
+    sessionId: "session-a",
+    cwd: "/workspace",
+    userInputRevision: 3,
+    settings,
+    lookupModel: (requested: ConcreteRuntimeSelection) => ({
+      available: true as const,
+      effective: requested,
+    }),
+  };
+  const proposal = controller.prepare(
+    [
+      {
+        prompt: "inspect",
+        name: "Scout",
+        cwd: "/workspace",
+        classification: { intent: "scout" },
+      },
+    ],
+    context,
+  );
+  let admissions = 0;
+  const admit = async () => {
+    admissions += 1;
+    return {
+      id: "sa-routed",
+      title: "Scout",
+      cwd: "/workspace",
+      harness: "pi" as const,
+      model: "provider/scout",
+    };
+  };
+
+  assert.throws(
+    () =>
+      controller.approveAndAdmit(
+        {
+          ...context,
+          proposalId: proposal.id,
+          bindingDigest: proposal.bindingDigest,
+        },
+        admit,
+      ),
+    /newer user response/,
+  );
+  const approvedContext = {
+    ...context,
+    userInputRevision: 4,
+    proposalId: proposal.id,
+    bindingDigest: proposal.bindingDigest,
+  };
+  const first = await controller.approveAndAdmit(approvedContext, admit);
+  assert.throws(
+    () =>
+      controller.approveAndAdmit(
+        { ...approvedContext, sessionId: "wrong-session" },
+        admit,
+      ),
+    /different session/,
+  );
+  assert.throws(
+    () =>
+      controller.approveAndAdmit({ ...approvedContext, cwd: "/other" }, admit),
+    /different working directory/,
+  );
+  const repeated = await controller.approveAndAdmit(approvedContext, admit);
+  assert.equal(first[0]?.id, "sa-routed");
+  assert.equal(repeated[0]?.id, "sa-routed");
+  assert.equal(admissions, 1);
+});
+
+test("ask_jev forwards only explicit state/questions and returns safe unavailable errors", async () => {
+  const seen: unknown[] = [];
+  const tool = createAskJevTool({
+    getEvaluator: () => ({
+      async evaluate(input) {
+        seen.push(input);
+        return {
+          ok: false as const,
+          error: {
+            code: "not_configured" as const,
+            message: "Jev credential is missing",
+          },
+        };
+      },
+    }),
+  });
+  const result = await tool.execute(
+    "ask",
+    {
+      state: "selected evidence",
+      questions: {
+        intent: {
+          type: "choice",
+          question: "Intent?",
+          options: ["scout", "implementation"],
+        },
+      },
+    },
+    undefined,
+    undefined,
+    { cwd: "/workspace", isProjectTrusted: () => true },
+  );
+
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0], {
+    state: "selected evidence",
+    questions: {
+      intent: {
+        type: "choice",
+        question: "Intent?",
+        options: ["scout", "implementation"],
+      },
+    },
+  });
+  assert.equal(result.details.ok, false);
+  assert.match(result.content[0]!.text, /not_configured/);
+});
+
+test("default settings plus a credential prepare an explicitly declared Jev workflow", () => {
+  const settings = loadSubagentSettings({
+    cwd: "/workspace",
+    projectTrusted: true,
+    globalPath: "/missing/global.json",
+    readFile: () => undefined,
+  });
+  const preparer = createWorkflowRoutingPreparer(
+    staticWorkflowDefinitionPreparer,
+    () => ({
+      settings,
+      jevCredentialPresent: true,
+      lookupModel: (requested) => ({ available: true, effective: requested }),
+    }),
+  );
+  const definition = preparer.prepareSpec({
+    tasks: [
+      {
+        id: "evaluate",
+        label: "Evaluate",
+        kind: "review",
+        prompt: "evaluate explicit evidence",
+        readOnly: true,
+        execution: {
+          type: "evaluation",
+          payload: {
+            state: "explicit evidence",
+            questions: {
+              verdict: {
+                type: "choice",
+                question: "Accept?",
+                options: ["yes", "no"],
+              },
+            },
+          },
+        },
+      },
+    ],
+  });
+  assert.equal(definition.evaluationPolicy?.apiKeyEnv, "TYPESAFE_API_KEY");
+  assert.equal(
+    Object.hasOwn(definition.evaluationPolicy ?? {}, "enabled"),
+    false,
+  );
+});
+
+test("standalone gate rejects missing or truncated evidence without evaluating", async () => {
+  let evaluations = 0;
+  const acceptance = createStandaloneJevAcceptance(
+    {
+      evaluator: "jev",
+      questions: {
+        verdict: {
+          type: "choice",
+          question: "Accept?",
+          options: ["yes", "no"],
+        },
+      },
+      predicate: {
+        type: "choice_equals",
+        question_id: "verdict",
+        value: "yes",
+      },
+    },
+    {
+      async evaluate() {
+        evaluations += 1;
+        return {
+          ok: false,
+          error: {
+            code: "transport_error" as const,
+            message: "unexpected call",
+          },
+        };
+      },
+    },
+  );
+  const blank = snapshot("sa-blank", { status: "done", finalText: "  " });
+  const truncated = snapshot("sa-truncated", {
+    status: "done",
+    finalText: "partial",
+    finalTextTruncated: true,
+  });
+  assert.equal(
+    (await acceptance.evaluate(blank, new AbortController().signal)).status,
+    "error",
+  );
+  assert.equal(
+    (await acceptance.evaluate(truncated, new AbortController().signal)).status,
+    "error",
+  );
+  assert.equal(evaluations, 0);
+});
+
+test("settings command validates and atomically saves only an explicit temp scope", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "subagents-settings-"));
+  const globalPath = path.join(root, "agent", "subagents.json");
+  const notifications: Array<{ message: string; type?: string }> = [];
+  let edited = JSON.stringify({
+    version: 1,
+    routing: { enabled: false },
+    jev: { apiKeyEnv: "TEST_JEV_KEY" },
+  });
+  const command = createSubagentsSettingsCommand({
+    globalPath,
+    env: { TEST_JEV_KEY: "secret-not-for-output" },
+  });
+  const ctx = {
+    cwd: root,
+    hasUI: true,
+    isProjectTrusted: () => true,
+    ui: {
+      async editor() {
+        return edited;
+      },
+      notify(message: string, type?: "info" | "warning" | "error") {
+        notifications.push({ message, type });
+      },
+    },
+  };
+
+  await command.handler("global edit", ctx);
+  assert.equal(JSON.parse(fs.readFileSync(globalPath, "utf8")).version, 1);
+  assert.match(
+    notifications.at(-1)!.message,
+    /credential TEST_JEV_KEY: present/,
+  );
+  assert.doesNotMatch(notifications.at(-1)!.message, /secret-not-for-output/);
+
+  const before = fs.readFileSync(globalPath, "utf8");
+  edited = JSON.stringify({ version: 2 });
+  await command.handler("global edit", ctx);
+  assert.equal(fs.readFileSync(globalPath, "utf8"), before);
+  assert.equal(notifications.at(-1)!.type, "error");
+  fs.rmSync(root, { recursive: true, force: true });
 });

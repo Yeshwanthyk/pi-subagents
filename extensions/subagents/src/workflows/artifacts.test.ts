@@ -123,6 +123,30 @@ test("journal parsing and paths fail closed at bounds and hostile fields", () =>
   );
   assert.throws(
     () =>
+      parseWorkflowJournal(
+        JSON.stringify([
+          {
+            _tag: "WorkflowCreated",
+            runId: "wf-artifact",
+            at: 1,
+            definition: {
+              evaluationPolicy: {
+                provider: "jev",
+                enabled: false,
+                apiKeyEnv: "TYPESAFE_API_KEY",
+                model: "jev-1.13.0",
+                timeoutMs: 10_000,
+                maxConcurrent: 2,
+              },
+              tasks: [],
+            },
+          },
+        ]),
+      ),
+    /evaluationPolicy\.enabled.*obsolete/,
+  );
+  assert.throws(
+    () =>
       new WorkflowArtifactStore({
         workflowsDir: os.tmpdir(),
         cwd: process.cwd(),

@@ -78,6 +78,28 @@ export function failureKindFromProvenance(
 /** Terminal output is consumed by the workflow owner and never delivered to a parent/client channel. */
 export type SubagentResultDelivery = "parent" | "client" | "workflow";
 
+/** Verdict from an injected, parent-owned standalone acceptance evaluator. */
+export interface SubagentAcceptanceResult {
+  readonly status: "pass" | "reject" | "error";
+  readonly reason?: string;
+}
+
+/**
+ * Internal acceptance seam. Public tools translate reviewed declarative gate
+ * input into this callback; executable evaluators are never accepted from JSON.
+ * Workflow acceptance remains owned by the workflow manager.
+ */
+export interface SubagentAcceptanceRequest {
+  readonly timeoutMs: number;
+  readonly evaluate: (
+    snapshot: SubagentSnapshot,
+    signal: AbortSignal,
+  ) => Promise<SubagentAcceptanceResult>;
+}
+
+export type SubagentAcceptanceState =
+  { readonly status: "pending" } | SubagentAcceptanceResult;
+
 /** Stable correlation for a child admitted on behalf of a workflow task. */
 export interface WorkflowOwnership {
   readonly runId: string;
@@ -126,6 +148,8 @@ export interface SpawnTask {
   readonly client?: SubagentClient;
   /** Runtime-only relationship to the parent session captured at spawn. */
   readonly parentRef?: ParentRef;
+  /** Optional parent-owned standalone acceptance; forbidden for workflow/client tasks. */
+  readonly acceptance?: SubagentAcceptanceRequest;
   /**
    * Generic model hint, interpreted per backend:
    * pi: "provider/model-id" or bare model id; codex: model slug.
@@ -308,6 +332,8 @@ export interface SubagentSnapshot {
   /** Classification supplied by the backend for bounded workflow recovery. */
   readonly failureKind?: SubagentFailureKind;
   readonly outcome?: RunOutcome;
+  /** Process status/outcome remain visible while acceptance is pending or rejected. */
+  readonly acceptance?: SubagentAcceptanceState;
   readonly meta: SubagentMeta;
   /** Native delivery support; manager-owned live snapshots always provide it. */
   readonly capabilities?: SubagentCapabilities;
@@ -322,6 +348,8 @@ export interface SubagentSnapshot {
   readonly queued: ReadonlyArray<QueuedMessage>;
   /** Final text of the most recent completed run (v1 `finalOutput`). */
   readonly finalText: string;
+  /** True when an owner deliberately retained only a partial final report. */
+  readonly finalTextTruncated?: boolean;
   /** Count of finalized assistant messages (for subagent_inspect). */
   readonly turns: number;
 }

@@ -99,6 +99,46 @@ test("wait summary omits the counts ribbon while nothing has settled", () => {
   assert.doesNotMatch(text, /■/);
 });
 
+test("activity cards and wait summaries distinguish acceptance lifecycle", () => {
+  const pending = snapshot({
+    id: "sa-gate",
+    status: "done",
+    liveTools: [],
+    acceptance: { status: "pending" },
+  });
+  const rejected = snapshot({
+    id: "sa-reject",
+    status: "done",
+    liveTools: [],
+    acceptance: { status: "reject", reason: "insufficient proof" },
+  });
+  assert.match(
+    renderSubagentActivity(pending, theme, { expanded: true }),
+    /GATE/,
+  );
+  assert.match(
+    renderSubagentActivity(pending, theme, { expanded: true }),
+    /coding complete · acceptance pending/,
+  );
+  assert.match(
+    renderSubagentActivity(rejected, theme, { expanded: true }),
+    /REJECTED/,
+  );
+  assert.match(
+    renderSubagentActivity(rejected, theme, { expanded: true }),
+    /acceptance reject · insufficient proof/,
+  );
+
+  const summary = renderSubagentWaitSummary([pending, rejected], theme, 6_000);
+  assert.match(
+    summary.split("\n")[0] ?? "",
+    /Waiting for 1 subagent · 1 complete/,
+  );
+  assert.match(summary, /1 failed/);
+  assert.match(summary, /sa-gate/);
+  assert.match(summary, /sa-gate · acceptance pending/);
+});
+
 test("formatActivityCounts renders only nonzero groups", () => {
   assert.equal(
     formatActivityCounts(theme, { running: 2, done: 1, failed: 1 }),

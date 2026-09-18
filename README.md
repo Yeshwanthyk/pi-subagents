@@ -15,21 +15,31 @@ Reload an existing Pi session with `/reload`.
 Tools:
 
 - `subagent_spawn`
+- `subagent_route` and `subagent_approve` — prepare and approve exact preference-routed batches
 - `subagent_wait`
 - `subagent_cancel`
 - `subagent_send`
 - `subagent_inspect` (`subagent_check` remains a compatibility alias)
 - `subagent_list`
+- `ask_jev` — optional bounded remote choice/score evaluation
 
-Command:
+Commands:
 
 - `/subagents` — compact fleet view, transcript inspection, and takeover for parent-owned subagents
+- `/subagents-settings` — inspect effective routing/Jev settings and credential presence
+- `/subagents-settings global edit` or `project edit` — validate and atomically save one explicit settings scope
 
 `Ctrl+Shift+A` toggles the fleet view. Workflow children are inspectable there but remain read-only; workflow lifecycle changes go through `workflow_control`.
 
 `subagent_send({ id, message, mode? })` sends another instruction immediately. `mode` is `auto`, `steer`, or `follow_up`; explicit steering fails on a harness that does not support it, while `auto` selects the effective supported mode. Queued children remain unavailable for sending.
 
 `subagent_inspect({ id })` returns a bounded, read-only snapshot of current tools, last activity, queued instruction previews, completed operations, latest output, and harness capabilities. It never waits for or consumes completion.
+
+`subagent_spawn` and routed tasks can declare an optional Jev post-run `gate`. Process outcome remains visible while acceptance is pending; wait and automatic parent delivery are held until the gate passes, rejects, errors, times out, or is cancelled.
+
+Preference routing remains disabled until `routing.enabled` is set. Jev needs no separate setting: the configured environment credential is sufficient, but only a direct `ask_jev` invocation or an explicitly declared gate/evaluation step can make a request. Routing uses explicit assignment classifications and prepares bound proposals before preference-derived runtimes can start. Simple validation has its own configurable route; documented alternatives are `opencode-go/deepseek-v4-flash` and `openai-codex/gpt-5.6-luna`, but the package selects or installs neither. `ask_jev` sends only its explicit state and questions to the configured remote service; it does not upload files or conversation history automatically and does not grant execution authority.
+
+Configuration, tool examples, limits, approval behavior, and the distinction between process and acceptance outcomes are documented in [Jev and standalone routing usage](extensions/subagents/docs/jev-routing-usage.md). The package does not write personal settings unless `/subagents-settings … edit` is explicitly used.
 
 ## Workflows
 
@@ -53,6 +63,8 @@ Workflow guarantees:
 - preparation never executes;
 - approval requires the exact immutable draft on a later response in the same session and project;
 - dependency handoffs are explicit, bounded, and transcript-free;
+- read-only typed evaluation tasks use the configured Jev evaluator without consuming a coding slot;
+- agent tasks may use typed post-run gates, and dependants remain blocked until accepted;
 - background completion uses the existing bounded parent mailbox;
 - pause blocks new admissions while running children continue;
 - retry is attempt-identified and bounded by declared provider/backend failure policy;

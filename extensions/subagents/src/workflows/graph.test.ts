@@ -366,3 +366,162 @@ test("prompt teaches declarative derived scheduling and bans imperative orchestr
   assert.match(WORKFLOW_TOOL_DESCRIPTION, /pipeline\(\)/);
   assert.ok(WORKFLOW_PROMPT_GUIDELINES.some((line) => /flow\(\)/.test(line)));
 });
+
+test("graph snapshots classification, evaluator payloads, and gates as immutable static data", () => {
+  const definition = validateWorkflowDefinition({
+    evaluationPolicy: {
+      provider: "jev",
+      apiKeyEnv: "TYPESAFE_API_KEY",
+      model: "jev-1.13.0",
+      timeoutMs: 10_000,
+      maxConcurrent: 2,
+    },
+    tasks: [
+      {
+        id: "evaluate",
+        label: "Evaluate",
+        kind: "review",
+        prompt: "Evaluate selected evidence",
+        readOnly: true,
+        classification: { intent: "validation", complexity: "simple" },
+        execution: {
+          type: "evaluation",
+          payload: {
+            state: "line one\nline two",
+            questions: {
+              quality: {
+                type: "score",
+                question: "How good is the evidence?",
+                criteria: ["poor", "good", "excellent"],
+              },
+            },
+          },
+        },
+      },
+      {
+        id: "agent",
+        label: "Agent",
+        kind: "writer",
+        prompt: "Implement",
+        needs: ["evaluate"],
+        owns: ["src/output.ts"],
+        gate: {
+          questions: {
+            verdict: {
+              type: "choice",
+              question: "Accept?",
+              options: ["pass", "reject"],
+            },
+          },
+          predicate: {
+            type: "choice_equals",
+            questionId: "verdict",
+            value: "pass",
+          },
+        },
+      },
+    ],
+  });
+  assert.equal(definition.tasks[0]?.classification?.complexity, "simple");
+  assert.equal(definition.evaluationPolicy?.model, "jev-1.13.0");
+  assert.equal(definition.evaluationPolicy?.apiKeyEnv, "TYPESAFE_API_KEY");
+  assert.ok(Object.isFrozen(definition.evaluationPolicy));
+  assert.equal(definition.tasks[0]?.execution?.type, "evaluation");
+  assert.ok(Object.isFrozen(definition.tasks[0]?.execution));
+  assert.equal(definition.tasks[1]?.gate?.predicate.type, "choice_equals");
+});
+
+test("evaluation graph validation fails closed on incompatible or remote-invalid shapes", () => {
+  assert.throws(() =>
+    validateWorkflowDefinition({
+      evaluationPolicy: {
+        provider: "jev",
+        apiKeyEnv: "TYPESAFE_API_KEY",
+        model: "jev-1.13.0",
+        timeoutMs: 10_000,
+        maxConcurrent: 2,
+      },
+      tasks: [
+        {
+          id: "bad",
+          label: "Bad",
+          kind: "review",
+          prompt: "bad",
+          owns: ["src"],
+          execution: {
+            type: "evaluation",
+            payload: {
+              state: "state",
+              questions: {
+                "bad id": {
+                  type: "choice",
+                  question: "Choose",
+                  options: ["only"],
+                },
+              },
+            },
+          },
+        },
+      ],
+    }),
+  );
+});
+
+test("workflow score questions reject more than ten ordinal criteria", () => {
+  assert.throws(() =>
+    validateWorkflowDefinition({
+      evaluationPolicy: {
+        provider: "jev",
+        apiKeyEnv: "TYPESAFE_API_KEY",
+        model: "jev-1.13.0",
+        timeoutMs: 10_000,
+        maxConcurrent: 2,
+      },
+      tasks: [
+        {
+          id: "score",
+          label: "Score",
+          kind: "review",
+          prompt: "score",
+          readOnly: true,
+          execution: {
+            type: "evaluation",
+            payload: {
+              state: "evidence",
+              questions: {
+                quality: {
+                  type: "score",
+                  question: "Quality?",
+                  criteria: Array.from(
+                    { length: 11 },
+                    (_, index) => `level-${index}`,
+                  ),
+                },
+              },
+            },
+          },
+        },
+      ],
+    }),
+  );
+});
+
+test("legacy workflow evaluation enabled fields require migration", () => {
+  for (const enabled of [false, true]) {
+    assert.throws(
+      () =>
+        validateWorkflowDefinition({
+          evaluationPolicy: {
+            provider: "jev",
+            enabled,
+            apiKeyEnv: "TYPESAFE_API_KEY",
+            model: "jev-1.13.0",
+            timeoutMs: 10_000,
+            maxConcurrent: 2,
+          },
+          tasks: [],
+        }),
+      /evaluationPolicy\.enabled.*obsolete/,
+    );
+  }
+});

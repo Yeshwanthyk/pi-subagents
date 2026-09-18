@@ -69,6 +69,9 @@ function workflowTaskModel(task: WorkflowTaskDefinition) {
   return { provider: "not encoded in model ID", model: modelId };
 }
 export function workflowTaskRuntime(task: WorkflowTaskDefinition): string {
+  if (task.execution?.type === "evaluation") {
+    return "Executor: evaluation · no coding-agent slot";
+  }
   const model = workflowTaskModel(task);
   return [
     `Harness: ${task.harness ?? WORKFLOW_DEFAULT_HARNESS}`,
@@ -96,7 +99,7 @@ export const WORKFLOW_PARAMETER_DESCRIPTIONS = {
 export const WORKFLOW_TOOL_DESCRIPTION = [
   "Prepare or approve a workflow through a deterministic two-response boundary.",
   "Preparation accepts exactly one inline flow({ tasks: [...] }) source, declarative spec, or saved workflow name plus a review preview. A source is decoded as static data only; it is never executed. Complete graph validation happens before draft persistence or manager use, and preparation creates no workflow run or child agent.",
-  "Every task declares id, label, kind, and prompt, plus exactly one scope: readOnly:true or a non-empty owns path list. needs expresses ordering. consumes explicitly selects completed dependency results for a bounded, labeled handoff; results are never inferred from arbitrary dependency transcripts.",
+  "Every task declares id, label, kind, and prompt, plus exactly one scope: readOnly:true or a non-empty owns path list. Agent execution is the default; a read-only task may instead declare a typed evaluation execution payload. Agent tasks may declare a typed post-run gate. needs expresses ordering. consumes explicitly selects completed dependency results for a bounded, labeled handoff; results are never inferred from arbitrary dependency transcripts.",
   "Readiness and safe parallelism are derived from completed needs and segment-aware ownership conflicts. Independent roots and disjoint writers may be selected together; overlapping writers require dependency order. The shared SubagentManager queue, not the workflow definition, owns execution capacity.",
   "Do not use concurrency, agent(), parallel(), or pipeline(); do not add imports, callbacks, identifiers, spreads, computed keys, templates, getters, filesystem/network/process/timer access, or imperative scheduling. The only source call is the outer flow(...).",
   "After preparation, write a normal assistant response outside the tool card that shows a bounded preview and, for every task, its concise purpose derived from the prompt, needs/consumes wiring, read-only or owned-path scope, and a clearly labeled requested/configured runtime row (harness, provider, model, and thinking effort). An unspecified harness is the workflow default: execution defaults to pi unless approval options override it. Unspecified model and effort use the selected backend/session default; an explicit codex harness uses codex backend/session defaults. Preserve explicit provider/model IDs without guessing. Include the execution digest and /workflow-draft command. Then wait for a newer explicit user response. Approval accepts only the exact draftId. It fails closed unless persisted and process-memory metadata agree and the session and project are unchanged.",

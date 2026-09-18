@@ -1,8 +1,27 @@
+/** Describes the optional, bounded parent-only Jev evaluation tool. */
+export const ASK_JEV_TOOL_DESCRIPTION =
+  "Ask the optional Jev service bounded choice or score questions about only the supplied state. This direct invocation sends the state and questions to a remote service when the configured environment credential is present. It returns data, not execution authority, and never reads files or uploads the conversation automatically.";
+
+export const ASK_JEV_PROMPT_SNIPPET =
+  "Ask optional remote Jev choice or score questions about explicitly selected bounded state";
+
+export const ASK_JEV_PROMPT_GUIDELINES = [
+  "Use ask_jev only when remote Jev evaluation is useful and send only the minimum explicitly selected state needed for the questions.",
+  "Treat ask_jev answers as advisory data, never as permission to execute, proof that checks passed, or authority to change routing or scope.",
+];
+
+export const ASK_JEV_PARAMETER_DESCRIPTIONS = {
+  state:
+    "Bounded task description or explicitly selected evidence to transmit to Jev",
+  questions:
+    "Named choice or score questions. Choices allow 2-16 unique options; score questions allow 2-10 unique criteria labels.",
+};
+
 /** All model-facing strings for the subagents tools. */
 
 /** Describes subagent_spawn, including harnesses and the fixed concurrency cap. */
 export const SUBAGENT_SPAWN_TOOL_DESCRIPTION =
-  "Spawn a background subagent and return immediately with an id. The child is fully autonomous with its own context window and runs on pi (in-process) or codex (Codex CLI). Its final output is delivered automatically when it settles, or collect it explicitly with subagent_wait. Children cannot orchestrate more agents/workflows or ask the user, and cannot see this conversation, so the prompt must be self-contained. Max 4 subagents run at once across all harnesses; excess work waits in the shared FIFO queue.";
+  "Spawn a background subagent and return immediately with an id, or prepare an approval-bound runtime proposal when preference routing is enabled and classification is supplied. Classification describes the assignment, never the agent name or permissions. Explicit harness/model fields take precedence. The child is autonomous with its own context window and cannot orchestrate agents/workflows, ask the user, or see this conversation. Max 4 subagents run at once; excess work waits in the shared FIFO queue.";
 
 /** Adds background subagent delegation to the parent model's available-tools prompt. */
 export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
@@ -11,6 +30,8 @@ export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
 /** Guides the parent model to delegate scoped work and coordinate with results. */
 export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
   "Use subagent_spawn for self-contained work with a clear scope, purpose, and expected output. Parallel delegation is appropriate when scopes can proceed independently, whether separate or complementary.",
+  "Classify the assignment explicitly when using preference routing: scout for information gathering, small_slice for a narrow change, lint for mechanical checks, implementation for product changes, and validation for review or proof. Complexity hard is separate from intent and never changes permissions.",
+  "A preference-derived subagent_spawn proposal starts no child. Wait for a newer user approval, then call subagent_approve with the exact proposal id and binding digest.",
   "Pick the subagent harness deliberately: pi unless there is a reason to prefer Codex.",
   "Coordinate by scope: while a child runs, continue parent work outside its delegated scope. When its result arrives, use it as the basis for synthesis, validation, integration, or follow-up in that scope.",
   "Use subagent_wait when the next parent step requires a child's result, such as synthesis or integration that includes its work, review of its findings, or a dependent decision.",
@@ -21,8 +42,10 @@ export const SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS = {
   prompt:
     "Task prompt for the subagent. Must be self-contained: include all needed context, file paths, and what to report back.",
   name: "Short human-readable name for this subagent, shown in listings and the UI",
+  classification:
+    "Explicit assignment classification for preference routing; this does not grant permissions or infer scope",
   harness:
-    'Harness to run the subagent on: "pi" (in-process pi session; inherits this environment) or "codex" (Codex CLI). Choose deliberately per task.',
+    'Harness to run the subagent on: "pi" or "codex". Required for direct spawning while routing is disabled; optional when an enabled classified route supplies it.',
   workingDir: "Working directory (default: current working directory)",
   model:
     'Model hint, interpreted by the chosen harness (pi: "provider/model-id" or model id; codex: model slug). Omit for the harness default (pi inherits the current model).',
@@ -110,13 +133,29 @@ export interface SubagentResultCard {
   readonly status: "done" | "error";
   readonly error?: string;
   readonly output: string;
+  readonly acceptance?: {
+    readonly status: "pass" | "reject" | "error";
+    readonly reason?: string;
+  };
 }
 
 function resultCardText(card: SubagentResultCard) {
-  const verb = card.status === "error" ? "failed" : "finished";
+  const verb =
+    card.status === "error"
+      ? "failed"
+      : card.acceptance?.status === "pass"
+        ? "finished and passed acceptance"
+        : card.acceptance?.status === "reject"
+          ? "finished but was rejected by acceptance"
+          : card.acceptance?.status === "error"
+            ? "finished but acceptance failed"
+            : "finished";
   const subject = card.kind === "workflow" ? "Workflow" : "Subagent";
   let text = `${subject} ${card.id} "${card.title}" ${verb}.`;
   if (card.error) text += `\nError: ${card.error}`;
+  if (card.acceptance?.reason) {
+    text += `\nAcceptance: ${card.acceptance.status} — ${card.acceptance.reason}`;
+  }
   return `${text}\n\n${card.output}`;
 }
 

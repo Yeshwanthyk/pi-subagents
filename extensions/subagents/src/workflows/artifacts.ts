@@ -395,6 +395,15 @@ function parseEvent(value: unknown, index: number): WorkflowEvent {
         childId: requiredString(record, "childId", label),
         attemptId: optionalString(record, "attemptId", label),
       });
+    case "TaskEvaluationStarted":
+      assertKeys(record, ["_tag", "runId", "at", "taskId", "attemptId"], label);
+      return boundWorkflowEvent({
+        _tag: "TaskEvaluationStarted",
+        runId,
+        at,
+        taskId: requiredString(record, "taskId", label),
+        attemptId: requiredString(record, "attemptId", label),
+      });
     case "TaskStarted":
       assertKeys(record, ["_tag", "runId", "at", "taskId", "attemptId"], label);
       return boundWorkflowEvent({
@@ -407,7 +416,15 @@ function parseEvent(value: unknown, index: number): WorkflowEvent {
     case "TaskCompleted":
       assertKeys(
         record,
-        ["_tag", "runId", "at", "taskId", "resultPreview", "attemptId"],
+        [
+          "_tag",
+          "runId",
+          "at",
+          "taskId",
+          "resultPreview",
+          "evaluationResult",
+          "attemptId",
+        ],
         label,
       );
       return boundWorkflowEvent({
@@ -416,12 +433,22 @@ function parseEvent(value: unknown, index: number): WorkflowEvent {
         at,
         taskId: requiredString(record, "taskId", label),
         resultPreview: optionalString(record, "resultPreview", label),
+        evaluationResult: optionalField(record, "evaluationResult") as never,
         attemptId: optionalString(record, "attemptId", label),
       });
     case "TaskFailed":
       assertKeys(
         record,
-        ["_tag", "runId", "at", "taskId", "error", "failureKind", "attemptId"],
+        [
+          "_tag",
+          "runId",
+          "at",
+          "taskId",
+          "error",
+          "failureKind",
+          "evaluationFailureKind",
+          "attemptId",
+        ],
         label,
       );
       return boundWorkflowEvent({
@@ -432,6 +459,10 @@ function parseEvent(value: unknown, index: number): WorkflowEvent {
         error: requiredString(record, "error", label),
         failureKind: optionalField(record, "failureKind") as
           "provider_stall" | "backend_failure" | undefined,
+        evaluationFailureKind: optionalField(
+          record,
+          "evaluationFailureKind",
+        ) as "gate_rejected" | "evaluator_error" | undefined,
         attemptId: optionalString(record, "attemptId", label),
       });
     case "TaskCancelled":

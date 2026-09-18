@@ -1,4 +1,4 @@
-/* oxlint-disable anti-slop/no-unknown-parameters -- Workflow execution accepts validated graph state and opaque backend snapshots at the manager boundary. */
+/* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-conditional-empty-object-spread -- Workflow execution accepts validated graph state and opaque backend snapshots at the manager boundary. */
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { Effect } from "effect";
@@ -18,8 +18,17 @@ import type {
 import { isSubagentTerminal } from "../domain.ts";
 import { buildTaskHandoff, type CompletedHandoffResult } from "./handoff.ts";
 import {
+  evaluationPreview,
+  gateAccepted,
+  validateWorkflowEvaluationPayload,
+  validateWorkflowEvaluationResult,
+  type WorkflowEvaluationResult,
+  type WorkflowEvaluator,
+} from "./evaluator.ts";
+import {
   isWorkflowTaskTerminal,
   isWorkflowTerminal,
+  type WorkflowEvaluationPolicy,
   type WorkflowReadModel,
 } from "./domain.ts";
 import {
@@ -28,9 +37,13 @@ import {
   MAX_WORKFLOW_EVENTS,
   MAX_WORKFLOW_EVENT_TEXT_BYTES,
   truncateUtf8,
+  utf8Bytes,
   type WorkflowEvent,
 } from "./events.ts";
-import { validateWorkflowDefinition } from "./graph.ts";
+import {
+  validateWorkflowDefinition,
+  validateWorkflowEvaluationPolicy,
+} from "./graph.ts";
 import { computeSchedule } from "./scheduler.ts";
 import { foldWorkflowEvents, reduceWorkflowEvent } from "./reducer.ts";
 import {
@@ -80,6 +93,9 @@ export interface WorkflowChildObservation {
 export interface WorkflowExecutionOptions {
   readonly executor?: WorkflowChildExecutor;
   readonly subagents?: SubagentManagerApi;
+  readonly evaluator?: WorkflowEvaluator;
+  /** Current non-secret runtime policy; must match the reviewed snapshot. */
+  readonly evaluationPolicy?: WorkflowEvaluationPolicy;
   readonly cwd?: string;
   readonly owner?: string;
   readonly parent?: ParentContext;
@@ -111,7 +127,9 @@ interface WorkflowEntry {
 }
 
 interface ResolvedExecutionOptions {
-  readonly executor: WorkflowChildExecutor;
+  readonly executor?: WorkflowChildExecutor;
+  readonly evaluator?: WorkflowEvaluator;
+  readonly evaluationPolicy?: WorkflowEvaluationPolicy;
   readonly cwd: string;
   readonly owner: string;
   readonly parent: ParentContext;
@@ -127,6 +145,7 @@ interface WorkflowChildSnapshot {
   readonly status: SubagentSnapshot["status"];
   readonly startedAt?: number;
   readonly finalText: string;
+  readonly finalTextTruncated: boolean;
   readonly errorText?: string;
 }
 interface ChildSettlement {
@@ -153,6 +172,9 @@ function projectChildSnapshot(
     status: snapshot.status,
     startedAt: snapshot.startedAt,
     finalText: truncateUtf8(snapshot.finalText, MAX_WORKFLOW_EVENT_TEXT_BYTES),
+    finalTextTruncated:
+      snapshot.finalTextTruncated === true ||
+      utf8Bytes(snapshot.finalText) > MAX_WORKFLOW_EVENT_TEXT_BYTES,
   };
   if (error === undefined) return projected;
   return {
@@ -185,6 +207,14 @@ interface WorkflowExecution {
   readonly runId: string;
   readonly options: ResolvedExecutionOptions;
   readonly active: Map<string, ActiveChild>;
+  readonly evaluations: Map<
+    string,
+    {
+      readonly attemptId: string;
+      readonly controller: AbortController;
+      readonly promise: Promise<void>;
+    }
+  >;
   /** Bounded explicit outputs used by downstream consumes handoffs. */
   readonly results: Map<string, CompletedHandoffResult>;
   /** Tasks whose spawn call has not returned a child yet. */
@@ -541,6 +571,7 @@ export class WorkflowManager {
       void this.queueChildCancellation(execution, [active.childId]);
       this.detachChild(execution, active);
     }
+    execution?.evaluations.get(taskId)?.controller.abort();
     return next;
   }
 
@@ -573,6 +604,15 @@ export class WorkflowManager {
         if (!task || !isWorkflowTaskTerminal(task.status)) continue;
         void this.queueChildCancellation(execution, [active.childId]);
         this.detachChild(execution, active);
+      }
+      for (const [evaluationTaskId, evaluation] of execution.evaluations) {
+        if (
+          isWorkflowTaskTerminal(
+            next.tasks[evaluationTaskId]?.status ?? "cancelled",
+          )
+        ) {
+          evaluation.controller.abort();
+        }
       }
     }
     return next;
@@ -650,6 +690,7 @@ export class WorkflowManager {
     taskId: string,
     resultPreview?: string,
     attemptId?: string,
+    evaluationResult?: WorkflowEvaluationResult,
   ): WorkflowReadModel {
     const task = this.requireEntry(runId).state.tasks[taskId];
     return this.append({
@@ -657,6 +698,7 @@ export class WorkflowManager {
       runId,
       taskId,
       resultPreview,
+      evaluationResult,
       attemptId: attemptId ?? task?.attemptId,
       at: this.eventTime(runId),
     });
@@ -669,6 +711,7 @@ export class WorkflowManager {
     options: {
       readonly attemptId?: string;
       readonly failureKind?: SubagentFailureKind;
+      readonly evaluationFailureKind?: "gate_rejected" | "evaluator_error";
     } = {},
   ): WorkflowReadModel {
     const task = this.requireEntry(runId).state.tasks[taskId];
@@ -679,6 +722,7 @@ export class WorkflowManager {
       error,
       attemptId: options.attemptId ?? task?.attemptId,
       failureKind: options.failureKind,
+      evaluationFailureKind: options.evaluationFailureKind,
       at: this.eventTime(runId),
     });
   }
@@ -843,10 +887,43 @@ export class WorkflowManager {
     const executor =
       merged.executor ??
       (merged.subagents ? executorFromManager(merged.subagents) : undefined);
-    if (!executor) {
+    const definition = this.requireEntry(runId).state.definition;
+    const needsExecutor = definition.tasks.some(
+      (task) => task.execution?.type !== "evaluation",
+    );
+    const needsEvaluator = definition.tasks.some(
+      (task) =>
+        task.execution?.type === "evaluation" || task.gate !== undefined,
+    );
+    if (needsExecutor && !executor) {
       throw new WorkflowExecutionError(
         `Workflow "${runId}" has no child executor configured.`,
       );
+    }
+    if (needsEvaluator && !merged.evaluator) {
+      throw new WorkflowExecutionError(
+        `Workflow "${runId}" requires an evaluator, but none is configured.`,
+      );
+    }
+    const reviewedPolicy = definition.evaluationPolicy;
+    const runtimePolicy =
+      merged.evaluationPolicy === undefined
+        ? undefined
+        : validateWorkflowEvaluationPolicy(
+            merged.evaluationPolicy,
+            "Workflow runtime evaluationPolicy",
+          );
+    if (needsEvaluator) {
+      if (!reviewedPolicy || !runtimePolicy) {
+        throw new WorkflowExecutionError(
+          `Workflow "${runId}" requires reviewed and current evaluation policy.`,
+        );
+      }
+      if (JSON.stringify(reviewedPolicy) !== JSON.stringify(runtimePolicy)) {
+        throw new WorkflowExecutionError(
+          `Workflow "${runId}" evaluator runtime no longer matches its reviewed policy.`,
+        );
+      }
     }
     const cwd = merged.cwd ?? process.cwd();
     this.assertArtifactProject(cwd);
@@ -855,6 +932,8 @@ export class WorkflowManager {
       ({ parentCwd: cwd, projectTrusted: true } satisfies ParentContext);
     return {
       executor,
+      evaluator: merged.evaluator,
+      evaluationPolicy: runtimePolicy,
       cwd,
       owner: merged.owner ?? `workflow:${runId}`,
       parent,
@@ -883,6 +962,7 @@ export class WorkflowManager {
       runId,
       options,
       active: new Map(),
+      evaluations: new Map(),
       results: new Map(),
       spawningTaskIds: new Set(),
       pendingChildIds: new Set(),
@@ -1098,6 +1178,254 @@ export class WorkflowManager {
     await Promise.all(operations);
   }
 
+  private evaluateWithDeadline(
+    execution: WorkflowExecution,
+    payload: Parameters<WorkflowEvaluator["evaluate"]>[0],
+    controller: AbortController,
+  ): ReturnType<WorkflowEvaluator["evaluate"]> {
+    const evaluator = execution.options.evaluator!;
+    const timeoutMs = execution.options.evaluationPolicy!.timeoutMs;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (callback: () => void): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        controller.signal.removeEventListener("abort", onAbort);
+        callback();
+      };
+      const onAbort = (): void =>
+        finish(() =>
+          reject(new WorkflowExecutionError("Evaluation cancelled.")),
+        );
+      timer = setTimeout(
+        () =>
+          finish(() =>
+            reject(new WorkflowExecutionError("Evaluation timed out.")),
+          ),
+        timeoutMs,
+      );
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      void Promise.resolve()
+        .then(() => evaluator.evaluate(payload, { signal: controller.signal }))
+        .then(
+          (result) => finish(() => resolve(result)),
+          (error: unknown) => finish(() => reject(error)),
+        );
+    });
+  }
+
+  private async admitEvaluationTask(
+    execution: WorkflowExecution,
+    taskId: string,
+  ): Promise<void> {
+    const state = this.requireEntry(execution.runId).state;
+    const task = state.tasks[taskId];
+    if (
+      !task ||
+      task.status !== "ready" ||
+      task.definition.execution?.type !== "evaluation"
+    )
+      return;
+    const evaluation = task.definition.execution;
+    const evaluator = execution.options.evaluator;
+    if (!evaluator) {
+      this.failTask(
+        execution.runId,
+        taskId,
+        "Evaluation backend is unavailable.",
+        { evaluationFailureKind: "evaluator_error" },
+      );
+      return;
+    }
+    const attemptId = task.attemptId ?? this.createAttemptId();
+    const controller = new AbortController();
+    let operation!: Promise<void>;
+    operation = Promise.resolve().then(async () => {
+      try {
+        this.append({
+          _tag: "TaskEvaluationStarted",
+          runId: execution.runId,
+          taskId,
+          attemptId,
+          at: this.eventTime(execution.runId),
+        });
+        let consumed = "";
+        if ((task.definition.consumes?.length ?? 0) > 0) {
+          const handoff = buildTaskHandoff(
+            {
+              id: task.definition.id,
+              label: task.definition.label,
+              consumes: task.definition.consumes,
+            },
+            execution.results,
+          );
+          if (handoff.entries.some((entry) => entry.truncated))
+            throw new WorkflowExecutionError(
+              "Evaluation input is partial or truncated.",
+            );
+          consumed = handoff.text;
+        }
+        const payload = validateWorkflowEvaluationPayload({
+          state:
+            consumed.length === 0
+              ? evaluation.payload.state
+              : `${evaluation.payload.state}\n\n${consumed}`,
+          questions: evaluation.payload.questions,
+        });
+        const raw = await this.evaluateWithDeadline(
+          execution,
+          payload,
+          controller,
+        );
+        const result = validateWorkflowEvaluationResult(raw, payload.questions);
+        const current = this.requireEntry(execution.runId).state;
+        const currentTask = current.tasks[taskId];
+        if (
+          controller.signal.aborted ||
+          isWorkflowTerminal(current.status) ||
+          currentTask?.status !== "running" ||
+          currentTask.attemptId !== attemptId
+        )
+          return;
+        const preview = evaluationPreview(result);
+        this.completeTask(execution.runId, taskId, preview, attemptId, result);
+        execution.results.set(taskId, {
+          status: "completed",
+          output: result,
+          label: task.definition.label,
+          artifactRef: `artifact:${execution.runId}:${taskId}:${attemptId}`,
+        });
+      } catch (error) {
+        const current = this.entries.get(execution.runId)?.state;
+        const currentTask = current?.tasks[taskId];
+        if (
+          !controller.signal.aborted &&
+          current &&
+          !isWorkflowTerminal(current.status) &&
+          currentTask?.status === "running" &&
+          currentTask.attemptId === attemptId
+        ) {
+          this.failTask(execution.runId, taskId, errorText(error), {
+            attemptId,
+            evaluationFailureKind: "evaluator_error",
+          });
+        }
+      } finally {
+        const active = execution.evaluations.get(taskId);
+        if (active?.promise === operation) execution.evaluations.delete(taskId);
+      }
+    });
+    execution.evaluations.set(taskId, {
+      attemptId,
+      controller,
+      promise: operation,
+    });
+    await operation;
+  }
+
+  private async evaluateGate(
+    execution: WorkflowExecution,
+    taskId: string,
+    attemptId: string,
+    finalText: string,
+    finalTextTruncated: boolean,
+  ): Promise<WorkflowEvaluationResult | undefined> {
+    const state = this.requireEntry(execution.runId).state;
+    const task = state.tasks[taskId];
+    const gate = task?.definition.gate;
+    if (!task || !gate) return undefined;
+    if (finalTextTruncated || finalText.trim().length === 0) {
+      this.failTask(
+        execution.runId,
+        taskId,
+        "Gate evidence is missing or truncated.",
+        {
+          attemptId,
+          evaluationFailureKind: "evaluator_error",
+        },
+      );
+      return undefined;
+    }
+    const evaluator = execution.options.evaluator;
+    if (!evaluator) {
+      this.failTask(execution.runId, taskId, "Gate evaluator is unavailable.", {
+        attemptId,
+        evaluationFailureKind: "evaluator_error",
+      });
+      return undefined;
+    }
+    const controller = new AbortController();
+    let operation!: Promise<void>;
+    let acceptedResult: WorkflowEvaluationResult | undefined;
+    operation = Promise.resolve().then(async () => {
+      try {
+        const payload = validateWorkflowEvaluationPayload({
+          state: JSON.stringify({
+            goal: task.definition.prompt,
+            report: finalText,
+            completeness: { report: true, truncated: false },
+          }),
+          questions: gate.questions,
+        });
+        const raw = await this.evaluateWithDeadline(
+          execution,
+          payload,
+          controller,
+        );
+        const result = validateWorkflowEvaluationResult(raw, payload.questions);
+        const current = this.requireEntry(execution.runId).state;
+        const currentTask = current.tasks[taskId];
+        if (
+          controller.signal.aborted ||
+          isWorkflowTerminal(current.status) ||
+          currentTask?.status !== "running" ||
+          currentTask.attemptId !== attemptId
+        )
+          return;
+        if (!gateAccepted(gate, result)) {
+          this.failTask(
+            execution.runId,
+            taskId,
+            "Post-run gate rejected the task result.",
+            {
+              attemptId,
+              evaluationFailureKind: "gate_rejected",
+            },
+          );
+          return;
+        }
+        acceptedResult = result;
+      } catch (error) {
+        const current = this.entries.get(execution.runId)?.state;
+        const currentTask = current?.tasks[taskId];
+        if (
+          !controller.signal.aborted &&
+          current &&
+          !isWorkflowTerminal(current.status) &&
+          currentTask?.status === "running" &&
+          currentTask.attemptId === attemptId
+        ) {
+          this.failTask(execution.runId, taskId, errorText(error), {
+            attemptId,
+            evaluationFailureKind: "evaluator_error",
+          });
+        }
+      } finally {
+        const active = execution.evaluations.get(taskId);
+        if (active?.promise === operation) execution.evaluations.delete(taskId);
+      }
+    });
+    execution.evaluations.set(taskId, {
+      attemptId,
+      controller,
+      promise: operation,
+    });
+    await operation;
+    return acceptedResult;
+  }
+
   private async admitTask(
     execution: WorkflowExecution,
     taskId: string,
@@ -1108,6 +1436,21 @@ export class WorkflowManager {
     }
     const task = state.tasks[taskId];
     if (!task || task.status !== "ready") return;
+
+    if (task.definition.execution?.type === "evaluation") {
+      await this.admitEvaluationTask(execution, taskId);
+      return;
+    }
+
+    const executor = execution.options.executor;
+    if (!executor) {
+      this.recordTaskFailure(
+        execution,
+        taskId,
+        "Child executor is unavailable.",
+      );
+      return;
+    }
 
     let handoff = "";
     try {
@@ -1153,7 +1496,7 @@ export class WorkflowManager {
     execution.spawningTaskIds.add(taskId);
     let child: SubagentSnapshot;
     try {
-      child = await execution.options.executor.spawn(
+      child = await executor.spawn(
         task.definition.harness ?? execution.options.defaultBackend,
         spawnTask,
       );
@@ -1333,6 +1676,9 @@ export class WorkflowManager {
     expected: WorkflowOwnership,
   ): Promise<WorkflowChildObservation | undefined> {
     const executor = execution.options.executor;
+    if (!executor) {
+      throw new WorkflowExecutionError("Child executor is unavailable.");
+    }
     if (!this.ownedSnapshot(child, expected)) {
       throw new WorkflowExecutionError(
         `Child "${child.id}" is not owned by workflow "${expected.runId}/${expected.taskId}".`,
@@ -1585,20 +1931,43 @@ export class WorkflowManager {
       snapshot.finalText,
       MAX_WORKFLOW_EVENT_TEXT_BYTES,
     );
+    let gateResult: WorkflowEvaluationResult | undefined;
+    if (task.definition.gate) {
+      gateResult = await this.evaluateGate(
+        execution,
+        child.taskId,
+        child.attemptId,
+        finalText,
+        snapshot.finalTextTruncated,
+      );
+      const afterGate = this.requireEntry(execution.runId).state.tasks[
+        child.taskId
+      ];
+      if (
+        !gateResult ||
+        afterGate?.status !== "running" ||
+        afterGate.attemptId !== child.attemptId
+      )
+        return;
+    }
     // Store only bounded explicit output and an opaque manager id. The child
     // snapshot/transcript remains solely owned by SubagentManager.
-    execution.results.set(child.taskId, {
-      status: "completed",
-      output: finalText,
-      label: task.definition.label,
-      sessionRef: `session:${snapshot.id}`,
-    });
     this.completeTask(
       execution.runId,
       child.taskId,
       finalText,
       child.attemptId,
+      gateResult,
     );
+    execution.results.set(child.taskId, {
+      status: "completed",
+      output:
+        gateResult === undefined
+          ? finalText
+          : { report: finalText, gate: gateResult },
+      label: task.definition.label,
+      sessionRef: `session:${snapshot.id}`,
+    });
   }
 
   private ownedSnapshot(
@@ -1629,6 +1998,9 @@ export class WorkflowManager {
           : "Workflow completed";
     execution.cancelReason = reason;
     execution.resolveCancelSignal();
+    for (const evaluation of execution.evaluations.values()) {
+      evaluation.controller.abort();
+    }
     const childIds = [
       ...execution.pendingChildIds,
       ...[...execution.active.values()].map((child) => child.childId),
@@ -1703,8 +2075,10 @@ export class WorkflowManager {
     ids: ReadonlyArray<string>,
   ): Promise<void> {
     if (ids.length === 0) return;
+    const executor = execution.options.executor;
+    if (!executor) return;
     try {
-      await execution.options.executor.cancel([...new Set(ids)]);
+      await executor.cancel([...new Set(ids)]);
     } catch {
       // The workflow is already sealed; backend cancellation is best effort.
     }
@@ -1716,15 +2090,21 @@ export class WorkflowManager {
     if (execution.cancelReason === undefined) return;
     while (true) {
       const admissions = [...execution.inFlightAdmissions];
+      const evaluations = [...execution.evaluations.values()].map(
+        (evaluation) => evaluation.promise,
+      );
       const cancellation = execution.cancellation;
       await Promise.all(
-        admissions.map((admission) => admission.catch(() => undefined)),
+        [...admissions, ...evaluations].map((operation) =>
+          operation.catch(() => undefined),
+        ),
       );
       await cancellation;
       const cleanups = [...execution.cleanups];
       await Promise.all(cleanups);
       if (
         execution.inFlightAdmissions.size === 0 &&
+        execution.evaluations.size === 0 &&
         execution.cleanups.size === 0 &&
         execution.cancellation === cancellation
       ) {

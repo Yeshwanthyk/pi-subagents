@@ -46,6 +46,7 @@ import type {
   SubagentFailureKind,
   EffectiveSubagentSendMode,
   SubagentSendMode,
+  SubagentAcceptanceResult,
 } from "./domain.ts";
 import {
   failureKindFromProvenance,
@@ -64,6 +65,41 @@ const FALLBACK_PARENT_REF: ParentRef = { epoch: 0, leafId: null };
 
 function bounded(text: string) {
   return text.slice(0, ERROR_TEXT_MAX_LENGTH);
+}
+
+const invalidAcceptanceResult = (): NonNullable<
+  SubagentSnapshot["acceptance"]
+> => ({
+  status: "error",
+  reason: "Acceptance gate returned an invalid result.",
+});
+
+function normalizeAcceptanceResult(
+  value: SubagentAcceptanceResult,
+): NonNullable<SubagentSnapshot["acceptance"]> {
+  // This callback result is the manager's runtime boundary even though the
+  // injected evaluator has a typed TypeScript contract.
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof
+  if (typeof value !== "object" || value === null) {
+    return invalidAcceptanceResult();
+  }
+  let status: SubagentAcceptanceResult["status"];
+  let reason: string | undefined;
+  try {
+    ({ status, reason } = value);
+  } catch {
+    return invalidAcceptanceResult();
+  }
+  if (
+    (status !== "pass" && status !== "reject" && status !== "error") ||
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof
+    (reason !== undefined && typeof reason !== "string")
+  ) {
+    return invalidAcceptanceResult();
+  }
+  return reason === undefined
+    ? { status }
+    : { status, reason: bounded(reason) };
 }
 
 // --- Internal state -----------------------------------------------------------
@@ -88,6 +124,7 @@ interface MutableSnapshot {
   errorText?: string;
   failureKind?: SubagentFailureKind;
   outcome?: RunOutcome;
+  acceptance?: SubagentSnapshot["acceptance"];
   meta: SubagentMeta;
   capabilities: BackendCapabilities;
   usage: { tokens?: number; contextWindow?: number };
@@ -121,6 +158,10 @@ interface Entry {
   /** Idle restart dispatched but RunStarted not folded yet; counts as running
    * so concurrent restarts cannot race past the cap. */
   restarting?: boolean;
+  acceptanceRun?: {
+    readonly controller: AbortController;
+    readonly timer: ReturnType<typeof setTimeout>;
+  };
 }
 
 export interface WorkflowSubagentObservation {
@@ -408,6 +449,7 @@ const makeManager = Effect.gen(function* () {
       .filter(
         (e) =>
           (e.snapshot.status === "done" || e.snapshot.status === "error") &&
+          e.snapshot.acceptance?.status !== "pending" &&
           !waitInterest.has(e.snapshot.id) &&
           e.workflowClaims === 0,
       )
@@ -454,6 +496,68 @@ const makeManager = Effect.gen(function* () {
     }
   };
 
+  const publishSettlement = (entry: Entry) => {
+    const s = entry.snapshot;
+    Deferred.doneUnsafe(entry.settlement, Effect.succeed<SubagentSnapshot>(s));
+    const consumed = (waitInterest.get(s.id) ?? 0) > 0;
+    notify(s.id);
+    try {
+      if (!disposed) onSettled?.(s, consumed);
+    } catch {
+      // Parent delivery is best-effort; the settled result remains observable.
+    }
+    pruneSettled();
+    trimSettlementHandles();
+  };
+
+  const finishAcceptance = (
+    entry: Entry,
+    run: NonNullable<Entry["acceptanceRun"]>,
+    result: NonNullable<SubagentSnapshot["acceptance"]>,
+  ) => {
+    if (entry.acceptanceRun !== run || result.status === "pending") return;
+    entry.acceptanceRun = undefined;
+    clearTimeout(run.timer);
+    entry.snapshot.acceptance = result;
+    entry.snapshot.lastActivityAt = Date.now();
+    run.controller.abort();
+    publishSettlement(entry);
+  };
+
+  const startAcceptance = (entry: Entry) => {
+    const policy = entry.task.acceptance;
+    if (!policy) return;
+    const controller = new AbortController();
+    const run: NonNullable<Entry["acceptanceRun"]> = {
+      controller,
+      timer: setTimeout(() => {
+        finishAcceptance(entry, run, {
+          status: "error",
+          reason: "Acceptance gate timed out.",
+        });
+      }, policy.timeoutMs),
+    };
+    entry.acceptanceRun = run;
+    entry.snapshot.acceptance = { status: "pending" };
+    notify(entry.snapshot.id);
+    void Promise.resolve()
+      .then(() => {
+        if (entry.acceptanceRun !== run) return undefined;
+        return policy.evaluate(entry.snapshot, controller.signal);
+      })
+      .then(
+        (result) => {
+          if (entry.acceptanceRun !== run || result === undefined) return;
+          finishAcceptance(entry, run, normalizeAcceptanceResult(result));
+        },
+        () =>
+          finishAcceptance(entry, run, {
+            status: "error",
+            reason: "Acceptance gate evaluation failed.",
+          }),
+      );
+  };
+
   const settle = (entry: Entry, outcome: RunOutcome) => {
     const s = entry.snapshot;
     entry.restarting = false;
@@ -493,21 +597,17 @@ const makeManager = Effect.gen(function* () {
     // Per-entry deferreds plus the terminal guard make result publication and
     // slot release exactly once even when cancellation races backend events.
     Deferred.doneUnsafe(entry.admission, terminal);
-    Deferred.doneUnsafe(entry.settlement, terminal);
+    const gated =
+      outcome._tag === "Completed" && entry.task.acceptance && !disposed;
+    // Mark the process-terminal row as gate-pending before releasing its slot.
+    // A synchronously failing queued admission may settle and prune during
+    // drainQueue(), so this ordering keeps the gated entry protected.
+    if (gated) startAcceptance(entry);
     releaseSlot(entry);
     // Refill capacity before publishing settlement so synchronous listeners
     // cannot let a restarted session leapfrog already-queued work.
     drainQueue();
-    const consumed = (waitInterest.get(s.id) ?? 0) > 0;
-    notify(s.id);
-    try {
-      // During teardown, don't queue results into a shutting-down session.
-      if (!disposed) onSettled?.(s, consumed);
-    } catch {
-      // The parent session may be unavailable; settlement stays final.
-    }
-    pruneSettled();
-    trimSettlementHandles();
+    if (!gated) publishSettlement(entry);
   };
 
   const foldEvent = (entry: Entry, event: SubagentEvent) => {
@@ -528,6 +628,7 @@ const makeManager = Effect.gen(function* () {
         s.errorText = undefined;
         s.failureKind = undefined;
         s.outcome = undefined;
+        s.acceptance = undefined;
         break;
       case "RunSettled":
         settle(entry, event.outcome);
@@ -733,6 +834,21 @@ const makeManager = Effect.gen(function* () {
             message: 'resultDelivery "workflow" requires WorkflowOwnership.',
           });
         }
+        if (
+          task.acceptance &&
+          (task.workflow !== undefined ||
+            task.client !== undefined ||
+            (task.resultDelivery !== undefined &&
+              task.resultDelivery !== "parent") ||
+            !Number.isInteger(task.acceptance.timeoutMs) ||
+            task.acceptance.timeoutMs < 1 ||
+            task.acceptance.timeoutMs > 120_000)
+        ) {
+          return new SpawnError({
+            message:
+              "Acceptance requires a parent-owned task and a valid bounded timeout.",
+          });
+        }
         const id = `sa-${++counter}`;
         const now = Date.now();
         const parentRef: ParentRef = task.parentRef
@@ -815,8 +931,12 @@ const makeManager = Effect.gen(function* () {
       const loop = Effect.gen(function* () {
         while (true) {
           const pending = unique.filter((id) => {
-            const status = entries.get(id)?.snapshot.status;
-            return status === "queued" || status === "running";
+            const snapshot = entries.get(id)?.snapshot;
+            return (
+              snapshot?.status === "queued" ||
+              snapshot?.status === "running" ||
+              snapshot?.acceptance?.status === "pending"
+            );
           });
           if (pending.length === 0) return;
           onPending?.(pending);
@@ -836,6 +956,13 @@ const makeManager = Effect.gen(function* () {
   /** Cancel one queued/running entry, force-closing its scope after 5s. */
   const abortEntry = (entry: Entry) =>
     Effect.gen(function* () {
+      if (entry.acceptanceRun) {
+        finishAcceptance(entry, entry.acceptanceRun, {
+          status: "error",
+          reason: "Acceptance gate was cancelled.",
+        });
+        return;
+      }
       if (entry.snapshot.status === "queued") {
         if (entry.admissionFiber) {
           yield* Fiber.interrupt(entry.admissionFiber).pipe(Effect.ignore);
@@ -884,7 +1011,8 @@ const makeManager = Effect.gen(function* () {
         .filter(
           (entry): entry is Entry =>
             entry?.snapshot.status === "queued" ||
-            entry?.snapshot.status === "running",
+            entry?.snapshot.status === "running" ||
+            entry?.snapshot.acceptance?.status === "pending",
         );
       const pendingIds = pending.map((entry) => entry.snapshot.id);
       // Mark consumed before interrupting so cancellation does not also
@@ -898,7 +1026,8 @@ const makeManager = Effect.gen(function* () {
           pending.some(
             (entry) =>
               entry.snapshot.status === "queued" ||
-              entry.snapshot.status === "running",
+              entry.snapshot.status === "running" ||
+              entry.snapshot.acceptance?.status === "pending",
           )
         ) {
           yield* nextChange;
@@ -935,6 +1064,11 @@ const makeManager = Effect.gen(function* () {
       if (!entry || disposed) {
         return new SendError({
           message: `Subagent "${id}" is no longer tracked.`,
+        });
+      }
+      if (entry.snapshot.acceptance?.status === "pending") {
+        return new SendError({
+          message: `Subagent "${id}" is awaiting acceptance and cannot receive messages.`,
         });
       }
       if (entry.snapshot.status === "queued") {
@@ -1002,6 +1136,12 @@ const makeManager = Effect.gen(function* () {
     yield* Effect.sync(() => {
       admissionQueue.length = 0;
       for (const entry of all) {
+        if (entry.acceptanceRun) {
+          finishAcceptance(entry, entry.acceptanceRun, {
+            status: "error",
+            reason: "Acceptance gate was cancelled during shutdown.",
+          });
+        }
         settle(entry, { _tag: "Interrupted" });
       }
     });

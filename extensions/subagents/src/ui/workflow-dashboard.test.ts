@@ -529,3 +529,62 @@ test("nested workflow child toggle closes the child and dashboard", async () => 
   assert.equal(await openWorkflowDashboard(ctx, manager, view), true);
   assert.equal(opens, 2);
 });
+
+test("workflow dashboard identifies evaluator tasks and gate acceptance", () => {
+  const evaluationDefinition: ValidatedWorkflowDefinition = {
+    evaluationPolicy: {
+      provider: "jev",
+      apiKeyEnv: "TYPESAFE_API_KEY",
+      model: "jev-1.13.0",
+      timeoutMs: 10_000,
+      maxConcurrent: 2,
+    },
+    tasks: [
+      {
+        id: "evaluate",
+        label: "Evaluate evidence",
+        kind: "review",
+        prompt: "evaluate",
+        readOnly: true,
+        execution: {
+          type: "evaluation",
+          payload: {
+            state: "evidence",
+            questions: {
+              quality: {
+                type: "score",
+                question: "Quality?",
+                criteria: ["poor", "good", "excellent"],
+              },
+            },
+          },
+        },
+      },
+    ],
+  };
+  const evaluated = foldWorkflowEvents([
+    event(1, { _tag: "WorkflowCreated", definition: evaluationDefinition }),
+    event(2, { _tag: "WorkflowStarted" }),
+    event(3, {
+      _tag: "TaskEvaluationStarted",
+      taskId: "evaluate",
+      attemptId: "attempt-eval",
+    }),
+    event(4, {
+      _tag: "TaskCompleted",
+      taskId: "evaluate",
+      attemptId: "attempt-eval",
+      resultPreview: "quality=2",
+      evaluationResult: {
+        version: 1,
+        answers: { quality: { type: "score", value: 2, confidence: 0.9 } },
+      },
+    }),
+  ]);
+  const projection = projectWorkflowRun(evaluated);
+  assert.equal(projection.tasks[0]?.executor, "evaluation");
+  assert.equal(projection.tasks[0]?.backend, undefined);
+  const rows = renderWorkflowTaskRows(projection, 100, "evaluate", theme);
+  assert.match(rows.join("\n"), /evaluation/);
+  assert.match(projection.tasks[0]?.evaluationResult ?? "", /quality/);
+});

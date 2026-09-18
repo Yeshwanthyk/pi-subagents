@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  ASK_JEV_PROMPT_GUIDELINES,
+  ASK_JEV_TOOL_DESCRIPTION,
   buildSubagentSpawnResult,
   SUBAGENT_SPAWN_PROMPT_GUIDELINES,
   SUBAGENT_SPAWN_PROMPT_SNIPPET,
@@ -49,4 +51,21 @@ test("wait description identifies dependent parent work", () => {
     SUBAGENT_WAIT_TOOL_DESCRIPTION,
     /not to monitor progress/,
   );
+});
+
+test("routing and Jev guidance preserve authority and disclosure boundaries", () => {
+  const spawnGuidance = SUBAGENT_SPAWN_PROMPT_GUIDELINES.join(" ");
+  const jevGuidance = ASK_JEV_PROMPT_GUIDELINES.join(" ");
+
+  assert.match(
+    SUBAGENT_SPAWN_TOOL_DESCRIPTION,
+    /Classification describes the assignment/,
+  );
+  assert.match(spawnGuidance, /newer user approval/);
+  assert.match(
+    ASK_JEV_TOOL_DESCRIPTION,
+    /sends the state and questions to a remote service/,
+  );
+  assert.match(jevGuidance, /never as permission/);
+  assert.match(jevGuidance, /minimum explicitly selected state/);
 });

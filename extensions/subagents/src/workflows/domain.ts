@@ -3,6 +3,11 @@ import type {
   ReasoningEffort,
   SubagentFailureKind,
 } from "../domain.ts";
+import type {
+  WorkflowEvaluationPayload,
+  WorkflowEvaluationResult,
+  WorkflowGateDefinition,
+} from "./evaluator.ts";
 
 export type WorkflowRecoveryKind = "orphaned" | "interrupted";
 
@@ -15,6 +20,22 @@ export const WORKFLOW_TASK_KINDS = [
 ] as const;
 export type WorkflowTaskKind = (typeof WORKFLOW_TASK_KINDS)[number];
 export type WorkflowRetryKind = SubagentFailureKind;
+export type WorkflowEvaluationFailureKind = "gate_rejected" | "evaluator_error";
+
+export interface WorkflowClassification {
+  readonly intent?:
+    "scout" | "small_slice" | "lint" | "implementation" | "validation";
+  readonly complexity?: "simple" | "normal" | "hard";
+}
+
+export interface WorkflowEvaluationPolicy {
+  readonly provider: "jev";
+  /** Environment variable name only; credential values are never workflow data. */
+  readonly apiKeyEnv: string;
+  readonly model: string;
+  readonly timeoutMs: number;
+  readonly maxConcurrent: number;
+}
 
 export interface WorkflowTaskRetry {
   readonly maxAttempts: number;
@@ -32,14 +53,29 @@ interface WorkflowTaskBase {
   readonly model?: string;
   readonly effort?: ReasoningEffort;
   readonly retry?: WorkflowTaskRetry;
+  readonly classification?: WorkflowClassification;
 }
 
+type WorkflowTaskScope =
+  | { readonly readOnly: true; readonly owns?: never }
+  | {
+      readonly readOnly?: never;
+      readonly owns: readonly [string, ...string[]];
+    };
+
 export type WorkflowTaskDefinition = WorkflowTaskBase &
+  WorkflowTaskScope &
   (
-    | { readonly readOnly: true; readonly owns?: never }
     | {
-        readonly readOnly?: never;
-        readonly owns: readonly [string, ...string[]];
+        readonly execution?: { readonly type: "agent" };
+        readonly gate?: WorkflowGateDefinition;
+      }
+    | {
+        readonly execution: {
+          readonly type: "evaluation";
+          readonly payload: WorkflowEvaluationPayload;
+        };
+        readonly gate?: never;
       }
   );
 
@@ -47,6 +83,7 @@ export type WorkflowTaskDefinition = WorkflowTaskBase &
 export interface ValidatedWorkflowDefinition {
   readonly name?: string;
   readonly description?: string;
+  readonly evaluationPolicy?: WorkflowEvaluationPolicy;
   readonly tasks: ReadonlyArray<WorkflowTaskDefinition>;
 }
 
@@ -82,11 +119,16 @@ export type WorkflowTaskAttemptStatus =
   "ready" | "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export type WorkflowTaskAttemptOutcome =
-  | { readonly _tag: "Completed"; readonly resultPreview?: string }
+  | {
+      readonly _tag: "Completed";
+      readonly resultPreview?: string;
+      readonly evaluationResult?: WorkflowEvaluationResult;
+    }
   | {
       readonly _tag: "Failed";
       readonly error: string;
       readonly failureKind?: WorkflowRetryKind;
+      readonly evaluationFailureKind?: WorkflowEvaluationFailureKind;
     }
   | { readonly _tag: "Cancelled"; readonly reason: string };
 
@@ -111,11 +153,16 @@ export type WorkflowOutcome =
   | { readonly _tag: "Cancelled"; readonly reason: string };
 
 export type WorkflowTaskOutcome =
-  | { readonly _tag: "Completed"; readonly resultPreview?: string }
+  | {
+      readonly _tag: "Completed";
+      readonly resultPreview?: string;
+      readonly evaluationResult?: WorkflowEvaluationResult;
+    }
   | {
       readonly _tag: "Failed";
       readonly error: string;
       readonly failureKind?: WorkflowRetryKind;
+      readonly evaluationFailureKind?: WorkflowEvaluationFailureKind;
     }
   | { readonly _tag: "Cancelled"; readonly reason: string }
   | {

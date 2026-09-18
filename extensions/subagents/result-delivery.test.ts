@@ -205,3 +205,94 @@ test("workflow aggregate keeps its kind on the existing parent result rail", () 
   });
   assert.match(message.content, /^Workflow wf-1/);
 });
+
+test("automatic parent delivery preserves pass, reject, and error acceptance", () => {
+  const snapshot = (
+    id: string,
+    acceptance: NonNullable<SubagentSnapshot["acceptance"]>,
+  ): SubagentSnapshot => ({
+    id,
+    backend: "pi",
+    owner: "subagents",
+    resultDelivery: "parent",
+    parentRef: ref(),
+    title: id,
+    prompt: "produce evidence",
+    cwd: "/private/project",
+    status: "done",
+    createdAt: 1,
+    settledAt: 2,
+    lastActivityAt: 2,
+    outcome: { _tag: "Completed", finalText: `${id} output` },
+    acceptance,
+    finalText: `${id} output`,
+    meta: { backend: "pi" },
+    usage: {},
+    transcript: [],
+    liveTools: [],
+    completedOperations: 0,
+    processTelemetry: "unavailable",
+    queued: [],
+    turns: 0,
+  });
+  const pending = parentResultEnvelope(
+    snapshot("pending", { status: "pending" }),
+  );
+  assert.equal(pending, undefined);
+
+  const envelopes = [
+    parentResultEnvelope(snapshot("passed", { status: "pass" })),
+    parentResultEnvelope(
+      snapshot("rejected", { status: "reject", reason: "proof is incomplete" }),
+    ),
+    parentResultEnvelope(
+      snapshot("errored", {
+        status: "error",
+        reason: "evaluation timed out",
+      }),
+    ),
+  ];
+  assert.ok(envelopes.every((result) => result !== undefined));
+  const batch = buildParentResultBatchMessage(
+    envelopes.filter((result): result is ParentResultEnvelope => !!result),
+  );
+
+  assert.deepEqual(batch.details.results, [
+    {
+      id: "passed",
+      title: "passed",
+      status: "done",
+      acceptance: { status: "pass" },
+    },
+    {
+      id: "rejected",
+      title: "rejected",
+      status: "done",
+      acceptance: { status: "reject", reason: "proof is incomplete" },
+    },
+    {
+      id: "errored",
+      title: "errored",
+      status: "done",
+      acceptance: { status: "error", reason: "evaluation timed out" },
+    },
+  ]);
+  assert.match(batch.content, /passed acceptance/);
+  assert.match(batch.content, /rejected by acceptance/);
+  assert.match(batch.content, /acceptance failed/);
+  assert.match(batch.content, /Acceptance: reject — proof is incomplete/);
+  assert.match(batch.content, /Acceptance: error — evaluation timed out/);
+});
+
+test("automatic parent delivery bounds acceptance reasons", () => {
+  const mailbox = createParentMailbox();
+  mailbox.enqueue({
+    ...envelope("bounded-acceptance"),
+    acceptance: { status: "reject", reason: "😀".repeat(3_000) },
+  });
+  const reason = mailbox.list()[0]?.acceptance?.reason ?? "";
+  assert.ok(
+    Buffer.byteLength(reason, "utf8") <=
+      PARENT_RESULT_LIMITS.maxAcceptanceReasonBytes,
+  );
+});

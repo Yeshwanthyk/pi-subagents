@@ -1,8 +1,11 @@
 import type {
   ValidatedWorkflowDefinition,
+  WorkflowEvaluationFailureKind,
   WorkflowRecoveryKind,
   WorkflowRetryKind,
 } from "./domain.ts";
+import type { WorkflowEvaluationResult } from "./evaluator.ts";
+import { validatePersistedWorkflowEvaluationResult } from "./evaluator.ts";
 
 export const MAX_WORKFLOW_EVENTS = 2_048;
 export const MAX_WORKFLOW_TASKS = 128;
@@ -40,6 +43,11 @@ export type WorkflowEvent =
       readonly attemptId?: string;
     })
   | (WorkflowEventBase & {
+      readonly _tag: "TaskEvaluationStarted";
+      readonly taskId: string;
+      readonly attemptId: string;
+    })
+  | (WorkflowEventBase & {
       readonly _tag: "TaskStarted";
       readonly taskId: string;
       readonly attemptId?: string;
@@ -48,6 +56,7 @@ export type WorkflowEvent =
       readonly _tag: "TaskCompleted";
       readonly taskId: string;
       readonly resultPreview?: string;
+      readonly evaluationResult?: WorkflowEvaluationResult;
       readonly attemptId?: string;
     })
   | (WorkflowEventBase & {
@@ -55,6 +64,7 @@ export type WorkflowEvent =
       readonly taskId: string;
       readonly error: string;
       readonly failureKind?: WorkflowRetryKind;
+      readonly evaluationFailureKind?: WorkflowEvaluationFailureKind;
       readonly attemptId?: string;
     })
   | (WorkflowEventBase & {
@@ -194,6 +204,20 @@ function assertRetryKind(
   }
 }
 
+function assertEvaluationFailureKind(
+  value: WorkflowEvaluationFailureKind | undefined,
+): void {
+  if (
+    value !== undefined &&
+    value !== "gate_rejected" &&
+    value !== "evaluator_error"
+  ) {
+    throw new WorkflowEventBoundsError(
+      "Task evaluation failure kind is invalid.",
+    );
+  }
+}
+
 function assertRecoveryKind(
   value: WorkflowRecoveryKind | undefined,
   label: string,
@@ -252,6 +276,16 @@ export function boundWorkflowEvent(event: WorkflowEvent): WorkflowEvent {
         childId: event.childId,
         attemptId: event.attemptId,
       };
+    case "TaskEvaluationStarted":
+      assertId(event.taskId, "Task id");
+      assertAttemptId(event.attemptId, "Attempt id");
+      return {
+        _tag: "TaskEvaluationStarted",
+        runId: event.runId,
+        at: event.at,
+        taskId: event.taskId,
+        attemptId: event.attemptId,
+      };
     case "TaskStarted":
       assertId(event.taskId, "Task id");
       if (event.attemptId !== undefined)
@@ -276,6 +310,10 @@ export function boundWorkflowEvent(event: WorkflowEvent): WorkflowEvent {
           event.resultPreview === undefined
             ? undefined
             : truncateUtf8(event.resultPreview, MAX_WORKFLOW_EVENT_TEXT_BYTES),
+        evaluationResult:
+          event.evaluationResult === undefined
+            ? undefined
+            : validatePersistedWorkflowEvaluationResult(event.evaluationResult),
         attemptId: event.attemptId,
       };
     case "TaskFailed":
@@ -283,6 +321,15 @@ export function boundWorkflowEvent(event: WorkflowEvent): WorkflowEvent {
       if (event.attemptId !== undefined)
         assertAttemptId(event.attemptId, "Attempt id");
       assertRetryKind(event.failureKind, "Task failure kind");
+      assertEvaluationFailureKind(event.evaluationFailureKind);
+      if (
+        event.failureKind !== undefined &&
+        event.evaluationFailureKind !== undefined
+      ) {
+        throw new WorkflowEventBoundsError(
+          "Task failure cannot be both backend and evaluation failure.",
+        );
+      }
       return {
         _tag: "TaskFailed",
         runId: event.runId,
@@ -290,6 +337,7 @@ export function boundWorkflowEvent(event: WorkflowEvent): WorkflowEvent {
         taskId: event.taskId,
         error: truncateUtf8(event.error, MAX_WORKFLOW_EVENT_TEXT_BYTES),
         failureKind: event.failureKind,
+        evaluationFailureKind: event.evaluationFailureKind,
         attemptId: event.attemptId,
       };
     case "TaskCancelled":

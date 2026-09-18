@@ -22,6 +22,10 @@ import {
   type WorkflowChildExecutor,
   type WorkflowExecutionOptions,
 } from "./manager.ts";
+import {
+  MAX_EVALUATION_STATE_BYTES,
+  type WorkflowEvaluator,
+} from "./evaluator.ts";
 import type {
   ValidatedWorkflowDefinition,
   WorkflowReadModel,
@@ -35,6 +39,14 @@ import {
 const parent: ParentContext = {
   parentCwd: process.cwd(),
   projectTrusted: true,
+};
+
+const evaluationPolicy = {
+  provider: "jev" as const,
+  apiKeyEnv: "TYPESAFE_API_KEY",
+  model: "jev-1.13.0",
+  timeoutMs: 10_000,
+  maxConcurrent: 2,
 };
 
 const registry = Layer.sync(BackendRegistry, () => {
@@ -538,3 +550,505 @@ function failedSnapshot(id: string): SubagentSnapshot {
     { _tag: "Failed", errorText: "cancelled", failureKind: "backend_failure" },
   );
 }
+
+test("typed evaluation tasks use no coding slot and publish bounded answers to declared consumers", async () => {
+  let spawns = 0;
+  const executor: WorkflowChildExecutor = {
+    spawn: async (_backend, spawnTask) => {
+      spawns++;
+      return executionChild(
+        `consumer-${spawns}`,
+        spawnTask.workflow!,
+        "running",
+      );
+    },
+    awaitSettlement: async (id, expected) =>
+      executionChild(id, expected!, "done", {
+        _tag: "Completed",
+        finalText: "consumer complete",
+      }),
+    cancel: async () => [],
+  };
+  const evaluator: WorkflowEvaluator = {
+    evaluate: async () => ({
+      ok: true,
+      answers: {
+        intent: { type: "choice", value: "implementation", confidence: 0.8 },
+      },
+    }),
+  };
+  const workflows = new WorkflowManager({
+    createId: () => "wf-typed-evaluation",
+    execution: { executor, evaluator, evaluationPolicy },
+  });
+  const created = workflows.createRun({
+    evaluationPolicy,
+    tasks: [
+      {
+        id: "classify",
+        label: "Classify",
+        kind: "scout",
+        prompt: "Classify evidence",
+        readOnly: true,
+        execution: {
+          type: "evaluation",
+          payload: {
+            state: "Selected evidence",
+            questions: {
+              intent: {
+                type: "choice",
+                question: "What is the intent?",
+                options: ["implementation", "validation"],
+              },
+            },
+          },
+        },
+      },
+      task("consumer", "Use classification", {
+        needs: ["classify"],
+        consumes: ["classify"],
+      }),
+    ],
+  });
+  const settled = await workflows.execute(created.id).completion;
+  assert.equal(settled.status, "completed");
+  assert.equal(spawns, 1);
+  assert.equal(settled.tasks.classify?.childId, undefined);
+  assert.equal(
+    settled.tasks.classify?.outcome?._tag === "Completed"
+      ? settled.tasks.classify.outcome.evaluationResult?.answers.intent?.value
+      : undefined,
+    "implementation",
+  );
+  const consumer = workflows
+    .events(created.id)
+    .find((item) => item._tag === "TaskQueued" && item.taskId === "consumer");
+  assert.ok(consumer);
+});
+
+test("a delayed post-run gate blocks dependants until its persisted pass", async () => {
+  let release!: () => void;
+  const gateWait = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let spawns = 0;
+  const executor: WorkflowChildExecutor = {
+    spawn: async (_backend, spawnTask) => {
+      spawns++;
+      return executionChild(
+        `gate-child-${spawns}`,
+        spawnTask.workflow!,
+        "running",
+      );
+    },
+    awaitSettlement: async (id, expected) =>
+      executionChild(id, expected!, "done", {
+        _tag: "Completed",
+        finalText: "checks passed",
+      }),
+    cancel: async () => [],
+  };
+  const evaluator: WorkflowEvaluator = {
+    evaluate: async () => {
+      await gateWait;
+      return {
+        ok: true,
+        answers: { verdict: { type: "choice", value: "pass" } },
+      };
+    },
+  };
+  const workflows = new WorkflowManager({
+    createId: () => "wf-gate-delay",
+    execution: { executor, evaluator, evaluationPolicy },
+  });
+  const created = workflows.createRun({
+    evaluationPolicy,
+    tasks: [
+      task("gated", "produce report", {
+        gate: {
+          questions: {
+            verdict: {
+              type: "choice",
+              question: "Accept the report?",
+              options: ["pass", "reject"],
+            },
+          },
+          predicate: {
+            type: "choice_equals",
+            questionId: "verdict",
+            value: "pass",
+          },
+        },
+      }),
+      task("dependent", "after gate", { needs: ["gated"] }),
+    ],
+  });
+  const handle = workflows.execute(created.id);
+  await waitUntil(
+    () =>
+      workflows.get(created.id)?.tasks.gated?.status === "running" &&
+      spawns === 1,
+    "gate should remain pending",
+  );
+  assert.equal(workflows.get(created.id)?.tasks.dependent?.status, "blocked");
+  release();
+  const settled = await handle.completion;
+  assert.equal(settled.status, "completed");
+  assert.equal(spawns, 2);
+  const completion = workflows
+    .events(created.id)
+    .find((item) => item._tag === "TaskCompleted" && item.taskId === "gated");
+  assert.ok(
+    completion &&
+      completion._tag === "TaskCompleted" &&
+      completion.evaluationResult,
+  );
+});
+
+test("gate rejection is semantic, skips dependants, and never becomes a backend retry", async () => {
+  let spawns = 0;
+  const executor: WorkflowChildExecutor = {
+    spawn: async (_backend, spawnTask) => {
+      spawns++;
+      return executionChild(
+        `reject-child-${spawns}`,
+        spawnTask.workflow!,
+        "running",
+      );
+    },
+    awaitSettlement: async (id, expected) =>
+      executionChild(id, expected!, "done", {
+        _tag: "Completed",
+        finalText: "insufficient evidence",
+      }),
+    cancel: async () => [],
+  };
+  const evaluator: WorkflowEvaluator = {
+    evaluate: async () => ({
+      ok: true,
+      answers: { verdict: { type: "choice", value: "reject" } },
+    }),
+  };
+  const workflows = new WorkflowManager({
+    createId: () => "wf-gate-reject",
+    execution: { executor, evaluator, evaluationPolicy },
+  });
+  const created = workflows.createRun({
+    evaluationPolicy,
+    tasks: [
+      task("gated", "produce report", {
+        retry: { maxAttempts: 2, on: ["backend_failure"] },
+        gate: {
+          questions: {
+            verdict: {
+              type: "choice",
+              question: "Accept?",
+              options: ["pass", "reject"],
+            },
+          },
+          predicate: {
+            type: "choice_equals",
+            questionId: "verdict",
+            value: "pass",
+          },
+        },
+      }),
+      task("dependent", "must not run", { needs: ["gated"] }),
+    ],
+  });
+  const settled = await workflows.execute(created.id).completion;
+  assert.equal(settled.status, "failed");
+  assert.equal(spawns, 1);
+  assert.equal(settled.tasks.dependent?.status, "skipped");
+  assert.equal(
+    settled.tasks.gated?.outcome?._tag === "Failed"
+      ? settled.tasks.gated.outcome.evaluationFailureKind
+      : undefined,
+    "gate_rejected",
+  );
+  assert.equal(
+    workflows
+      .events(created.id)
+      .some((item) => item._tag === "TaskRetryRequested"),
+    false,
+  );
+});
+
+test("workflow cancellation aborts an in-flight evaluator and ignores its late answer", async () => {
+  let aborted = false;
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const evaluator: WorkflowEvaluator = {
+    evaluate: async (_payload, options) => {
+      options?.signal?.addEventListener("abort", () => {
+        aborted = true;
+      });
+      await pending;
+      return {
+        ok: true,
+        answers: { verdict: { type: "choice", value: "pass" } },
+      };
+    },
+  };
+  const workflows = new WorkflowManager({
+    createId: () => "wf-evaluator-cancel",
+    execution: {
+      evaluator,
+      evaluationPolicy,
+      executor: {
+        spawn: async () => {
+          throw new Error("evaluation must not spawn");
+        },
+        awaitSettlement: async () => undefined,
+        cancel: async () => [],
+      },
+    },
+  });
+  const created = workflows.createRun({
+    evaluationPolicy,
+    tasks: [
+      {
+        id: "evaluate",
+        label: "Evaluate",
+        kind: "review",
+        prompt: "evaluate",
+        readOnly: true,
+        execution: {
+          type: "evaluation",
+          payload: {
+            state: "evidence",
+            questions: {
+              verdict: {
+                type: "choice",
+                question: "Pass?",
+                options: ["pass", "reject"],
+              },
+            },
+          },
+        },
+      },
+    ],
+  });
+  const handle = workflows.execute(created.id);
+  await waitUntil(
+    () => workflows.get(created.id)?.tasks.evaluate?.status === "running",
+    "evaluation should start",
+  );
+  const cancellation = handle.cancel("stop evaluator");
+  await waitUntil(() => aborted, "evaluator abort signal");
+  const cancelled = await cancellation;
+  release();
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(
+    workflows.events(created.id).some((item) => item._tag === "TaskCompleted"),
+    false,
+  );
+});
+
+test("synchronous evaluator failures fail closed without hanging cleanup", async () => {
+  const evaluator: WorkflowEvaluator = {
+    evaluate: () => {
+      throw new Error("synchronous evaluator failure");
+    },
+  };
+  const workflows = new WorkflowManager({
+    createId: () => "wf-evaluator-sync-failure",
+    execution: { evaluator, evaluationPolicy },
+  });
+  const created = workflows.createRun({
+    evaluationPolicy,
+    tasks: [
+      {
+        id: "evaluate",
+        label: "Evaluate",
+        kind: "review",
+        prompt: "evaluate",
+        readOnly: true,
+        execution: {
+          type: "evaluation",
+          payload: {
+            state: "x".repeat(MAX_EVALUATION_STATE_BYTES),
+            questions: {
+              verdict: {
+                type: "choice",
+                question: "Pass?",
+                options: ["pass", "reject"],
+              },
+            },
+          },
+        },
+      },
+    ],
+  });
+  const settled = await workflows.execute(created.id).completion;
+  assert.equal(settled.status, "failed");
+  await workflows.shutdown();
+});
+
+test("a pretruncated child report never reaches its gate evaluator", async () => {
+  let evaluations = 0;
+  const evaluator: WorkflowEvaluator = {
+    evaluate: async () => {
+      evaluations++;
+      return {
+        ok: true,
+        answers: { verdict: { type: "choice", value: "pass" } },
+      };
+    },
+  };
+  const executor: WorkflowChildExecutor = {
+    spawn: async (_backend, spawnTask) =>
+      executionChild("pretruncated-child", spawnTask.workflow!, "running"),
+    awaitSettlement: async (id, expected) => ({
+      ...executionChild(id, expected!, "done", {
+        _tag: "Completed",
+        finalText: "partial report",
+      }),
+      finalTextTruncated: true,
+    }),
+    cancel: async () => [],
+  };
+  const workflows = new WorkflowManager({
+    createId: () => "wf-pretruncated-gate",
+    execution: { executor, evaluator, evaluationPolicy },
+  });
+  const created = workflows.createRun({
+    evaluationPolicy,
+    tasks: [
+      task("gated", "produce report", {
+        gate: {
+          questions: {
+            verdict: {
+              type: "choice",
+              question: "Accept?",
+              options: ["pass", "reject"],
+            },
+          },
+          predicate: {
+            type: "choice_equals",
+            questionId: "verdict",
+            value: "pass",
+          },
+        },
+      }),
+    ],
+  });
+  const settled = await workflows.execute(created.id).completion;
+  assert.equal(settled.status, "failed");
+  assert.equal(evaluations, 0);
+});
+
+test("oversized composed evaluation handoff fails before evaluator admission", async () => {
+  let evaluatorCalls = 0;
+  const evaluator: WorkflowEvaluator = {
+    evaluate: async () => {
+      evaluatorCalls++;
+      return {
+        ok: true,
+        answers: { verdict: { type: "choice", value: "pass" } },
+      };
+    },
+  };
+  const executor: WorkflowChildExecutor = {
+    spawn: async (_backend, spawnTask) =>
+      executionChild("source-child", spawnTask.workflow!, "running"),
+    awaitSettlement: async (id, expected) =>
+      executionChild(id, expected!, "done", {
+        _tag: "Completed",
+        finalText: "source evidence",
+      }),
+    cancel: async () => [],
+  };
+  const workflows = new WorkflowManager({
+    createId: () => "wf-oversized-evaluation-input",
+    execution: { executor, evaluator, evaluationPolicy },
+  });
+  const created = workflows.createRun({
+    evaluationPolicy,
+    tasks: [
+      task("source"),
+      {
+        id: "evaluate",
+        label: "Evaluate",
+        kind: "review",
+        prompt: "evaluate",
+        needs: ["source"],
+        consumes: ["source"],
+        readOnly: true,
+        execution: {
+          type: "evaluation",
+          payload: {
+            state: "x".repeat(MAX_EVALUATION_STATE_BYTES),
+            questions: {
+              verdict: {
+                type: "choice",
+                question: "Pass?",
+                options: ["pass", "reject"],
+              },
+            },
+          },
+        },
+      },
+    ],
+  });
+  const settled = await workflows.execute(created.id).completion;
+  assert.equal(settled.status, "failed");
+  assert.equal(evaluatorCalls, 0);
+  await workflows.shutdown();
+});
+
+test("workflow execution rejects changed evaluator policy and obsolete enabled fields", () => {
+  const evaluator: WorkflowEvaluator = {
+    evaluate: async () => ({
+      ok: true,
+      answers: { verdict: { type: "choice", value: "pass" } },
+    }),
+  };
+  const definition = {
+    evaluationPolicy,
+    tasks: [
+      {
+        id: "evaluate",
+        label: "Evaluate",
+        kind: "review",
+        prompt: "evaluate",
+        readOnly: true,
+        execution: {
+          type: "evaluation",
+          payload: {
+            state: "evidence",
+            questions: {
+              verdict: {
+                type: "choice",
+                question: "Pass?",
+                options: ["pass", "reject"],
+              },
+            },
+          },
+        },
+      },
+    ],
+  };
+  const legacyPolicy = { ...evaluationPolicy, enabled: false };
+  for (const [id, current, expected] of [
+    [
+      "wf-policy-model-change",
+      { ...evaluationPolicy, model: "jev-new" },
+      /policy/iu,
+    ],
+    [
+      "wf-policy-obsolete-enabled",
+      legacyPolicy,
+      /enabled.*obsolete/iu,
+    ],
+  ] as const) {
+    const workflows = new WorkflowManager({
+      createId: () => id,
+      execution: { evaluator, evaluationPolicy: current },
+    });
+    const created = workflows.createRun(definition);
+    assert.throws(() => workflows.execute(created.id), expected);
+  }
+});

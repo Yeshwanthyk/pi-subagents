@@ -87,6 +87,15 @@ function reviewRows(
   addWrapped(rows, draft.preview, width, "text", theme);
   rows.push("");
   rows.push(theme.fg("dim", `TASKS · ${draft.definition.tasks.length}`));
+  if (draft.definition.evaluationPolicy) {
+    const policy = draft.definition.evaluationPolicy;
+    rows.push(
+      theme.fg(
+        "dim",
+        `EVALUATOR · ${policy.provider}/${policy.model} · timeout:${policy.timeoutMs}ms · max:${policy.maxConcurrent} · credential:${policy.apiKeyEnv}`,
+      ),
+    );
+  }
   for (const [index, task] of draft.definition.tasks.entries()) {
     rows.push(
       `${theme.fg("accent", String(index + 1).padStart(2, " "))}  ${theme.bold(task.label)} ${theme.fg("dim", `· ${task.id}`)}`,
@@ -108,7 +117,9 @@ function reviewRows(
     );
     addWrapped(
       rows,
-      `    Requested/configured runtime: ${workflowTaskRuntime(task)}`,
+      task.execution?.type === "evaluation"
+        ? `    Evaluator runtime: ${workflowTaskRuntime(task)}`
+        : `    Requested/configured runtime: ${workflowTaskRuntime(task)}`,
       width,
       "dim",
       theme,
@@ -340,6 +351,7 @@ export function workflowDraftReviewText(
   artifactPath: string,
 ): string {
   const definition = exactDefinition(draft);
+  const evaluationPolicy = draft.definition.evaluationPolicy;
   const tasks = draft.definition.tasks.flatMap((task, index) => {
     const wiring = workflowTaskWiring(task);
     const scope = workflowTaskScope(task);
@@ -348,7 +360,9 @@ export function workflowDraftReviewText(
       `   Purpose: ${workflowTaskPurpose(task)}`,
       `   ${wiring}`,
       `   Scope: ${scope}`,
-      `   Requested/configured runtime: ${workflowTaskRuntime(task)}`,
+      task.execution?.type === "evaluation"
+        ? `   Evaluator runtime: ${workflowTaskRuntime(task)}`
+        : `   Requested/configured runtime: ${workflowTaskRuntime(task)}`,
     ];
   });
   return [
@@ -358,6 +372,12 @@ export function workflowDraftReviewText(
     "",
     "Outcome",
     draft.preview,
+    ...(evaluationPolicy === undefined
+      ? []
+      : [
+          "",
+          `Evaluator: ${evaluationPolicy.provider}/${evaluationPolicy.model} · timeout:${evaluationPolicy.timeoutMs}ms · maxConcurrent:${evaluationPolicy.maxConcurrent} · credential env:${evaluationPolicy.apiKeyEnv}`,
+        ]),
     "",
     `Tasks (${draft.definition.tasks.length})`,
     ...tasks,

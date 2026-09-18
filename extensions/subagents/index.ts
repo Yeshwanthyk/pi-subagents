@@ -1,3 +1,5 @@
+/* oxlint-disable anti-slop/no-conditional-empty-object-spread -- Tool inputs are TypeBox-validated; conditional spreads preserve omission in immutable proposal bindings. */
+
 /**
  * Subagents — spawn background subagents on Pi or Codex, unified behind a
  * single Effect service interface.
@@ -126,6 +128,30 @@ import {
   WORKFLOW_TOOL_DESCRIPTION,
 } from "./src/workflows/prompt.ts";
 import { openSubagentPicker } from "./src/ui/takeover.ts";
+import { createJevClient, type JevClient } from "./src/jev/client.ts";
+import type { JevEvaluator } from "./src/jev/domain.ts";
+import { loadSubagentSettings } from "./src/routing/settings.ts";
+import {
+  createAskJevTool,
+  createJevWorkflowEvaluator,
+} from "./src/integration/jev.ts";
+import { registerSubagentsSettingsCommand } from "./src/integration/settings-command.ts";
+import {
+  ROUTING_CLASSIFICATION_PARAMETERS,
+  ROUTED_SPAWN_TASK_PARAMETERS,
+  StandaloneRoutingController,
+  type BoundRoutedSpawnTask,
+  type RoutedSpawnTaskParams,
+} from "./src/integration/routing.ts";
+import type {
+  ConcreteRuntimeSelection,
+  ModelLookup,
+} from "./src/routing/domain.ts";
+import {
+  createStandaloneJevAcceptance,
+  STANDALONE_GATE_PARAMETERS,
+} from "./src/integration/standalone-gate.ts";
+import { createWorkflowRoutingPreparer } from "./src/integration/workflow-routing.ts";
 import {
   formatWorkflowList,
   formatWorkflowProjection,
@@ -424,13 +450,16 @@ export async function runHeadlessSubagentsDialog(
 }
 
 function describeSubagent(snap: SubagentSnapshot) {
+  const acceptance = snap.acceptance
+    ? `, acceptance:${snap.acceptance.status}`
+    : "";
   const details = [
     `${snap.backend}: ${snap.meta.modelLabel ?? "?"}`,
     formatContextUtilization(snap.usage),
     formatElapsed(snap),
     snap.cwd,
   ].filter(Boolean);
-  return `${snap.id} [${snap.status}] "${snap.title}" (${details.join(", ")})`;
+  return `${snap.id} [${snap.status}${acceptance}] "${snap.title}" (${details.join(", ")})`;
 }
 
 function truncatedOutput(
@@ -495,6 +524,12 @@ export default function (pi: ExtensionAPI) {
   let workflowManager: WorkflowManager | undefined;
   let workflowControls: WorkflowControls | undefined;
   let workflowLifecycle: WorkflowToolLifecycle | undefined;
+  const standaloneRouting = new StandaloneRoutingController();
+  // One client (and therefore one aggregate admission queue) is pinned to each
+  // session. Config changes fail closed until reload; credential availability
+  // is checked by the client for every explicit evaluation.
+  let jevClient: JevClient | undefined;
+  let jevConfigIdentity: string | undefined;
   const workflowParentRefs = new Map<string, ParentRef>();
   let publishWorkflowResult:
     ((run: WorkflowReadModel, parentRef: ParentRef) => void) | undefined;
@@ -541,7 +576,26 @@ export default function (pi: ExtensionAPI) {
           workflowsDir,
           agentDir: getAgentDir(),
           manager: workflowManager,
-          preparer: staticWorkflowDefinitionPreparer,
+          preparer: createWorkflowRoutingPreparer(
+            staticWorkflowDefinitionPreparer,
+            () => {
+              const ctx = sessionContext;
+              if (!ctx) {
+                throw new Error("Workflow routing requires an active session.");
+              }
+              const settings = loadSubagentSettings({
+                cwd: ctx.cwd,
+                projectTrusted: ctx.isProjectTrusted(),
+              });
+              return {
+                settings,
+                lookupModel: lookupRoutedModel(ctx),
+                jevCredentialPresent: Boolean(
+                  process.env[settings.settings.jev.apiKeyEnv]?.trim(),
+                ),
+              };
+            },
+          ),
         });
         workflowControls = new WorkflowControls(workflowManager);
         const schedule = () => scheduleObservability(manager);
@@ -559,8 +613,22 @@ export default function (pi: ExtensionAPI) {
     manager: SubagentManagerApi,
   ): WorkflowExecutionOptions => {
     const parentRef = captureParentRef(sessionEpoch, ctx.sessionManager);
+    const jev = loadSubagentSettings({
+      cwd: ctx.cwd,
+      projectTrusted: ctx.isProjectTrusted(),
+    }).settings.jev;
     return {
       subagents: manager,
+      evaluator: createJevWorkflowEvaluator(
+        getJevEvaluator(ctx.cwd, ctx.isProjectTrusted()),
+      ),
+      evaluationPolicy: {
+        provider: "jev",
+        apiKeyEnv: jev.apiKeyEnv,
+        model: jev.model,
+        timeoutMs: jev.timeoutMs,
+        maxConcurrent: jev.maxConcurrent,
+      },
       cwd: ctx.cwd,
       parentRef,
       onTerminal: (run) => {
@@ -819,6 +887,19 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     sessionEpoch += 1;
     workflowParentRefs.clear();
+    standaloneRouting.clear();
+    jevClient = undefined;
+    jevConfigIdentity = undefined;
+    try {
+      jevConfigIdentity = JSON.stringify(
+        loadSubagentSettings({
+          cwd: ctx.cwd,
+          projectTrusted: ctx.isProjectTrusted(),
+        }).settings.jev,
+      );
+    } catch {
+      jevConfigIdentity = "invalid-at-session-start";
+    }
     sessionClosed = false;
     parentResults.startSession(ctx, sessionEpoch);
     browserUI?.setWidget(BROWSER_ACTIVITY_WIDGET_KEY, undefined);
@@ -887,7 +968,10 @@ export default function (pi: ExtensionAPI) {
     workflowLifecycle = undefined;
     workflowControls = undefined;
     workflowParentRefs.clear();
+    standaloneRouting.clear();
+    jevClient = undefined;
     const closing = runtime;
+    jevConfigIdentity = undefined;
     runtime = undefined;
     managerInitialization = undefined;
     // Seal workflow state and propagate cancellation while the shared
@@ -1260,7 +1344,271 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  const lookupRoutedModel =
+    (ctx: ExtensionContext): ModelLookup =>
+    (requested) => {
+      if (requested.harness === "codex") {
+        return { available: true, effective: requested };
+      }
+      const slash = requested.model.indexOf("/");
+      if (slash > 0) {
+        const provider = requested.model.slice(0, slash);
+        const id = requested.model.slice(slash + 1);
+        return ctx.modelRegistry.find(provider, id)
+          ? { available: true, effective: requested }
+          : {
+              available: false,
+              reason: `Unknown pi model "${requested.model}"`,
+            };
+      }
+      const matches = ctx.modelRegistry
+        .getAll()
+        .filter((model) => model.id === requested.model);
+      if (matches.length !== 1) {
+        return {
+          available: false,
+          reason:
+            matches.length === 0
+              ? `Unknown pi model "${requested.model}"`
+              : `Pi model "${requested.model}" is ambiguous; use provider/model`,
+        };
+      }
+      return {
+        available: true,
+        effective: {
+          ...requested,
+          model: `${matches[0]!.provider}/${matches[0]!.id}`,
+        },
+      };
+    };
+
+  const admitStandalone = async (
+    task: Omit<BoundRoutedSpawnTask, "classification"> & {
+      readonly classification?: BoundRoutedSpawnTask["classification"];
+    },
+    runtimeSelection: {
+      readonly harness: (typeof BACKEND_NAMES)[number];
+      readonly model?: string;
+      readonly effort?: (typeof REASONING_EFFORTS)[number];
+    },
+    ctx: ExtensionContext,
+  ) => {
+    const manager = await getManager();
+    const cwd = path.resolve(task.cwd);
+    if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
+      throw new Error(`working_dir is not a directory: ${cwd}`);
+    }
+    const parentRef = captureParentRef(sessionEpoch, ctx.sessionManager);
+    const title = task.name.trim().slice(0, 160) || "subagent";
+    const snap = await runTool(
+      getRuntime(),
+      manager.spawn(runtimeSelection.harness, {
+        prompt: task.prompt,
+        title,
+        cwd,
+        model: runtimeSelection.model,
+        reasoningEffort: runtimeSelection.effort,
+        acceptance: task.gate
+          ? createStandaloneJevAcceptance(
+              task.gate,
+              getJevEvaluator(ctx.cwd, ctx.isProjectTrusted()),
+            )
+          : undefined,
+        parentRef,
+        parent: {
+          parentCwd: ctx.cwd,
+          projectTrusted: resolveChildProjectTrust({
+            parentCwd: ctx.cwd,
+            childCwd: cwd,
+            parentTrusted: ctx.isProjectTrusted(),
+          }),
+          inheritedModel: ctx.model
+            ? { provider: ctx.model.provider, id: ctx.model.id }
+            : undefined,
+          inheritedThinkingLevel: pi.getThinkingLevel(),
+          modelRegistry: ctx.modelRegistry,
+        },
+      }),
+    );
+    return { snap, cwd, title };
+  };
+
+  const unavailableJevEvaluator = (message: string): JevEvaluator => ({
+    async evaluate() {
+      return {
+        ok: false,
+        error: { code: "not_configured", message },
+      };
+    },
+  });
+
+  const resolveJevDelegate = (
+    cwd: string,
+    projectTrusted: boolean,
+  ): JevEvaluator => {
+    const config = loadSubagentSettings({ cwd, projectTrusted }).settings.jev;
+    const identity = JSON.stringify(config);
+    if (jevConfigIdentity !== undefined && jevConfigIdentity !== identity) {
+      return unavailableJevEvaluator(
+        "Jev configuration changed during this session; reload before evaluating",
+      );
+    }
+    if (!jevClient) {
+      jevClient = createJevClient({
+        apiKeyEnv: config.apiKeyEnv,
+        model: config.model,
+        timeoutMs: config.timeoutMs,
+        maxConcurrent: config.maxConcurrent,
+      });
+    }
+    return jevClient;
+  };
+
+  const getJevEvaluator = (
+    cwd: string,
+    projectTrusted: boolean,
+  ): JevEvaluator => ({
+    evaluate(input, options) {
+      return resolveJevDelegate(cwd, projectTrusted).evaluate(input, options);
+    },
+  });
+
+  pi.registerTool(
+    createAskJevTool({
+      getEvaluator: ({ cwd, projectTrusted }) =>
+        getJevEvaluator(cwd, projectTrusted),
+    }),
+  );
   // --- Tools -------------------------------------------------------------
+
+  pi.registerTool({
+    name: "subagent_route",
+    label: "Route Subagents",
+    description:
+      "Prepare a bound, batchable preference-routed spawn proposal without starting children. Every task requires explicit assignment classification. Preference-derived runtimes require a newer user approval through subagent_approve.",
+    parameters: Type.Object({
+      tasks: Type.Array(ROUTED_SPAWN_TASK_PARAMETERS, {
+        minItems: 1,
+        maxItems: 64,
+      }),
+    }),
+    async execute(
+      _toolCallId,
+      params: { tasks: RoutedSpawnTaskParams[] },
+      _signal,
+      _onUpdate,
+      ctx,
+    ) {
+      const settings = loadSubagentSettings({
+        cwd: ctx.cwd,
+        projectTrusted: ctx.isProjectTrusted(),
+      });
+      if (!settings.settings.routing.enabled) {
+        throw new Error(
+          "Preference routing is disabled; use explicit subagent_spawn runtimes.",
+        );
+      }
+      const tasks: BoundRoutedSpawnTask[] = params.tasks.map((task) => {
+        const cwd = path.resolve(ctx.cwd, task.working_dir ?? ".");
+        if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
+          throw new Error(`working_dir is not a directory: ${cwd}`);
+        }
+        return {
+          prompt: task.prompt,
+          name: task.name,
+          cwd,
+          classification: task.classification,
+          ...(task.gate === undefined ? {} : { gate: task.gate }),
+          ...(task.harness === undefined ? {} : { harness: task.harness }),
+          ...(task.model === undefined ? {} : { model: task.model }),
+          ...(task.reasoning_effort === undefined
+            ? {}
+            : { reasoningEffort: task.reasoning_effort }),
+        };
+      });
+      const proposal = standaloneRouting.prepare(tasks, {
+        sessionId: ctx.sessionManager.getSessionId(),
+        cwd: ctx.cwd,
+        userInputRevision,
+        settings,
+        lookupModel: lookupRoutedModel(ctx),
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Prepared ${proposal.items.length} routed spawn(s) as ${proposal.id}; no child started. ` +
+              `${proposal.status === "pending" ? "A newer user response must approve this exact binding before admission." : "The exact runtimes were explicitly authorized; call subagent_approve to admit the batch."}`,
+          },
+        ],
+        details: {
+          kind: "routing_proposal",
+          proposalId: proposal.id,
+          bindingDigest: proposal.bindingDigest,
+          status: proposal.status,
+          items: proposal.items.map((item) => ({ runtime: item.runtime })),
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_approve",
+    label: "Approve Routed Subagents",
+    description:
+      "Approve and admit one exact routed spawn batch. Preference-derived proposals require a user message newer than proposal creation. The id and binding digest must match the reviewed proposal.",
+    parameters: Type.Object({
+      proposal_id: Type.String(),
+      binding_digest: Type.String(),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const settings = loadSubagentSettings({
+        cwd: ctx.cwd,
+        projectTrusted: ctx.isProjectTrusted(),
+      });
+      const results = await standaloneRouting.approveAndAdmit(
+        {
+          proposalId: params.proposal_id,
+          bindingDigest: params.binding_digest,
+          sessionId: ctx.sessionManager.getSessionId(),
+          cwd: ctx.cwd,
+          userInputRevision,
+          settings,
+          lookupModel: lookupRoutedModel(ctx),
+        },
+        async (task, runtime: ConcreteRuntimeSelection) => {
+          const admitted = await admitStandalone(task, runtime, ctx);
+          return {
+            id: admitted.snap.id,
+            title: admitted.snap.title,
+            cwd: admitted.cwd,
+            harness: runtime.harness,
+            model: admitted.snap.meta.modelLabel,
+          };
+        },
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: results
+              .map((result) =>
+                buildSubagentSpawnResult({
+                  id: result.id,
+                  title: result.title,
+                  harness: result.harness,
+                  modelLabel: result.model ?? "?",
+                  cwd: result.cwd,
+                }),
+              )
+              .join("\n\n"),
+          },
+        ],
+        details: { proposalId: params.proposal_id, results },
+      };
+    },
+  });
 
   pi.registerTool({
     name: "subagent_spawn",
@@ -1275,9 +1623,13 @@ export default function (pi: ExtensionAPI) {
       name: Type.String({
         description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.name,
       }),
-      harness: StringEnum(BACKEND_NAMES, {
-        description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.harness,
-      }),
+      classification: Type.Optional(ROUTING_CLASSIFICATION_PARAMETERS),
+      gate: Type.Optional(STANDALONE_GATE_PARAMETERS),
+      harness: Type.Optional(
+        StringEnum(BACKEND_NAMES, {
+          description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.harness,
+        }),
+      ),
       working_dir: Type.Optional(
         Type.String({
           description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.workingDir,
@@ -1295,60 +1647,135 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getManager();
-      const harness = params.harness;
-
       const cwd = path.resolve(ctx.cwd, params.working_dir ?? ".");
       if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
         throw new Error(`working_dir is not a directory: ${cwd}`);
       }
-
-      const parentRef = captureParentRef(sessionEpoch, ctx.sessionManager);
-      const title = params.name.trim().slice(0, 160) || "subagent";
-      const snap = await runTool(
-        getRuntime(),
-        manager.spawn(harness, {
+      const settings = loadSubagentSettings({
+        cwd: ctx.cwd,
+        projectTrusted: ctx.isProjectTrusted(),
+      });
+      if (settings.settings.routing.enabled && params.classification) {
+        const task: BoundRoutedSpawnTask = {
           prompt: params.prompt,
-          title,
+          name: params.name,
           cwd,
-          model: params.model,
-          reasoningEffort: params.reasoning_effort,
-          parentRef,
-          parent: {
-            parentCwd: ctx.cwd,
-            projectTrusted: resolveChildProjectTrust({
-              parentCwd: ctx.cwd,
-              childCwd: cwd,
-              parentTrusted: ctx.isProjectTrusted(),
-            }),
-            inheritedModel: ctx.model
-              ? { provider: ctx.model.provider, id: ctx.model.id }
-              : undefined,
-            inheritedThinkingLevel: pi.getThinkingLevel(),
-            modelRegistry: ctx.modelRegistry,
+          classification: params.classification,
+          ...(params.gate === undefined ? {} : { gate: params.gate }),
+          ...(params.harness === undefined ? {} : { harness: params.harness }),
+          ...(params.model === undefined ? {} : { model: params.model }),
+          ...(params.reasoning_effort === undefined
+            ? {}
+            : { reasoningEffort: params.reasoning_effort }),
+        };
+        const proposal = standaloneRouting.prepare([task], {
+          sessionId: ctx.sessionManager.getSessionId(),
+          cwd: ctx.cwd,
+          userInputRevision,
+          settings,
+          lookupModel: lookupRoutedModel(ctx),
+        });
+        if (proposal.status === "pending") {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Prepared routed spawn ${proposal.id}; no child started. ` +
+                  `Review ${proposal.items[0]!.runtime.effective.harness}/${proposal.items[0]!.runtime.effective.model}` +
+                  `${proposal.items[0]!.runtime.effective.effort ? `:${proposal.items[0]!.runtime.effective.effort}` : ""}, then after a newer user approval call subagent_approve with this id and binding digest.`,
+              },
+            ],
+            details: {
+              kind: "routing_proposal",
+              proposalId: proposal.id,
+              bindingDigest: proposal.bindingDigest,
+              status: proposal.status,
+              runtime: proposal.items[0]!.runtime,
+            },
+          };
+        }
+        const [admitted] = await standaloneRouting.approveAndAdmit(
+          {
+            proposalId: proposal.id,
+            bindingDigest: proposal.bindingDigest,
+            sessionId: ctx.sessionManager.getSessionId(),
+            cwd: ctx.cwd,
+            userInputRevision,
+            settings,
+            lookupModel: lookupRoutedModel(ctx),
           },
-        }),
+          async (approvedTask, runtime) => {
+            const result = await admitStandalone(approvedTask, runtime, ctx);
+            return {
+              id: result.snap.id,
+              title: result.snap.title,
+              cwd: result.cwd,
+              harness: runtime.harness,
+              model: result.snap.meta.modelLabel,
+            };
+          },
+        );
+        if (!admitted)
+          throw new Error("Routed spawn admission returned no result");
+        return {
+          content: [
+            {
+              type: "text",
+              text: buildSubagentSpawnResult({
+                id: admitted.id,
+                title: admitted.title,
+                harness: admitted.harness,
+                modelLabel: admitted.model ?? "?",
+                cwd: admitted.cwd,
+              }),
+            },
+          ],
+          details: admitted,
+        };
+      }
+      if (!params.harness) {
+        throw new Error(
+          settings.settings.routing.enabled
+            ? "Provide classification for preference routing, or an explicit harness for legacy/direct spawning."
+            : "harness is required while routing is disabled.",
+        );
+      }
+      const admitted = await admitStandalone(
+        {
+          prompt: params.prompt,
+          name: params.name,
+          cwd,
+          ...(params.gate === undefined ? {} : { gate: params.gate }),
+        },
+        {
+          harness: params.harness,
+          ...(params.model === undefined ? {} : { model: params.model }),
+          ...(params.reasoning_effort === undefined
+            ? {}
+            : { effort: params.reasoning_effort }),
+        },
+        ctx,
       );
-
       return {
         content: [
           {
             type: "text",
             text: buildSubagentSpawnResult({
-              id: snap.id,
-              title: snap.title,
-              harness,
-              modelLabel: snap.meta.modelLabel ?? "?",
+              id: admitted.snap.id,
+              title: admitted.snap.title,
+              harness: params.harness,
+              modelLabel: admitted.snap.meta.modelLabel ?? "?",
               cwd,
             }),
           },
         ],
         details: {
-          id: snap.id,
-          title: snap.title,
+          id: admitted.snap.id,
+          title: admitted.snap.title,
           cwd,
-          harness,
-          model: snap.meta.modelLabel,
+          harness: params.harness,
+          model: admitted.snap.meta.modelLabel,
         },
       };
     },
@@ -1368,9 +1795,22 @@ export default function (pi: ExtensionAPI) {
       // SAFETY: execute always attaches id/title/cwd/harness/model details,
       // and the renderer must tolerate restored renders without them.
       const details = result.details as
-        | { id?: string; title?: string; harness?: string; cwd?: string }
+        | {
+            id?: string;
+            title?: string;
+            harness?: string;
+            cwd?: string;
+            proposalId?: string;
+          }
         | undefined;
       const id = details?.id;
+      if (!id && details?.proposalId) {
+        return new Text(
+          `${theme.fg("warning", "■")} ${theme.fg("accent", "routing proposal")} ${theme.fg("muted", details.proposalId)}\n  ${theme.fg("dim", "No child started; exact runtime awaits approval.")}`,
+          0,
+          0,
+        );
+      }
       const snapshot = id ? renderView?.get(id) : undefined;
 
       // Keep the in-transcript card live while the agent runs: subscribe for
@@ -1493,9 +1933,23 @@ export default function (pi: ExtensionAPI) {
           sections.push(`## ${id}\n\n(no longer tracked)`);
           continue;
         }
-        const verb = snap.status === "error" ? "failed" : "finished";
+        const verb =
+          snap.status === "error" ||
+          snap.acceptance?.status === "reject" ||
+          snap.acceptance?.status === "error"
+            ? "failed"
+            : snap.acceptance?.status === "pending"
+              ? "finished process; acceptance pending"
+              : "finished";
         let section = `## ${snap.id} "${snap.title}" ${verb}`;
         if (snap.errorText) section += `\nError: ${snap.errorText}`;
+        if (
+          snap.acceptance &&
+          "reason" in snap.acceptance &&
+          snap.acceptance.reason
+        ) {
+          section += `\nAcceptance: ${snap.acceptance.status} — ${snap.acceptance.reason}`;
+        }
         const headerBytes = Buffer.byteLength(section, "utf8") + 2;
         const outputBudget = Math.max(
           512,
@@ -1718,6 +2172,8 @@ export default function (pi: ExtensionAPI) {
   );
 
   // --- Command ------------------------------------------------------------
+
+  registerSubagentsSettingsCommand(pi);
 
   pi.registerCommand("subagents", {
     description: "List, inspect, and take over parent-owned subagents",

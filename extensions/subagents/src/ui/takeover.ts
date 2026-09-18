@@ -71,6 +71,13 @@ function configuredKeys(
 }
 
 function statusGlyph(snap: SubagentSnapshot, theme: Theme): string {
+  if (snap.acceptance?.status === "pending") return theme.fg("warning", "■");
+  if (
+    snap.acceptance?.status === "reject" ||
+    snap.acceptance?.status === "error"
+  ) {
+    return theme.fg("error", "■");
+  }
   switch (snap.status) {
     case "queued":
       return theme.fg("muted", "■");
@@ -105,6 +112,15 @@ export function takeoverMetaLabels(snap: SubagentSnapshot) {
 }
 
 function statusWord(snap: SubagentSnapshot, theme: Theme): string {
+  if (snap.acceptance?.status === "pending") {
+    return theme.fg("warning", "gate pending");
+  }
+  if (snap.acceptance?.status === "reject") {
+    return theme.fg("error", "rejected");
+  }
+  if (snap.acceptance?.status === "error") {
+    return theme.fg("error", "gate failed");
+  }
   switch (snap.status) {
     case "queued":
       return theme.fg("muted", "queued");
@@ -118,6 +134,15 @@ function statusWord(snap: SubagentSnapshot, theme: Theme): string {
 }
 
 function detailStatusLabel(snap: SubagentSnapshot, theme: Theme): string {
+  if (snap.acceptance?.status === "pending") {
+    return theme.fg("warning", theme.bold("GATE PENDING"));
+  }
+  if (snap.acceptance?.status === "reject") {
+    return theme.fg("error", theme.bold("REJECTED"));
+  }
+  if (snap.acceptance?.status === "error") {
+    return theme.fg("error", theme.bold("GATE FAILED"));
+  }
   switch (snap.status) {
     case "queued":
       return theme.fg("muted", theme.bold("QUEUED"));

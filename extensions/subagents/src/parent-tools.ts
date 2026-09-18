@@ -101,6 +101,7 @@ export function projectSubagentInspection(snap: SubagentSnapshot) {
     lastCompletedOperation,
     latestOutput: latestOutput?.content,
     latestOutputTruncated: latestOutput?.truncated ?? false,
+    acceptance: snap.acceptance,
     capabilities: snap.capabilities ?? {
       steering: false,
       modelSelection: false,
@@ -125,6 +126,12 @@ function describeInspection(snap: SubagentSnapshot) {
     ` model_selection=${projection.capabilities.modelSelection ? "yes" : "no"},` +
     ` reasoning_effort=${projection.capabilities.reasoningEffort ? "yes" : "no"}`;
   if (snap.errorText) text += `\nError: ${snap.errorText}`;
+  if (projection.acceptance) {
+    text += `\nAcceptance: ${projection.acceptance.status}`;
+    if ("reason" in projection.acceptance && projection.acceptance.reason) {
+      text += ` — ${boundedPreview(projection.acceptance.reason)}`;
+    }
+  }
 
   if (projection.currentTools.length > 0) {
     text += "\n\nCurrent tools:";

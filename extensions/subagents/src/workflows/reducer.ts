@@ -17,6 +17,7 @@ import {
   utf8Bytes,
 } from "./events.ts";
 import { validateWorkflowDefinition } from "./graph.ts";
+import { validateWorkflowEvaluationResult } from "./evaluator.ts";
 
 export class WorkflowInvariantError extends Error {
   constructor(message: string) {
@@ -640,6 +641,41 @@ export function reduceWorkflowEvent(
       return withProgress(state, event.at);
     }
 
+    case "TaskEvaluationStarted": {
+      assertRunning(state, event);
+      const task = requireTask(state, event.taskId);
+      if (task.status !== "ready") {
+        throw new WorkflowInvariantError(
+          `Evaluation task "${event.taskId}" cannot start from ${task.status}.`,
+        );
+      }
+      if (task.definition.execution?.type !== "evaluation") {
+        throw new WorkflowInvariantError(
+          `Task "${event.taskId}" is not an evaluation task.`,
+        );
+      }
+      const attemptId = event.attemptId;
+      const attemptNumber =
+        attemptFor(task, attemptId)?.number ?? task.attempts.length + 1;
+      const attempts = updateAttempt(task, attemptId, (attempt) => ({
+        ...attempt,
+        id: attemptId,
+        number: attemptNumber,
+        status: "running",
+        startedAt: event.at,
+      }));
+      state = replaceTask(state, event.taskId, {
+        ...task,
+        status: "running",
+        attemptId,
+        attemptNumber,
+        attempts,
+        startedAt: event.at,
+        lastActivityAt: event.at,
+      });
+      return withProgress(state, event.at);
+    }
+
     case "TaskStarted": {
       // queued -> running
       assertActive(state, event);
@@ -686,9 +722,28 @@ export function reduceWorkflowEvent(
           `Task "${event.taskId}" attempt "${attemptId}" cannot complete from ${attempt?.status ?? "missing"}.`,
         );
       }
+      const evaluationResult =
+        event.evaluationResult === undefined
+          ? undefined
+          : validateWorkflowEvaluationResult(
+              { ok: true, answers: event.evaluationResult.answers },
+              task.definition.execution?.type === "evaluation"
+                ? task.definition.execution.payload.questions
+                : (task.definition.gate?.questions ?? {}),
+            );
+      if (
+        evaluationResult !== undefined &&
+        task.definition.execution?.type !== "evaluation" &&
+        task.definition.gate === undefined
+      ) {
+        throw new WorkflowInvariantError(
+          `Task "${event.taskId}" cannot persist an evaluation result.`,
+        );
+      }
       const outcome = {
         _tag: "Completed" as const,
         resultPreview: event.resultPreview,
+        evaluationResult,
       };
       state = replaceTask(state, event.taskId, {
         ...task,
@@ -729,6 +784,12 @@ export function reduceWorkflowEvent(
       };
       if (event.failureKind !== undefined) {
         outcome = { ...outcome, failureKind: event.failureKind };
+      }
+      if (event.evaluationFailureKind !== undefined) {
+        outcome = {
+          ...outcome,
+          evaluationFailureKind: event.evaluationFailureKind,
+        };
       }
       const attempts = updateAttempt(task, attemptId, (current) => ({
         ...current,

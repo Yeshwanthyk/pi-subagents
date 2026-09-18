@@ -945,3 +945,374 @@ test("workflow cancellation settles once and releases exactly one slot", async (
     await runTool(runtime, observed.release);
   });
 });
+
+test("standalone acceptance holds settlement and delivery while releasing coding capacity", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    let release!: (value: { status: "pass" }) => void;
+    const verdict = new Promise<{ status: "pass" }>((resolve) => {
+      release = resolve;
+    });
+    const delivered: string[] = [];
+    manager.view.setOnSettled((snapshot) => delivered.push(snapshot.id));
+    const gated = await runtime.runPromise(
+      manager.spawn("codex", {
+        ...task("gated"),
+        acceptance: { timeoutMs: 2000, evaluate: () => verdict },
+      }),
+    );
+    await waitUntil(
+      () => controlled.starts.includes("gated"),
+      "gated child starts",
+    );
+    let settled = false;
+    const settlement = runtime
+      .runPromise(manager.awaitSettlement(gated.id))
+      .then(() => {
+        settled = true;
+      });
+    let waited = false;
+    const waiting = runtime.runPromise(manager.waitFor([gated.id])).then(() => {
+      waited = true;
+    });
+    await controlled.complete("gated");
+    await waitUntil(
+      () => gated.acceptance?.status === "pending",
+      "gate starts",
+    );
+    assert.equal(gated.status, "done");
+    assert.equal(settled, false);
+    assert.equal(waited, false);
+    assert.deepEqual(delivered, []);
+    await assert.rejects(
+      runtime.runPromise(manager.send(gated.id, "continue")),
+      /awaiting acceptance/,
+    );
+    for (let index = 0; index < 4; index++) {
+      await runtime.runPromise(
+        manager.spawn("codex", task(`capacity-${index}`)),
+      );
+    }
+    await waitUntil(
+      () => controlled.starts.length === 5,
+      "gate does not occupy coding capacity",
+    );
+    release({ status: "pass" });
+    await Promise.all([settlement, waiting]);
+    assert.equal(gated.acceptance?.status, "pass");
+    assert.deepEqual(delivered, [gated.id]);
+  });
+});
+
+test("standalone acceptance cancellation ignores late verdicts and publishes once", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    let release!: (value: { status: "pass" }) => void;
+    let signal: AbortSignal | undefined;
+    const verdict = new Promise<{ status: "pass" }>((resolve) => {
+      release = resolve;
+    });
+    const delivered: string[] = [];
+    manager.view.setOnSettled((snapshot) => delivered.push(snapshot.id));
+    const gated = await runtime.runPromise(
+      manager.spawn("codex", {
+        ...task("cancel-gate"),
+        acceptance: {
+          timeoutMs: 2000,
+          evaluate: (_snapshot, abortSignal) => {
+            signal = abortSignal;
+            return verdict;
+          },
+        },
+      }),
+    );
+    await waitUntil(() => controlled.starts.length === 1, "child starts");
+    await controlled.complete("cancel-gate");
+    await waitUntil(() => signal !== undefined, "gate evaluates");
+    const results = await runtime.runPromise(manager.cancel([gated.id]));
+    assert.equal(results[0]?.cancelled, true);
+    assert.equal(signal?.aborted, true);
+    assert.equal(gated.acceptance?.status, "error");
+    release({ status: "pass" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(gated.acceptance?.status, "error");
+    assert.deepEqual(delivered, [gated.id]);
+  });
+});
+
+test("standalone acceptance timeout is not process failure and does not expose evaluator errors", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const gated = await runtime.runPromise(
+      manager.spawn("codex", {
+        ...task("timeout-gate"),
+        acceptance: { timeoutMs: 20, evaluate: () => new Promise(() => {}) },
+      }),
+    );
+    await waitUntil(() => controlled.starts.length === 1, "child starts");
+    await controlled.complete("timeout-gate");
+    await runtime.runPromise(manager.awaitSettlement(gated.id));
+    assert.equal(gated.status, "done");
+    assert.equal(gated.outcome?._tag, "Completed");
+    assert.deepEqual(gated.acceptance, {
+      status: "error",
+      reason: "Acceptance gate timed out.",
+    });
+  });
+});
+
+test("manager rejects acceptance hooks on workflow-owned children", async () => {
+  await withControlledManager(async (manager, runtime) => {
+    await assert.rejects(
+      runtime.runPromise(
+        manager.spawn("codex", {
+          ...task("workflow-gate"),
+          workflow: { runId: "run", taskId: "task", attemptId: "attempt" },
+          acceptance: {
+            timeoutMs: 1000,
+            evaluate: async () => ({ status: "pass" }),
+          },
+        }),
+      ),
+      /parent-owned task/,
+    );
+  });
+});
+
+test("process failure bypasses standalone acceptance", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    let evaluations = 0;
+    const failed = await runtime.runPromise(
+      manager.spawn("codex", {
+        ...task("failed-before-gate"),
+        acceptance: {
+          timeoutMs: 1000,
+          evaluate: async () => {
+            evaluations++;
+            return { status: "pass" };
+          },
+        },
+      }),
+    );
+    await waitUntil(() => controlled.starts.length === 1, "child starts");
+    await controlled.emit("failed-before-gate", {
+      _tag: "RunSettled",
+      outcome: { _tag: "Failed", errorText: "process failed" },
+    });
+    const settled = await runtime.runPromise(
+      manager.awaitSettlement(failed.id),
+    );
+    assert.equal(settled?.outcome?._tag, "Failed");
+    assert.equal(settled?.acceptance, undefined);
+    assert.equal(evaluations, 0);
+  });
+});
+
+test("standalone acceptance preserves rejection and hides evaluator errors", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const rejected = await runtime.runPromise(
+      manager.spawn("codex", {
+        ...task("rejected-gate"),
+        acceptance: {
+          timeoutMs: 1000,
+          evaluate: async () => ({
+            status: "reject",
+            reason: "insufficient proof",
+          }),
+        },
+      }),
+    );
+    const errored = await runtime.runPromise(
+      manager.spawn("codex", {
+        ...task("errored-gate"),
+        acceptance: {
+          timeoutMs: 1000,
+          evaluate: async () => {
+            throw new Error("private provider failure");
+          },
+        },
+      }),
+    );
+    await waitUntil(() => controlled.starts.length === 2, "children start");
+    await Promise.all([
+      controlled.complete("rejected-gate"),
+      controlled.complete("errored-gate"),
+    ]);
+    await Promise.all([
+      runtime.runPromise(manager.awaitSettlement(rejected.id)),
+      runtime.runPromise(manager.awaitSettlement(errored.id)),
+    ]);
+    assert.equal(rejected.outcome?._tag, "Completed");
+    assert.deepEqual(rejected.acceptance, {
+      status: "reject",
+      reason: "insufficient proof",
+    });
+    assert.equal(errored.outcome?._tag, "Completed");
+    assert.deepEqual(errored.acceptance, {
+      status: "error",
+      reason: "Acceptance gate evaluation failed.",
+    });
+  });
+});
+
+test("standalone acceptance converts invalid evaluator output to a bounded error", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const invalid = await runtime.runPromise(
+      manager.spawn("codex", {
+        ...task("invalid-gate"),
+        acceptance: {
+          timeoutMs: 1000,
+          // SAFETY: Deliberately violate the compile-time callback contract to
+          // prove that JavaScript evaluator output is checked at runtime.
+          evaluate: async () => ({ status: "maybe", reason: 42 }) as never,
+        },
+      }),
+    );
+    await waitUntil(() => controlled.starts.length === 1, "child starts");
+    await controlled.complete("invalid-gate");
+    await runtime.runPromise(manager.awaitSettlement(invalid.id));
+    assert.deepEqual(invalid.acceptance, {
+      status: "error",
+      reason: "Acceptance gate returned an invalid result.",
+    });
+  });
+});
+
+test("acceptance timeout fences late gate and process results exactly once", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    let release!: (value: { status: "pass" }) => void;
+    let signal: AbortSignal | undefined;
+    const verdict = new Promise<{ status: "pass" }>((resolve) => {
+      release = resolve;
+    });
+    const delivered: string[] = [];
+    manager.view.setOnSettled((snapshot) => delivered.push(snapshot.id));
+    const gated = await runtime.runPromise(
+      manager.spawn("codex", {
+        ...task("late-gate"),
+        acceptance: {
+          timeoutMs: 20,
+          evaluate: (_snapshot, abortSignal) => {
+            signal = abortSignal;
+            return verdict;
+          },
+        },
+      }),
+    );
+    await waitUntil(() => controlled.starts.length === 1, "child starts");
+    await controlled.complete("late-gate");
+    await runtime.runPromise(manager.awaitSettlement(gated.id));
+    assert.equal(signal?.aborted, true);
+    release({ status: "pass" });
+    await controlled.complete("late-gate", "duplicate process result");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(gated.acceptance, {
+      status: "error",
+      reason: "Acceptance gate timed out.",
+    });
+    assert.deepEqual(delivered, [gated.id]);
+  });
+});
+
+test("shutdown aborts a pending acceptance and settles its handle without delivery", async () => {
+  const controlled = makeControlledBackend();
+  const runtime = createRuntimeWith(controlled.backend);
+  const manager = await runtime.runPromise(SubagentManager);
+  let signal: AbortSignal | undefined;
+  const delivered: string[] = [];
+  manager.view.setOnSettled((snapshot) => delivered.push(snapshot.id));
+  const gated = await runtime.runPromise(
+    manager.spawn("codex", {
+      ...task("shutdown-gate"),
+      acceptance: {
+        timeoutMs: 2000,
+        evaluate: (_snapshot, abortSignal) => {
+          signal = abortSignal;
+          return new Promise(() => {});
+        },
+      },
+    }),
+  );
+  await waitUntil(() => controlled.starts.length === 1, "child starts");
+  await controlled.complete("shutdown-gate");
+  await waitUntil(() => signal !== undefined, "gate starts");
+  await runtime.runPromise(manager.disposeAll);
+  const settled = await runtime.runPromise(manager.awaitSettlement(gated.id));
+  assert.equal(signal?.aborted, true);
+  assert.deepEqual(settled?.acceptance, {
+    status: "error",
+    reason: "Acceptance gate was cancelled during shutdown.",
+  });
+  assert.deepEqual(delivered, []);
+  await runtime.dispose();
+});
+
+test("manager rejects acceptance on client delivery and invalid timeouts", async () => {
+  await withControlledManager(async (manager, runtime) => {
+    const acceptance = {
+      timeoutMs: 1000,
+      evaluate: async () => ({ status: "pass" as const }),
+    };
+    await assert.rejects(
+      runtime.runPromise(
+        manager.spawn("codex", {
+          ...task("client-gate"),
+          resultDelivery: "client",
+          client: { id: "owner", correlationId: "correlation" },
+          acceptance,
+        }),
+      ),
+      /parent-owned task/,
+    );
+    await assert.rejects(
+      runtime.runPromise(
+        manager.spawn("codex", {
+          ...task("invalid-timeout"),
+          acceptance: { ...acceptance, timeoutMs: 0 },
+        }),
+      ),
+      /valid bounded timeout/,
+    );
+  });
+});
+
+test("pending acceptance survives tracked-entry pruning", async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    let release!: (value: { status: "pass" }) => void;
+    const verdict = new Promise<{ status: "pass" }>((resolve) => {
+      release = resolve;
+    });
+    const gated = await runtime.runPromise(
+      manager.spawn("codex", {
+        ...task("retained-gate"),
+        acceptance: { timeoutMs: 2000, evaluate: () => verdict },
+      }),
+    );
+    const others = await runtime.runPromise(
+      Effect.forEach(
+        Array.from({ length: 64 }, (_, index) => `gate-prune-${index}`),
+        (prompt) => manager.spawn("codex", task(prompt)),
+        { concurrency: "unbounded" },
+      ),
+    );
+    await waitUntil(
+      () => controlled.starts.includes("retained-gate"),
+      "gated child starts",
+    );
+    await controlled.complete("retained-gate");
+    await waitUntil(
+      () => gated.acceptance?.status === "pending",
+      "gate becomes pending",
+    );
+
+    for (let index = 0; index < others.length; index++) {
+      const prompt = `gate-prune-${index}`;
+      await waitUntil(
+        () => controlled.starts.includes(prompt),
+        `${prompt} starts`,
+      );
+      await controlled.complete(prompt);
+    }
+    assert.equal(manager.view.get(gated.id)?.acceptance?.status, "pending");
+    release({ status: "pass" });
+    const settled = await runtime.runPromise(manager.awaitSettlement(gated.id));
+    assert.equal(settled?.acceptance?.status, "pass");
+  });
+});

@@ -8,6 +8,7 @@ import {
 } from "../domain.ts";
 import type {
   ValidatedWorkflowDefinition,
+  WorkflowEvaluationPolicy,
   WorkflowTaskDefinition,
   WorkflowTaskKind,
   WorkflowTaskRetry,
@@ -18,6 +19,10 @@ import {
   MAX_WORKFLOW_TASKS,
   utf8Bytes,
 } from "./events.ts";
+import {
+  validateWorkflowEvaluationPayload,
+  validateWorkflowGate,
+} from "./evaluator.ts";
 
 /**
  * Deliberately small, portable ownership policy. Paths are normalized to
@@ -277,6 +282,46 @@ function normalizeRetry(value: unknown, label: string): WorkflowTaskRetry {
   return { maxAttempts: maxAttempts.value, on: normalized };
 }
 
+function normalizeClassification(value: unknown, label: string) {
+  assertPlainRecord(value, `${label}.classification`);
+  assertAllowedKeys(
+    value,
+    new Set(["intent", "complexity"]),
+    `${label}.classification`,
+  );
+  const intent = ownProperty(value, "intent", `${label}.classification`);
+  const complexity = ownProperty(
+    value,
+    "complexity",
+    `${label}.classification`,
+  );
+  const intents = new Set([
+    "scout",
+    "small_slice",
+    "lint",
+    "implementation",
+    "validation",
+  ]);
+  if (
+    intent.present &&
+    (typeof intent.value !== "string" || !intents.has(intent.value))
+  )
+    fail(`${label}.classification.intent is invalid`);
+  if (
+    complexity.present &&
+    complexity.value !== "simple" &&
+    complexity.value !== "normal" &&
+    complexity.value !== "hard"
+  )
+    fail(`${label}.classification.complexity is invalid`);
+  return {
+    ...(intent.present ? { intent: intent.value as "scout" } : {}),
+    ...(complexity.present
+      ? { complexity: complexity.value as "simple" | "normal" | "hard" }
+      : {}),
+  };
+}
+
 const TASK_KEYS = new Set([
   "id",
   "label",
@@ -290,8 +335,16 @@ const TASK_KEYS = new Set([
   "model",
   "effort",
   "retry",
+  "classification",
+  "execution",
+  "gate",
 ]);
-const DEFINITION_KEYS = new Set(["name", "description", "tasks"]);
+const DEFINITION_KEYS = new Set([
+  "name",
+  "description",
+  "evaluationPolicy",
+  "tasks",
+]);
 const TASK_KINDS = new Set(["scout", "writer", "proof", "review", "repair"]);
 
 function normalizeTask(value: unknown, index: number): WorkflowTaskDefinition {
@@ -398,7 +451,58 @@ function normalizeTask(value: unknown, index: number): WorkflowTaskDefinition {
     ? normalizeRetry(retryProperty.value, `Task "${id}"`)
     : undefined;
 
-  return {
+  const classificationProperty = ownProperty(value, "classification", label);
+  const classification = classificationProperty.present
+    ? normalizeClassification(classificationProperty.value, label)
+    : undefined;
+  const executionProperty = ownProperty(value, "execution", label);
+  let execution:
+    | { readonly type: "agent" }
+    | {
+        readonly type: "evaluation";
+        readonly payload: ReturnType<typeof validateWorkflowEvaluationPayload>;
+      }
+    | undefined;
+  if (executionProperty.present) {
+    assertPlainRecord(executionProperty.value, `${label}.execution`);
+    const type = ownProperty(
+      executionProperty.value,
+      "type",
+      `${label}.execution`,
+    ).value;
+    if (type === "agent") {
+      assertAllowedKeys(
+        executionProperty.value,
+        new Set(["type"]),
+        `${label}.execution`,
+      );
+      execution = { type };
+    } else if (type === "evaluation") {
+      assertAllowedKeys(
+        executionProperty.value,
+        new Set(["type", "payload"]),
+        `${label}.execution`,
+      );
+      execution = {
+        type,
+        payload: validateWorkflowEvaluationPayload(
+          ownProperty(executionProperty.value, "payload", `${label}.execution`)
+            .value,
+          `${label}.execution.payload`,
+        ),
+      };
+    } else fail(`${label}.execution.type is invalid`);
+  }
+  const gateProperty = ownProperty(value, "gate", label);
+  const gate = gateProperty.present
+    ? validateWorkflowGate(gateProperty.value, `${label}.gate`)
+    : undefined;
+  if (execution?.type === "evaluation" && gate !== undefined)
+    fail(`Task "${id}" cannot attach a gate to an evaluation task`);
+  if (execution?.type === "evaluation" && !readOnlyProperty.present)
+    fail(`Evaluation task "${id}" must be readOnly`);
+
+  const normalized = {
     id,
     label: taskLabel,
     kind: taskKind,
@@ -409,7 +513,76 @@ function normalizeTask(value: unknown, index: number): WorkflowTaskDefinition {
     ...(harness === undefined ? {} : { harness }),
     ...(model === undefined ? {} : { model }),
     ...(effort === undefined ? {} : { effort }),
+    ...(classification === undefined ? {} : { classification }),
     ...(retry === undefined ? {} : { retry }),
+  };
+  if (execution?.type === "evaluation") {
+    return { ...normalized, execution } as WorkflowTaskDefinition;
+  }
+  return {
+    ...normalized,
+    ...(execution === undefined ? {} : { execution }),
+    ...(gate === undefined ? {} : { gate }),
+  } as WorkflowTaskDefinition;
+}
+
+export function validateWorkflowEvaluationPolicy(
+  value: unknown,
+  label = "Workflow definition.evaluationPolicy",
+): WorkflowEvaluationPolicy {
+  assertPlainRecord(value, label);
+  if (ownProperty(value, "enabled", label).present) {
+    fail(
+      `${label}.enabled is obsolete; remove it because credential presence now controls Jev availability`,
+    );
+  }
+  assertAllowedKeys(
+    value,
+    new Set([
+      "provider",
+      "apiKeyEnv",
+      "model",
+      "timeoutMs",
+      "maxConcurrent",
+    ]),
+    label,
+  );
+  if (ownProperty(value, "provider", label).value !== "jev")
+    fail(`${label}.provider must be "jev"`);
+  const apiKeyEnv = boundedString(
+    ownProperty(value, "apiKeyEnv", label).value,
+    `${label}.apiKeyEnv`,
+    { maxBytes: 128 },
+  );
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(apiKeyEnv))
+    fail(`${label}.apiKeyEnv must be an environment variable name`);
+  const model = boundedString(
+    ownProperty(value, "model", label).value,
+    `${label}.model`,
+    { maxBytes: 1_024 },
+  );
+  const timeoutMs = ownProperty(value, "timeoutMs", label).value;
+  if (
+    typeof timeoutMs !== "number" ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > 120_000
+  )
+    fail(`${label}.timeoutMs must be an integer from 1 to 120000`);
+  const maxConcurrent = ownProperty(value, "maxConcurrent", label).value;
+  if (
+    typeof maxConcurrent !== "number" ||
+    !Number.isSafeInteger(maxConcurrent) ||
+    maxConcurrent < 1 ||
+    maxConcurrent > 32
+  )
+    fail(`${label}.maxConcurrent must be an integer from 1 to 32`);
+  return {
+    provider: "jev",
+    apiKeyEnv,
+    model,
+    timeoutMs,
+    maxConcurrent,
   };
 }
 
@@ -437,9 +610,27 @@ function normalizeDefinition(value: unknown): ValidatedWorkflowDefinition {
     "Workflow definition",
     MAX_WORKFLOW_DESCRIPTION_BYTES,
   );
+  const policyProperty = ownProperty(
+    value,
+    "evaluationPolicy",
+    "Workflow definition",
+  );
+  const evaluationPolicy = policyProperty.present
+    ? validateWorkflowEvaluationPolicy(policyProperty.value)
+    : undefined;
+  if (
+    evaluationPolicy === undefined &&
+    tasks.some(
+      (task) =>
+        task.execution?.type === "evaluation" || task.gate !== undefined,
+    )
+  ) {
+    fail("Workflow evaluation tasks and gates require evaluationPolicy");
+  }
   const definition: ValidatedWorkflowDefinition = {
     ...(name === undefined ? {} : { name }),
     ...(description === undefined ? {} : { description }),
+    ...(evaluationPolicy === undefined ? {} : { evaluationPolicy }),
     tasks,
   };
   let serialized: string;
