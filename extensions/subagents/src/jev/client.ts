@@ -19,6 +19,10 @@ import {
   parseJevResponse,
   validateJevInput,
 } from "./validation.ts";
+import {
+  DEFAULT_JEV_CREDENTIALS_PATH,
+  resolveJevApiKey,
+} from "./credentials.ts";
 
 interface QueueEntry<T> {
   readonly signal: AbortSignal;
@@ -208,6 +212,7 @@ export class JevClient implements JevEvaluator {
   readonly #timeoutMs: number;
   readonly #transport: JevTransport;
   readonly #env: Readonly<Record<string, string | undefined>>;
+  readonly #credentialsPath: string;
   readonly #queue: AdmissionQueue;
 
   constructor(options: JevClientOptions = {}) {
@@ -238,6 +243,8 @@ export class JevClient implements JevEvaluator {
     );
     this.#transport = options.transport ?? fetchTransport;
     this.#env = options.env ?? process.env;
+    this.#credentialsPath =
+      options.credentialsPath ?? DEFAULT_JEV_CREDENTIALS_PATH;
     this.#queue = new AdmissionQueue(maxConcurrent, maxQueue);
   }
 
@@ -245,13 +252,28 @@ export class JevClient implements JevEvaluator {
     input: JevEvaluationInput<Questions>,
     options: JevEvaluateOptions = {},
   ): Promise<JevEvaluationResult<Questions>> {
-    const apiKey = this.#env[this.#apiKeyEnv]?.trim();
+    let apiKey: string | undefined;
+    try {
+      apiKey = resolveJevApiKey({
+        apiKeyEnv: this.#apiKeyEnv,
+        env: this.#env,
+        credentialsPath: this.#credentialsPath,
+      });
+    } catch {
+      return {
+        ok: false,
+        error: {
+          code: "not_configured",
+          message: `Jev credential is unavailable; set ${this.#apiKeyEnv} or replace the saved fallback with /subagents-settings set-jev-key`,
+        },
+      };
+    }
     if (!apiKey) {
       return {
         ok: false,
         error: {
           code: "not_configured",
-          message: `Jev credential environment variable ${this.#apiKeyEnv} is not set`,
+          message: `Jev credential is not configured; set ${this.#apiKeyEnv} or configure the saved fallback with /subagents-settings set-jev-key`,
         },
       };
     }

@@ -1,3 +1,12 @@
+export {
+  DEFAULT_JEV_CREDENTIALS_PATH,
+  hasJevCredential,
+  JevCredentialError,
+  loadSavedJevApiKey,
+  resolveJevApiKey,
+  saveJevApiKey,
+} from "./credentials.ts";
+export type { JevCredentialOptions } from "./credentials.ts";
 export { createJevClient, evaluateJev, JevClient } from "./client.ts";
 export {
   DEFAULT_JEV_MODEL,

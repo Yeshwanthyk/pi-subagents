@@ -494,10 +494,7 @@ test("settings command validates and atomically saves only an explicit temp scop
 
   await command.handler("global edit", ctx);
   assert.equal(JSON.parse(fs.readFileSync(globalPath, "utf8")).version, 1);
-  assert.match(
-    notifications.at(-1)!.message,
-    /credential TEST_JEV_KEY: present/,
-  );
+  assert.match(notifications.at(-1)!.message, /Jev credential: configured/);
   assert.doesNotMatch(notifications.at(-1)!.message, /secret-not-for-output/);
 
   const before = fs.readFileSync(globalPath, "utf8");

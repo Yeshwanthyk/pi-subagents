@@ -1,11 +1,16 @@
 /* eslint-disable anti-slop/no-unsafe-dictionary-type, anti-slop/no-known-value-widening, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-runtime-typeof -- Adversarial fixtures intentionally construct malformed untyped service payloads. */
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { test } from "node:test";
 import {
   createJevClient,
   evaluateJev,
   JEV_ENDPOINT,
   JEV_LIMITS,
+  loadSavedJevApiKey,
+  saveJevApiKey,
   type JevEvaluationInput,
   type JevTransport,
 } from "./index.ts";
@@ -122,6 +127,8 @@ test("sends the documented first-party wire contract and normalizes answers", as
 });
 
 test("environment credential is sufficient and missing credentials never call transport", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jev-client-"));
+  const credentialsPath = path.join(directory, "missing.json");
   let calls = 0;
   const transport = async (): Promise<Response> => {
     calls += 1;
@@ -135,10 +142,93 @@ test("environment credential is sufficient and missing credentials never call tr
   assert.equal((await configured.evaluate(input)).ok, true);
   assert.equal(calls, 1);
   assert.equal(
-    await errorCode(createJevClient({ env: {}, transport }).evaluate(input)),
+    await errorCode(
+      createJevClient({ env: {}, credentialsPath, transport }).evaluate(input),
+    ),
     "not_configured",
   );
   assert.equal(calls, 1);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("environment credential takes precedence over the saved fallback", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jev-client-"));
+  const credentialsPath = path.join(directory, "agent", "jev-credentials.json");
+  saveJevApiKey("saved-secret", credentialsPath);
+  let authorization = "";
+  const evaluator = createJevClient({
+    env: { TYPESAFE_API_KEY: "environment-secret" },
+    credentialsPath,
+    transport: async (_url, init) => {
+      authorization = (init.headers as Record<string, string>).Authorization;
+      return jsonResponse(successBody());
+    },
+  });
+  assert.equal((await evaluator.evaluate(input)).ok, true);
+  assert.equal(authorization, "Bearer environment-secret");
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("saved credential fallback is loaded securely and changes without recreating the client", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jev-client-"));
+  const credentialsPath = path.join(directory, "agent", "jev-credentials.json");
+  saveJevApiKey("first-secret", credentialsPath);
+  const seen: string[] = [];
+  const evaluator = createJevClient({
+    env: {},
+    credentialsPath,
+    transport: async (_url, init) => {
+      seen.push((init.headers as Record<string, string>).Authorization);
+      return jsonResponse(successBody());
+    },
+  });
+  assert.equal((await evaluator.evaluate(input)).ok, true);
+  saveJevApiKey("second-secret", credentialsPath);
+  assert.equal((await evaluator.evaluate(input)).ok, true);
+  assert.deepEqual(seen, ["Bearer first-secret", "Bearer second-secret"]);
+  assert.equal(loadSavedJevApiKey(credentialsPath), "second-secret");
+  assert.equal(fs.statSync(path.dirname(credentialsPath)).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(credentialsPath).mode & 0o777, 0o600);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("missing and malformed saved credentials fail closed without exposing secrets", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jev-client-"));
+  const credentialsPath = path.join(directory, "jev-credentials.json");
+  let calls = 0;
+  const evaluator = createJevClient({
+    env: {},
+    credentialsPath,
+    transport: async () => {
+      calls += 1;
+      return jsonResponse(successBody());
+    },
+  });
+  const missing = await evaluator.evaluate(input);
+  assert.equal(missing.ok, false);
+  if (!missing.ok) {
+    assert.match(missing.error.message, /TYPESAFE_API_KEY/);
+    assert.match(missing.error.message, /saved fallback/);
+  }
+
+  fs.writeFileSync(
+    credentialsPath,
+    JSON.stringify({ version: 1, apiKey: "do-not-leak", extra: true }),
+  );
+  const malformed = await evaluator.evaluate(input);
+  assert.equal(malformed.ok, false);
+  if (!malformed.ok) {
+    assert.equal(malformed.error.message.includes("do-not-leak"), false);
+    assert.match(malformed.error.message, /saved fallback/);
+  }
+  assert.equal(calls, 0);
+
+  const target = path.join(directory, "target.json");
+  fs.writeFileSync(target, JSON.stringify({ version: 1, apiKey: "linked" }));
+  fs.unlinkSync(credentialsPath);
+  fs.symlinkSync(target, credentialsPath);
+  assert.throws(() => loadSavedJevApiKey(credentialsPath), /invalid/);
+  fs.rmSync(directory, { recursive: true, force: true });
 });
 
 test("strictly validates inputs before transport", async () => {
@@ -454,10 +544,7 @@ test("total timeout includes time waiting in the admission queue", async () => {
 test("validates client configuration synchronously", () => {
   for (const enabled of [false, true]) {
     const legacy = { apiKeyEnv: "TYPESAFE_API_KEY", enabled };
-    assert.throws(
-      () => createJevClient(legacy),
-      /enabled.*obsolete/,
-    );
+    assert.throws(() => createJevClient(legacy), /enabled.*obsolete/);
   }
   assert.throws(() => createJevClient({ apiKeyEnv: "not valid" }), TypeError);
   assert.throws(() => createJevClient({ timeoutMs: 0 }), TypeError);

@@ -129,6 +129,7 @@ import {
 } from "./src/workflows/prompt.ts";
 import { openSubagentPicker } from "./src/ui/takeover.ts";
 import { createJevClient, type JevClient } from "./src/jev/client.ts";
+import { hasJevCredential } from "./src/jev/credentials.ts";
 import type { JevEvaluator } from "./src/jev/domain.ts";
 import { loadSubagentSettings } from "./src/routing/settings.ts";
 import {
@@ -590,9 +591,9 @@ export default function (pi: ExtensionAPI) {
               return {
                 settings,
                 lookupModel: lookupRoutedModel(ctx),
-                jevCredentialPresent: Boolean(
-                  process.env[settings.settings.jev.apiKeyEnv]?.trim(),
-                ),
+                jevCredentialPresent: hasJevCredential({
+                  apiKeyEnv: settings.settings.jev.apiKeyEnv,
+                }),
               };
             },
           ),

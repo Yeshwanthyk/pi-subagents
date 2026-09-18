@@ -98,6 +98,7 @@ export type JevEvaluationResult<Questions extends JevQuestions = JevQuestions> =
 
 export interface JevClientOptions {
   readonly apiKeyEnv?: string;
+  readonly credentialsPath?: string;
   readonly model?: string;
   readonly timeoutMs?: number;
   readonly maxConcurrent?: number;

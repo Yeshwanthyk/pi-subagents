@@ -1,6 +1,6 @@
 # Jev and standalone routing usage
 
-Jev and preference routing are optional. With no settings file, preference routing remains disabled. Jev becomes available when `TYPESAFE_API_KEY` is present, but only a direct `ask_jev` invocation or an explicitly declared gate/evaluation step can make a network request.
+Jev and preference routing are optional. With no settings file, preference routing remains disabled. Jev becomes available when `TYPESAFE_API_KEY` or a saved global fallback is present, but only a direct `ask_jev` invocation or an explicitly declared gate/evaluation step can make a network request.
 
 ## Settings
 
@@ -23,6 +23,14 @@ Inspect effective settings and credential presence without printing the credenti
 ```text
 /subagents-settings
 ```
+
+Securely enter or replace the global saved credential using masked TUI input:
+
+```text
+/subagents-settings set-jev-key
+```
+
+The command writes `~/.pi/agent/jev-credentials.json` atomically with owner-only `0600` permissions and makes the new key available to existing Jev clients immediately. It never accepts the key in command arguments, does not prefill the input, and does not store credentials in project settings. The configured environment variable (by default `TYPESAFE_API_KEY`) always takes precedence over the saved fallback.
 
 Open the interactive editor for one explicit scope:
 
@@ -183,7 +191,7 @@ Score example:
 }
 ```
 
-The configured environment variable must contain a credential; no separate Jev opt-in setting is required. The default credential variable is `TYPESAFE_API_KEY`; only its presence is displayed, never its value. Merely setting the variable does not make a request: `ask_jev` must be invoked directly or a gate/evaluation step must be declared and reached. Normal tests use an injected fake transport; they do not contact Jev. No live Jev call is claimed by this repository verification.
+The configured environment variable or saved global fallback must contain a credential; no separate Jev opt-in setting is required. The default credential variable is `TYPESAFE_API_KEY`, and its current value takes precedence over the saved key. Settings display only `configured` or `missing`, never a value. Merely configuring a credential does not make a request: `ask_jev` must be invoked directly or a gate/evaluation step must be declared and reached. Normal tests use an injected fake transport and temporary credential paths; they do not contact Jev or modify personal settings. No live Jev call is claimed by this repository verification.
 
 For a score question, `criteria` is an ordered scale of meaningful labels. Jev returns a zero-based numeric index into that array: the example above maps `0` to `insufficient` and `3` to `complete`.
 
