@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ParentRef, SubagentSnapshot } from "./src/domain.ts";
+import type { ParentQuestion, ParentRef, SubagentSnapshot } from "./src/domain.ts";
 import {
   captureParentRef,
   type ParentSessionManager,
@@ -299,4 +299,71 @@ test("workflow inspection consumption removes a queued aggregate before idle del
   coordinator.onWorkflowSettled(result, false);
   assert.equal(coordinator.flush(context), false);
   assert.deepEqual(sent, []);
+});
+
+test("questions notify separately, wait consumption does not consume terminal results, and stale questions are removed", () => {
+  const seam = sessionManager();
+  const context = { sessionManager: seam.manager, isIdle: () => true };
+  const sentQuestions: string[][] = [];
+  const sentResults: string[][] = [];
+  const coordinator = createParentResultCoordinator({
+    sendBatch: (batch) => sentResults.push(batch.map((result) => result.id)),
+    sendQuestionBatch: (batch) =>
+      sentQuestions.push(batch.map((question) => question.requestId)),
+  });
+  coordinator.startSession(context, 4);
+  const question: ParentQuestion = {
+    childId: "sa-question",
+    requestId: "pq-1",
+    question: "Need a choice",
+    context: "bounded context",
+    deadlineAt: Date.now() + 300_000,
+    parentRef: ref(),
+  };
+  coordinator.onQuestion(question);
+  assert.equal(coordinator.flush(context), true);
+  assert.deepEqual(sentQuestions, [["pq-1"]]);
+  assert.equal(coordinator.questionMailbox.size(), 0);
+
+  coordinator.onQuestion(question);
+  coordinator.consumeQuestions([question]);
+  assert.equal(coordinator.flush(context), false);
+
+  const settled = snapshot({ id: "sa-question" });
+  coordinator.onSettled(settled, false);
+  assert.equal(coordinator.flush(context), true);
+  assert.deepEqual(sentResults, [["sa-question"]]);
+
+  coordinator.onQuestion(question);
+  coordinator.onSettled(settled, false);
+  assert.equal(coordinator.questionMailbox.size(), 0);
+});
+
+test("question notification failure retains only the question and shutdown clears it", () => {
+  const seam = sessionManager();
+  const context = { sessionManager: seam.manager, isIdle: () => true };
+  let attempts = 0;
+  const question: ParentQuestion = {
+    childId: "sa-retry",
+    requestId: "pq-retry",
+    question: "Retry me",
+    deadlineAt: Date.now() + 300_000,
+    parentRef: ref(),
+  };
+  const coordinator = createParentResultCoordinator({
+    sendBatch: () => {},
+    sendQuestionBatch: () => {
+      attempts++;
+      if (attempts === 1) throw new Error("send failed");
+    },
+  });
+  coordinator.startSession(context, 4);
+  coordinator.onQuestion(question);
+  assert.equal(coordinator.flush(context), false);
+  assert.equal(coordinator.questionMailbox.size(), 1);
+  assert.equal(coordinator.flush(context), true);
+  assert.equal(coordinator.questionMailbox.size(), 0);
+  coordinator.onQuestion(question);
+  coordinator.close();
+  assert.equal(coordinator.questionMailbox.size(), 0);
 });

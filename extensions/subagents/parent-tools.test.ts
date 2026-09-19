@@ -4,7 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
-import type { SubagentSendMode, SubagentSnapshot } from "./src/domain.ts";
+import type {
+  ParentQuestion,
+  ParentRef,
+  SubagentSendMode,
+  SubagentSnapshot,
+} from "./src/domain.ts";
 import type { SubagentManagerApi } from "./src/manager.ts";
 import {
   createSubagentParentTools,
@@ -52,20 +57,36 @@ function snapshot(
   };
 }
 
-function fixture(snapshots: SubagentSnapshot[]) {
+function fixture(
+  snapshots: SubagentSnapshot[],
+  options: {
+    readonly parentRef?: ParentRef;
+    readonly isParentRefSafe?: (parentRef: ParentRef) => boolean;
+  } = {},
+) {
   const sends: Array<{ id: string; text: string; mode?: SubagentSendMode }> =
     [];
+  const replyArguments: Array<{
+    requestId?: string;
+    parentRef?: ParentRef;
+  }> = [];
   const manager = {
     spawn: () => Effect.die("unused"),
     waitFor: () => Effect.die("unused"),
     awaitSettlement: () => Effect.die("unused"),
     cancel: () => Effect.die("unused"),
-    send: (id, text, mode) =>
+    send: (id, text, mode, requestId, parentRef) =>
       Effect.sync(() => {
         sends.push({ id, text, mode });
+        if (mode === "reply") replyArguments.push({ requestId, parentRef });
         return {
           id,
-          mode: mode === "steer" ? ("steer" as const) : ("follow_up" as const),
+          mode:
+            mode === "steer"
+              ? ("steer" as const)
+              : mode === "reply"
+                ? ("reply" as const)
+                : ("follow_up" as const),
         };
       }),
     get: (id) => Effect.succeed(snapshots.find((item) => item.id === id)),
@@ -85,8 +106,10 @@ function fixture(snapshots: SubagentSnapshot[]) {
   const tools = createSubagentParentTools({
     getManager: async () => manager,
     runEffect: (effect) => Effect.runPromise(effect),
+    getParentRef: () => options.parentRef,
+    isParentRefSafe: options.isParentRefSafe,
   });
-  return { tools, sends };
+  return { tools, sends, replyArguments };
 }
 
 test("inspect is canonical and check is an exact handler/projection alias", () => {
@@ -157,6 +180,38 @@ test("inspection returns the latest finalized assistant output between turns", a
   assert.equal(result.details.latestOutput, "first turn output");
 });
 
+test("inspection exposes a bounded pending question without parent ownership data", async () => {
+  const inspected = snapshot("sa-question", {
+    pendingQuestion: {
+      childId: "sa-question",
+      requestId: "pq-1",
+      question: "Which option?",
+      context: "Choose one",
+      deadlineAt: 123_456,
+      parentRef: {
+        epoch: 9,
+        sessionFile: "/private/session.jsonl",
+        leafId: "secret-leaf",
+      },
+    } satisfies ParentQuestion,
+  });
+  const { tools } = fixture([inspected]);
+  const result = await tools.inspect.execute("call-question", {
+    id: inspected.id,
+  });
+
+  assert.deepEqual(result.details.pendingQuestion, {
+    childId: "sa-question",
+    requestId: "pq-1",
+    question: "Which option?",
+    context: "Choose one",
+    deadlineAt: 123_456,
+  });
+  assert.doesNotMatch(result.content[0]!.text, /session\.jsonl|secret-leaf/);
+  assert.match(result.content[0]!.text, /pq-1/);
+  assert.match(result.content[0]!.text, /1970/);
+});
+
 test("parent tools reject workflow and client children", async () => {
   const parent = snapshot("sa-parent");
   const workflow = snapshot("sa-workflow", {
@@ -198,6 +253,38 @@ test("send returns the manager's effective delivery mode", async () => {
   assert.equal(result.details?.effectiveMode, "follow_up");
   assert.deepEqual(sends, [
     { id: "sa-parent", text: "continue later", mode: "auto" },
+  ]);
+});
+test("reply uses the captured parent lineage after notification advances the leaf", async () => {
+  const captured: ParentRef = {
+    epoch: 3,
+    sessionFile: "/parent.jsonl",
+    leafId: "question-leaf",
+  };
+  const current: ParentRef = { ...captured, leafId: "notification-turn" };
+  const inspected = snapshot("sa-lineage", {
+    parentRef: captured,
+    pendingQuestion: {
+      childId: "sa-lineage",
+      requestId: "pq-lineage",
+      question: "Which branch?",
+      deadlineAt: Date.now() + 300_000,
+      parentRef: captured,
+    },
+  });
+  const { tools, replyArguments } = fixture([inspected], {
+    parentRef: current,
+    isParentRefSafe: (parentRef) => parentRef.leafId === captured.leafId,
+  });
+  const result = await tools.send.execute("reply", {
+    id: inspected.id,
+    message: "Use the existing branch",
+    mode: "reply",
+    requestId: "pq-lineage",
+  });
+  assert.equal(result.details?.effectiveMode, "reply");
+  assert.deepEqual(replyArguments, [
+    { requestId: "pq-lineage", parentRef: captured },
   ]);
 });
 

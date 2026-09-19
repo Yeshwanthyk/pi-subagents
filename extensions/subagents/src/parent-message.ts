@@ -1,3 +1,4 @@
+import type { ParentQuestion } from "./domain.ts";
 import type { TerminalSubagentStatus } from "./domain.ts";
 import type { ParentResultEnvelope } from "./parent-mailbox.ts";
 import {
@@ -76,6 +77,52 @@ export function buildParentResultBatchMessage(
     display: true,
     details: {
       results: batch.map(resultDetail),
+    },
+  };
+}
+
+export interface ParentQuestionBatchDetails {
+  readonly questions: ReadonlyArray<{
+    readonly childId: string;
+    readonly requestId: string;
+    readonly question: string;
+    readonly context?: string;
+    readonly deadlineAt: number;
+  }>;
+}
+
+export interface ParentQuestionBatchMessage {
+  readonly customType: "subagent-question-batch";
+  readonly content: string;
+  readonly display: true;
+  readonly details: ParentQuestionBatchDetails;
+}
+
+export const PARENT_QUESTION_BATCH_OPTIONS = {
+  deliverAs: "followUp",
+  triggerTurn: true,
+} as const;
+
+/** Build a bounded public notification without carrying runtime ParentRef data. */
+export function buildParentQuestionBatchMessage(
+  batch: ReadonlyArray<ParentQuestion>,
+): ParentQuestionBatchMessage {
+  const questions = batch.map((question) => {
+    const deadline = new Date(question.deadlineAt).toISOString();
+    const context =
+      question.context === undefined ? "" : `\nContext: ${question.context}`;
+    return `Child ${question.childId} asks (request ${question.requestId}, deadline ${deadline}): ${question.question}${context}\nReply with subagent_send using mode=reply and the exact requestId. Steering cancels this question; follow_up does not answer it.`;
+  });
+  return {
+    customType: "subagent-question-batch",
+    content: questions.join("\n\n"),
+    display: true,
+    details: {
+      questions: batch.map(({ childId, requestId, question, context, deadlineAt }) =>
+        context === undefined
+          ? { childId, requestId, question, deadlineAt }
+          : { childId, requestId, question, context, deadlineAt },
+      ),
     },
   };
 }

@@ -4,6 +4,7 @@ import { Type } from "typebox";
 import type { Effect } from "effect";
 import {
   latestText,
+  type ParentRef,
   type SubagentSendMode,
   type SubagentSnapshot,
 } from "./domain.ts";
@@ -91,7 +92,18 @@ export function projectSubagentInspection(snap: SubagentSnapshot) {
       }
     : undefined;
 
+  const pendingQuestion = snap.pendingQuestion
+    ? {
+        childId: snap.pendingQuestion.childId,
+        requestId: snap.pendingQuestion.requestId,
+        question: boundedPreview(snap.pendingQuestion.question) ?? "",
+        context: boundedPreview(snap.pendingQuestion.context),
+        deadlineAt: snap.pendingQuestion.deadlineAt,
+      }
+    : undefined;
+
   return {
+    pendingQuestion,
     currentTools,
     omittedCurrentTools: Math.max(
       0,
@@ -127,6 +139,14 @@ function describeInspection(snap: SubagentSnapshot) {
   let text = `${snap.id} [${snap.status}] "${snap.title}" (${details.join(", ")})`;
   text += `\nTurns: ${snap.turns}`;
   text += `\nLast activity: ${new Date(projection.lastActivityAt).toISOString()}`;
+  if (projection.pendingQuestion) {
+    text +=
+      `\nPending parent question (${projection.pendingQuestion.requestId}, deadline ${new Date(projection.pendingQuestion.deadlineAt).toISOString()}): ` +
+      projection.pendingQuestion.question;
+    if (projection.pendingQuestion.context) {
+      text += `\nQuestion context: ${projection.pendingQuestion.context}`;
+    }
+  }
   text +=
     `\nCapabilities: steering=${projection.capabilities.steering ? "yes" : "no"},` +
     ` model_selection=${projection.capabilities.modelSelection ? "yes" : "no"},` +
@@ -180,6 +200,10 @@ function describeInspection(snap: SubagentSnapshot) {
 export interface ParentToolDependencies {
   readonly getManager: () => Promise<SubagentManagerApi>;
   readonly runEffect: <A, E>(effect: Effect.Effect<A, E>) => Promise<A>;
+  readonly getParentRef?: () => ParentRef | undefined;
+  /** Validate a captured question ref against the current parent lineage. */
+  readonly isParentRefSafe?: (parentRef: ParentRef) => boolean;
+  readonly onQuestionResolved?: (requestId: string, parentRef: ParentRef) => void;
 }
 
 /** Build parent-only send and inspection tools over the filtered manager view. */
@@ -203,14 +227,26 @@ export function createSubagentParentTools(
             Type.Literal("auto"),
             Type.Literal("steer"),
             Type.Literal("follow_up"),
+            Type.Literal("reply"),
           ],
           { description: SUBAGENT_SEND_PARAMETER_DESCRIPTIONS.mode },
         ),
       ),
+      requestId: Type.Optional(
+        Type.String({
+          maxLength: 128,
+          description: SUBAGENT_SEND_PARAMETER_DESCRIPTIONS.requestId,
+        }),
+      ),
     }),
     async execute(
       _toolCallId: string,
-      params: { id: string; message: string; mode?: SubagentSendMode },
+      params: {
+        id: string;
+        message: string;
+        mode?: SubagentSendMode;
+        requestId?: string;
+      },
     ) {
       const manager = await dependencies.getManager();
       const view = parentSubagentView(manager.view);
@@ -225,9 +261,35 @@ export function createSubagentParentTools(
       if (message.length === 0) throw new Error("message is required.");
 
       const requestedMode = params.mode ?? "auto";
+      if (requestedMode === "reply" && !params.requestId)
+        throw new Error("requestId is required when mode is reply.");
+      const currentParentRef = dependencies.getParentRef?.();
+      const pendingQuestion = snap.pendingQuestion;
+      const replyParentRef =
+        requestedMode === "reply" ? pendingQuestion?.parentRef : undefined;
+      if (
+        requestedMode === "reply" &&
+        (replyParentRef === undefined ||
+          dependencies.isParentRefSafe?.(replyParentRef) !== true)
+      ) {
+        throw new Error("Reply parent ownership is not on the current parent lineage.");
+      }
       const result = await dependencies.runEffect(
-        manager.send(snap.id, message, requestedMode),
+        manager.send(
+          snap.id,
+          message,
+          requestedMode,
+          params.requestId,
+          replyParentRef ?? currentParentRef,
+        ),
       );
+      if (
+        pendingQuestion !== undefined &&
+        (result.mode === "reply" || result.mode === "steer") &&
+        replyParentRef !== undefined
+      ) {
+        dependencies.onQuestionResolved?.(pendingQuestion.requestId, replyParentRef);
+      }
       return {
         content: [
           {
@@ -239,6 +301,7 @@ export function createSubagentParentTools(
           id: result.id,
           requestedMode,
           effectiveMode: result.mode,
+          requestId: result.requestId,
         },
       };
     },

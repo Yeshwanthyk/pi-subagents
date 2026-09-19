@@ -27,7 +27,7 @@ export const SUBAGENT_SPAWN_TOOL_DESCRIPTION =
 
 /** Adds background subagent delegation to the parent model's available-tools prompt. */
 export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
-  "Delegate a clearly scoped, self-contained task to a Pi or Codex subagent running in the background";
+  "Delegate a clearly scoped, self-contained task to a Pi or Codex subagent running in the background; eligible Pi children also have bounded ask_parent for decisions that block progress.";
 
 /** Guides the parent model to delegate scoped work and coordinate with results. */
 export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
@@ -37,7 +37,7 @@ export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
   "Pick the subagent harness deliberately: pi unless there is a reason to prefer Codex.",
   "A gated standalone result delivers compact acceptance by default; request the full report explicitly when needed. Workflow consumers that truly need a dependency report retain its content—never strip dependency evidence for compact delivery.",
   "Coordinate by scope: while a child runs, continue parent work outside its delegated scope. When its result arrives, use it as the basis for synthesis, validation, integration, or follow-up in that scope.",
-  "Use subagent_wait when the next parent step requires a child's result, such as synthesis or integration that includes its work, review of its findings, or a dependent decision.",
+  "Use subagent_wait when the next parent step requires a child's result, such as synthesis or integration that includes its work, review of its findings, or a dependent decision. If it returns an ask_parent question, answer with subagent_send mode=reply and the exact requestId; follow_up is queued work, not an answer.",
 ];
 
 /** Model-facing schema descriptions for subagent_spawn task and execution options. */
@@ -68,13 +68,14 @@ export function buildSubagentSpawnResult(options: {
     `Spawned subagent ${options.id} "${options.title}" (${options.harness}: ${options.modelLabel}, ${options.cwd}).\n` +
     `It runs in the background, and its result will be delivered automatically. ` +
     `Use subagent_wait(ids: ["${options.id}"]) when your next step requires that result; otherwise continue outside its delegated scope. ` +
+    `A Pi child may pause on ask_parent; answer with subagent_send(mode="reply", requestId=<exact id>), steer to cancel the question, or use follow_up for later work. ` +
     `Use subagent_cancel to stop it, subagent_inspect to peek, and subagent_list to see all.`
   );
 }
 
 /** Describes explicit blocking collection of one or more subagent results. */
 export const SUBAGENT_WAIT_TOOL_DESCRIPTION =
-  "Block until all listed parent-owned subagents have settled, then return their final outputs. Use this when the next parent step requires those outputs.";
+  "Wait for listed parent-owned subagents. If a child asks ask_parent, return its question, requestId, and deadline without consuming an unfinished result; answer with subagent_send mode=reply and the exact requestId. Use this when the next parent step requires those outputs.";
 
 /** Model-facing schema description for the subagent ids to await. */
 export const SUBAGENT_WAIT_PARAMETER_DESCRIPTIONS = {
@@ -92,18 +93,19 @@ export const SUBAGENT_CANCEL_PARAMETER_DESCRIPTIONS = {
 
 /** Describes sending another instruction to a parent-owned child. */
 export const SUBAGENT_SEND_TOOL_DESCRIPTION =
-  'Send another instruction to a parent-owned subagent and return immediately. Use mode "steer" to inject into the current run, "follow_up" to wait until the current run would otherwise stop, or "auto" to select the harness-supported mode. The result reports the effective delivery mode. Explicit steering fails when the harness does not support it; it is never downgraded silently. Queued children cannot receive messages.';
+  'Send another instruction to a parent-owned subagent and return immediately. Use mode "reply" with the exact requestId to answer its pending ask_parent question; use "steer" to inject into the current run, "follow_up" to queue work after the run, or "auto" to select the harness-supported mode. follow_up is never an answer. The result reports the effective delivery mode. Explicit steering fails when the harness does not support it; it is never downgraded silently. Queued children cannot receive messages.';
 
 /** Model-facing schema descriptions for subagent_send. */
 export const SUBAGENT_SEND_PARAMETER_DESCRIPTIONS = {
   id: "Parent-owned subagent id",
   message: "Instruction to send to the subagent",
-  mode: 'Delivery mode: "auto", "steer", or "follow_up"',
+  mode: 'Delivery mode: "auto", "steer", "follow_up", or "reply"',
+  requestId: "Exact pending ask_parent request id; required for reply mode",
 };
 
 /** Describes nonblocking inspection of a subagent without consuming its result. */
 export const SUBAGENT_INSPECT_TOOL_DESCRIPTION =
-  "Peek at a parent-owned subagent without blocking or consuming its result. Reports bounded current-tool activity, last activity, queued instruction previews, completed-operation counts, capabilities, and latest output; it never returns the child transcript.";
+  "Peek at a parent-owned subagent without blocking or consuming its result. Reports bounded current-tool activity, pending ask_parent question/requestId/deadline, queued instruction previews, completed-operation counts, capabilities, and latest output; it never returns the child transcript.";
 
 /** Model-facing schema description for the subagent id to inspect. */
 export const SUBAGENT_INSPECT_PARAMETER_DESCRIPTIONS = {

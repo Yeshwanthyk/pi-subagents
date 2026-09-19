@@ -6,9 +6,15 @@ import {
   parentResultEnvelope,
   type ParentResultEnvelope,
 } from "./src/parent-mailbox.ts";
-import type { ParentRef, SubagentSnapshot } from "./src/domain.ts";
+import type {
+  ParentQuestion,
+  ParentRef,
+  SubagentSnapshot,
+} from "./src/domain.ts";
 import {
+  buildParentQuestionBatchMessage,
   buildParentResultBatchMessage,
+  PARENT_QUESTION_BATCH_OPTIONS,
   PARENT_RESULT_BATCH_OPTIONS,
 } from "./src/parent-message.ts";
 import { buildSubagentWaitResult } from "./src/result-delivery.ts";
@@ -184,6 +190,37 @@ test("parent message is one bounded batch with public details and follow-up opti
     JSON.stringify(message),
     /sessionFile|leafId|epoch|cwd|model/,
   );
+
+});
+
+test("parent question message is bounded, actionable, and omits ownership", () => {
+  const question: ParentQuestion = {
+    childId: "sa-question",
+    requestId: "pq-1",
+    question: "Which option?",
+    context: "Only choose A or B.",
+    deadlineAt: 1_234_567,
+    parentRef: ref({ sessionFile: "/private/session.jsonl", leafId: "secret" }),
+  };
+  const message = buildParentQuestionBatchMessage([question]);
+  assert.equal(message.customType, "subagent-question-batch");
+  assert.equal(message.display, true);
+  assert.deepEqual(message.details.questions, [
+    {
+      childId: "sa-question",
+      requestId: "pq-1",
+      question: "Which option?",
+      context: "Only choose A or B.",
+      deadlineAt: 1_234_567,
+    },
+  ]);
+  assert.match(message.content, /mode=reply/);
+  assert.match(message.content, /pq-1/);
+  assert.doesNotMatch(JSON.stringify(message), /session\.jsonl|secret/);
+  assert.deepEqual(PARENT_QUESTION_BATCH_OPTIONS, {
+    deliverAs: "followUp",
+    triggerTurn: true,
+  });
 });
 
 test("workflow aggregate keeps its kind on the existing parent result rail", () => {

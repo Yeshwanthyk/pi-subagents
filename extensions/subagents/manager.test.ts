@@ -61,12 +61,16 @@ function task(prompt: string): SpawnTask {
   return { prompt, title: "test", cwd: process.cwd(), parent };
 }
 
-function makeControlledBackend(steering = true) {
+function makeControlledBackend(
+  steering = true,
+  backendName: BackendName = "codex",
+) {
   const starts: string[] = [];
   const sends: Array<{ prompt: string; text: string; mode: string }> = [];
   const sessions = new Map<string, Queue.Queue<SubagentEvent>>();
+  const tasks = new Map<string, SpawnTask>();
   const backend: SubagentBackend = {
-    name: "codex",
+    name: backendName,
     capabilities: {
       steering,
       modelSelection: true,
@@ -76,6 +80,7 @@ function makeControlledBackend(steering = true) {
     spawn: (spawnTask) =>
       Effect.gen(function* () {
         starts.push(spawnTask.prompt);
+        tasks.set(spawnTask.prompt, spawnTask);
         if (spawnTask.prompt.startsWith("SPAWN_FAIL:")) {
           return yield* new SpawnError({ message: "controlled spawn failure" });
         }
@@ -83,7 +88,7 @@ function makeControlledBackend(steering = true) {
         sessions.set(spawnTask.prompt, events);
         return {
           meta: Effect.succeed({
-            backend: "codex",
+            backend: backendName,
             modelLabel: "controlled/codex",
           }),
           events: Stream.fromQueue(events),
@@ -109,6 +114,7 @@ function makeControlledBackend(steering = true) {
     backend,
     starts,
     sends,
+    task: (prompt: string) => tasks.get(prompt),
     complete: (prompt: string, finalText = prompt) =>
       emit(prompt, {
         _tag: "RunSettled",
@@ -153,6 +159,23 @@ async function waitUntil(predicate: () => boolean, message: string) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.equal(predicate(), true, message);
+}
+
+async function withPiControlledManager(
+  run: (
+    manager: SubagentManagerApi,
+    runtime: ReturnType<typeof createRuntimeWith>,
+    controlled: ReturnType<typeof makeControlledBackend>,
+  ) => Promise<void>,
+) {
+  const controlled = makeControlledBackend(true, "pi");
+  const runtime = createRuntimeWith(controlled.backend);
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    await run(manager, runtime, controlled);
+  } finally {
+    await runtime.dispose();
+  }
 }
 
 async function withManager(
@@ -664,6 +687,188 @@ test("explicit steering fails when a backend does not support it", async () => {
   } finally {
     await runtime.dispose();
   }
+});
+
+test("parent questions yield before settlement and replies preserve the running slot", async () => {
+  await withPiControlledManager(async (manager, runtime, controlled) => {
+    const parentRef = { epoch: 7, sessionFile: "/parent.jsonl", leafId: "leaf" } as const;
+    const child = await runTool(
+      runtime,
+      manager.spawn("pi", { ...task("ask-parent"), parentRef }),
+    );
+    await waitUntil(() => controlled.task("ask-parent") !== undefined, "Pi child should be admitted");
+    const ask = controlled.task("ask-parent")!.askParent!({
+      question: "Which option?",
+      context: "Two valid options remain.",
+    });
+    await waitUntil(() => manager.view.get(child.id)?.pendingQuestion !== undefined, "question should be visible");
+    const waiting = runTool(runtime, manager.waitForParent!([child.id]));
+    const result = await waiting;
+    assert.equal(result.questions[0]?.question, "Which option?");
+    assert.equal(manager.view.get(child.id)?.status, "running");
+    const reply = await runTool(
+      runtime,
+      manager.send(child.id, "choose B", "reply", result.questions[0]!.requestId, parentRef),
+    );
+    assert.deepEqual(reply, {
+      id: child.id,
+      mode: "reply",
+      requestId: result.questions[0]!.requestId,
+    });
+    assert.equal(await ask, "choose B");
+    await controlled.complete("ask-parent", "done after answer");
+    assert.equal((await runTool(runtime, manager.awaitSettlement(child.id)))?.finalText, "done after answer");
+  });
+});
+test("parent wait keeps acceptance-pending terminals pending", async () => {
+  await withPiControlledManager(async (manager, runtime, controlled) => {
+    let release!: (result: { status: "pass" }) => void;
+    const verdict = new Promise<{ status: "pass" }>((resolve) => {
+      release = resolve;
+    });
+    const child = await runTool(
+      runtime,
+      manager.spawn("pi", {
+        ...task("parent-wait-acceptance"),
+        acceptance: { timeoutMs: 2_000, evaluate: () => verdict },
+      }),
+    );
+    await waitUntil(
+      () => controlled.task("parent-wait-acceptance") !== undefined,
+      "acceptance child should be admitted",
+    );
+    await controlled.complete("parent-wait-acceptance", "accepted later");
+    await waitUntil(
+      () =>
+        manager.view.get(child.id)?.status === "done" &&
+        manager.view.get(child.id)?.acceptance?.status === "pending",
+      "process should settle behind the acceptance gate",
+    );
+
+    let returned = false;
+    const waiting = runTool(runtime, manager.waitForParent!([child.id])).then(
+      (result) => {
+        returned = true;
+        return result;
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(returned, false);
+    release({ status: "pass" });
+    const result = await waiting;
+    assert.deepEqual(result.questions, []);
+    assert.deepEqual(result.settledIds, [child.id]);
+  });
+});
+
+test("parent wait observes a sibling settlement without suppressing its delivery", async () => {
+  await withPiControlledManager(async (manager, runtime, controlled) => {
+    const settled: Array<{ id: string; consumed: boolean }> = [];
+    manager.view.setOnSettled((snapshot, consumed) =>
+      settled.push({ id: snapshot.id, consumed }),
+    );
+    const parentRef = { epoch: 10, sessionFile: "/parent.jsonl", leafId: "leaf" } as const;
+    const questionChild = await runTool(
+      runtime,
+      manager.spawn("pi", { ...task("parent-wait-question"), parentRef }),
+    );
+    const sibling = await runTool(
+      runtime,
+      manager.spawn("pi", { ...task("parent-wait-sibling"), parentRef }),
+    );
+    await waitUntil(
+      () =>
+        controlled.task("parent-wait-question") !== undefined &&
+        controlled.task("parent-wait-sibling") !== undefined,
+      "both parent-owned Pi children should be admitted",
+    );
+    let waitStarted = false;
+    const waiting = runTool(
+      runtime,
+      manager.waitForParent!([questionChild.id, sibling.id], () => {
+        waitStarted = true;
+      }),
+    );
+    await waitUntil(() => waitStarted, "parent wait should be observing");
+    await controlled.complete("parent-wait-sibling", "sibling done");
+    await waitUntil(
+      () => manager.view.get(sibling.id)?.status === "done",
+      "sibling should settle while parent wait is observing",
+    );
+    const ask = controlled.task("parent-wait-question")!.askParent!({
+      question: "Need sibling context",
+    });
+    const result = await waiting;
+    assert.equal(result.questions[0]?.childId, questionChild.id);
+    assert.deepEqual(result.settledIds, [sibling.id]);
+    assert.deepEqual(
+      settled.filter((entry) => entry.id === sibling.id),
+      [{ id: sibling.id, consumed: false }],
+    );
+    await runTool(runtime, manager.cancel([questionChild.id]));
+    await assert.rejects(ask, /cancelled with the child/);
+  });
+});
+
+test("parent question replies reject wrong, stale, duplicate, expired, and queued-answer paths", async () => {
+  await withPiControlledManager(async (manager, runtime, controlled) => {
+    const parentRef = { epoch: 8, sessionFile: "/parent.jsonl", leafId: "leaf" } as const;
+    const child = await runTool(runtime, manager.spawn("pi", { ...task("question-races"), parentRef }));
+    await waitUntil(() => controlled.task("question-races") !== undefined, "race child should be admitted");
+    const ask = controlled.task("question-races")!.askParent!({ question: "Need a choice" });
+    await waitUntil(() => manager.view.get(child.id)?.pendingQuestion !== undefined, "race question should be visible");
+    const request = manager.view.get(child.id)!.pendingQuestion!;
+    await assert.rejects(
+      runTool(runtime, manager.send(child.id, "wrong owner", "reply", request.requestId, { ...parentRef, leafId: "other" })),
+      /parent ownership/,
+    );
+    await assert.rejects(
+      runTool(runtime, manager.send(child.id, "stale", "reply", "pq-stale", parentRef)),
+      /stale/,
+    );
+    const followUp = await runTool(runtime, manager.send(child.id, "queued work", "follow_up"));
+    assert.equal(followUp.mode, "follow_up");
+    assert.notEqual(manager.view.get(child.id)?.pendingQuestion, undefined);
+    await runTool(runtime, manager.send(child.id, "steer instead", "steer"));
+    await assert.rejects(ask, /cancelled by steering/);
+    assert.equal(manager.view.get(child.id)?.pendingQuestion, undefined);
+
+    const expired = controlled.task("question-races")!.askParent!({ question: "Expire me" });
+    await waitUntil(() => manager.view.get(child.id)?.pendingQuestion?.requestId !== request.requestId, "second question should be visible");
+    const second = manager.view.get(child.id)!.pendingQuestion!;
+    const originalNow = Date.now;
+    Date.now = () => originalNow() + 301_000;
+    try {
+      await assert.rejects(
+        runTool(runtime, manager.send(child.id, "too late", "reply", second.requestId, parentRef)),
+        /expired/,
+      );
+    } finally {
+      Date.now = originalNow;
+    }
+    await assert.rejects(expired, /timed out/);
+    await controlled.complete("question-races", "race done");
+  });
+});
+
+test("parent question cleanup covers tool abort and child cancellation", async () => {
+  await withPiControlledManager(async (manager, runtime, controlled) => {
+    const parentRef = { epoch: 9, sessionFile: "/parent.jsonl", leafId: "leaf" } as const;
+    const child = await runTool(runtime, manager.spawn("pi", { ...task("abort-question"), parentRef }));
+    await waitUntil(() => controlled.task("abort-question") !== undefined, "abort child should be admitted");
+    const controller = new AbortController();
+    const aborted = controlled.task("abort-question")!.askParent!({ question: "Abort me" }, controller.signal);
+    await waitUntil(() => manager.view.get(child.id)?.pendingQuestion !== undefined, "abort question should be visible");
+    controller.abort();
+    await assert.rejects(aborted, /aborted/);
+    assert.equal(manager.view.get(child.id)?.pendingQuestion, undefined);
+
+    const cancelled = controlled.task("abort-question")!.askParent!({ question: "Cancel me" });
+    await waitUntil(() => manager.view.get(child.id)?.pendingQuestion !== undefined, "cancel question should be visible");
+    await runTool(runtime, manager.cancel([child.id]));
+    await assert.rejects(cancelled, /cancelled with the child/);
+    assert.equal(manager.view.get(child.id)?.pendingQuestion, undefined);
+  });
 });
 
 test("running follow-up stays live and settles after the queued turn", async () => {

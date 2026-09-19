@@ -47,14 +47,18 @@ import type {
   EffectiveSubagentSendMode,
   SubagentSendMode,
   SubagentAcceptanceResult,
+  ParentQuestion,
+  ParentQuestionRequest,
 } from "./domain.ts";
 import {
+  PARENT_QUESTION_LIMITS,
   failureKindFromProvenance,
   BackendUnavailableError,
   SendError,
   SpawnError,
   WorkflowObservationLimitError,
   WorkflowOwnershipError,
+  ParentQuestionError,
 } from "./domain.ts";
 
 export const MAX_RUNNING = 4;
@@ -135,8 +139,20 @@ interface MutableSnapshot {
   lastCompletedOperation?: CompletedOperation;
   processTelemetry: "unavailable";
   queued: SubagentSnapshot["queued"];
+  pendingQuestion?: ParentQuestion;
   finalText: string;
   turns: number;
+}
+
+interface PendingParentQuestion {
+  readonly question: ParentQuestion;
+  readonly attempt: number;
+  readonly resolve: (answer: string) => void;
+  readonly reject: (error: ParentQuestionError) => void;
+  readonly signal?: AbortSignal;
+  readonly abortListener: () => void;
+  timer?: ReturnType<typeof setTimeout>;
+  settled: boolean;
 }
 
 interface Entry {
@@ -158,10 +174,12 @@ interface Entry {
   /** Idle restart dispatched but RunStarted not folded yet; counts as running
    * so concurrent restarts cannot race past the cap. */
   restarting?: boolean;
+  attempt: number;
   acceptanceRun?: {
     readonly controller: AbortController;
     readonly timer: ReturnType<typeof setTimeout>;
   };
+  pendingQuestion?: PendingParentQuestion;
 }
 
 export interface WorkflowSubagentObservation {
@@ -202,6 +220,12 @@ export interface SubagentReadModel {
   setOnSettled(
     hook: ((snap: SubagentSnapshot, consumed: boolean) => void) | undefined,
   ): void;
+  setOnQuestion?: (
+    hook: ((question: ParentQuestion) => void) | undefined,
+  ) => void;
+  setOnQuestionResolved?: (
+    hook: ((question: ParentQuestion) => void) | undefined,
+  ) => void;
 }
 
 /**
@@ -232,6 +256,12 @@ export function parentSubagentView(view: SubagentReadModel): SubagentReadModel {
     },
     setOnSettled: () => {
       throw new Error("Filtered views cannot replace the manager settle hook.");
+    },
+    setOnQuestion: () => {
+      throw new Error("Filtered views cannot replace the manager question hook.");
+    },
+    setOnQuestionResolved: () => {
+      throw new Error("Filtered views cannot replace the manager question hook.");
     },
   };
 }
@@ -267,6 +297,12 @@ export function operatorSubagentView(
     setOnSettled: () => {
       throw new Error("Filtered views cannot replace the manager settle hook.");
     },
+    setOnQuestionResolved: () => {
+      throw new Error("Filtered views cannot replace the manager question hook.");
+    },
+    setOnQuestion: () => {
+      throw new Error("Filtered views cannot replace the manager question hook.");
+    },
   };
 }
 
@@ -289,6 +325,12 @@ export interface CancelResult {
 export interface SubagentSendResult {
   readonly id: string;
   readonly mode: EffectiveSubagentSendMode;
+  readonly requestId?: string;
+}
+
+export interface ParentWaitResult {
+  readonly questions: ReadonlyArray<ParentQuestion>;
+  readonly settledIds: ReadonlyArray<string>;
 }
 
 export interface SubagentManagerApi {
@@ -336,6 +378,11 @@ export interface SubagentManagerApi {
     ids: ReadonlyArray<string>,
     onPending?: (pending: string[]) => void,
   ): Effect.Effect<void>;
+  /** Parent-facing wait: return a live question before terminal collection. */
+  readonly waitForParent?: (
+    ids: ReadonlyArray<string>,
+    onPending?: (pending: string[]) => void,
+  ) => Effect.Effect<ParentWaitResult>;
   /** Cancel queued or running subagents; resolves when they have settled. */
   cancel(
     ids: ReadonlyArray<string>,
@@ -344,6 +391,8 @@ export interface SubagentManagerApi {
     id: string,
     text: string,
     mode?: SubagentSendMode,
+    requestId?: string,
+    parentRef?: ParentRef,
   ): Effect.Effect<SubagentSendResult, SendError>;
   get(id: string): Effect.Effect<SubagentSnapshot | undefined>;
   readonly list: Effect.Effect<ReadonlyArray<SubagentSnapshot>>;
@@ -387,11 +436,14 @@ const makeManager = Effect.gen(function* () {
   const idListeners = new Map<string, Set<() => void>>();
   const cleanups = new Set<Fiber.Fiber<unknown>>();
   let counter = 0;
+  let questionCounter = 0;
   const admissionQueue: Entry[] = [];
   let activeSlots = 0;
   let disposed = false;
   let onSettled:
     ((snap: SubagentSnapshot, consumed: boolean) => void) | undefined;
+  let onQuestion: ((question: ParentQuestion) => void) | undefined;
+  let onQuestionResolved: ((question: ParentQuestion) => void) | undefined;
 
   const notify = (id?: string) => {
     const waiters = changeWaiters;
@@ -413,6 +465,108 @@ const makeManager = Effect.gen(function* () {
         }
       }
     }
+  };
+
+  const clearPendingQuestion = (
+    entry: Entry,
+    pending: PendingParentQuestion,
+    outcome: { answer: string } | { error: ParentQuestionError },
+  ) => {
+    if (entry.pendingQuestion !== pending || pending.settled) return false;
+    pending.settled = true;
+    clearTimeout(pending.timer);
+    pending.signal?.removeEventListener("abort", pending.abortListener);
+    entry.pendingQuestion = undefined;
+    entry.snapshot.pendingQuestion = undefined;
+    try {
+      onQuestionResolved?.(pending.question);
+    } catch {
+      // Notification cleanup is best-effort; request settlement is authoritative.
+    }
+    notify(entry.snapshot.id);
+    if ("answer" in outcome) pending.resolve(outcome.answer);
+    else pending.reject(outcome.error);
+    return true;
+  };
+
+  const validateParentQuestion = (request: ParentQuestionRequest) => {
+    const question = request.question.trim();
+    const context = request.context?.trim();
+    const timeoutSeconds = request.timeoutSeconds ?? PARENT_QUESTION_LIMITS.defaultTimeoutSeconds;
+    if (!question || question.length > PARENT_QUESTION_LIMITS.maxQuestionLength)
+      throw new ParentQuestionError({ message: "question must be non-empty and bounded." });
+    if (context !== undefined && context.length > PARENT_QUESTION_LIMITS.maxContextLength)
+      throw new ParentQuestionError({ message: "context exceeds the bounded limit." });
+    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < PARENT_QUESTION_LIMITS.minTimeoutSeconds || timeoutSeconds > PARENT_QUESTION_LIMITS.maxTimeoutSeconds)
+      throw new ParentQuestionError({ message: "timeoutSeconds must be an integer from 30 through 900." });
+    return { question, context, timeoutSeconds };
+  };
+
+  const askParent = (entry: Entry, request: ParentQuestionRequest, signal?: AbortSignal) => {
+    if (entry.snapshot.backend !== "pi" || entry.snapshot.resultDelivery !== "parent" || entry.snapshot.client !== undefined || entry.snapshot.workflow !== undefined)
+      return Promise.reject(new ParentQuestionError({ message: "This child cannot ask its parent." }));
+    let input: ReturnType<typeof validateParentQuestion>;
+    try {
+      input = validateParentQuestion(request);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (entry.pendingQuestion !== undefined)
+      return Promise.reject(new ParentQuestionError({ message: "This child already has a pending parent question." }));
+    if (signal?.aborted)
+      return Promise.reject(new ParentQuestionError({ message: "Parent question was aborted." }));
+    const requestId = `pq-${++questionCounter}`;
+    const deadlineAt = Date.now() + input.timeoutSeconds * 1_000;
+    let resolvePromise!: (answer: string) => void;
+    let rejectPromise!: (error: ParentQuestionError) => void;
+    const promise = new Promise<string>((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    const questionBase = {
+      childId: entry.snapshot.id,
+      requestId,
+      question: input.question,
+      deadlineAt,
+      parentRef: { ...entry.parentRef },
+    };
+    const question: ParentQuestion =
+      input.context === undefined
+        ? questionBase
+        : { ...questionBase, context: input.context };
+    let pending: PendingParentQuestion;
+    pending = {
+      question,
+      attempt: entry.attempt,
+      resolve: resolvePromise,
+      reject: rejectPromise,
+      signal,
+      timer: undefined,
+      settled: false,
+      abortListener: () => {
+        clearPendingQuestion(entry, pending, { error: new ParentQuestionError({ message: "Parent question was aborted." }) });
+      },
+    };
+    const expire = () => {
+      if (entry.pendingQuestion !== pending || pending.settled) return;
+      const remaining = deadlineAt - Date.now();
+      if (remaining > 0) {
+        pending.timer = setTimeout(expire, remaining);
+        return;
+      }
+      clearPendingQuestion(entry, pending, { error: new ParentQuestionError({ message: "Parent question timed out." }) });
+    };
+    pending.timer = setTimeout(expire, input.timeoutSeconds * 1_000);
+    entry.pendingQuestion = pending;
+    entry.snapshot.pendingQuestion = question;
+    signal?.addEventListener("abort", pending.abortListener, { once: true });
+    try {
+      onQuestion?.(question);
+    } catch {
+      // Notification is best-effort; the request remains manager-owned.
+    }
+    notify(entry.snapshot.id);
+    return promise;
   };
 
   /** Resolves on the next state change. Interruption unregisters the waiter. */
@@ -560,6 +714,11 @@ const makeManager = Effect.gen(function* () {
 
   const settle = (entry: Entry, outcome: RunOutcome) => {
     const s = entry.snapshot;
+    if (entry.pendingQuestion) {
+      clearPendingQuestion(entry, entry.pendingQuestion, {
+        error: new ParentQuestionError({ message: "Child attempt settled before the parent answered." }),
+      });
+    }
     entry.restarting = false;
     if (s.status === "done" || s.status === "error") return;
     s.settledAt = Date.now();
@@ -621,6 +780,7 @@ const makeManager = Effect.gen(function* () {
     s.lastActivityAt = observedAt;
     switch (event._tag) {
       case "RunStarted":
+        entry.attempt++;
         entry.restarting = false;
         s.status = "running";
         s.startedAt ??= observedAt;
@@ -899,8 +1059,20 @@ const makeManager = Effect.gen(function* () {
           settlement: Deferred.makeUnsafe<SubagentSnapshot>(),
           slotHeld: false,
           workflowClaims: 0,
+          attempt: 0,
           liveToolMap: new Map(),
         };
+        if (
+          backendName === "pi" &&
+          entry.snapshot.resultDelivery === "parent" &&
+          entry.snapshot.client === undefined &&
+          entry.snapshot.workflow === undefined
+        ) {
+          entry.task = {
+            ...entry.task,
+            askParent: (request, signal) => askParent(entry, request, signal),
+          };
+        }
         entries.set(id, entry);
         settlementHandles.set(id, {
           // Keep ownership separate from the mutable live snapshot; validation
@@ -953,9 +1125,53 @@ const makeManager = Effect.gen(function* () {
       );
     });
 
+  const waitForParent = (
+    ids: ReadonlyArray<string>,
+    onPending?: (pending: string[]) => void,
+  ) =>
+    Effect.suspend(() => {
+      const unique = [...new Set(ids)];
+      const loop = Effect.gen(function* () {
+        while (true) {
+          const questions = unique
+            .map((id) => entries.get(id)?.snapshot.pendingQuestion)
+            .filter((question): question is ParentQuestion => question !== undefined)
+            .map((question) => ({ ...question, parentRef: { ...question.parentRef } }));
+          const settledIds = unique.filter((id) => {
+            const snapshot = entries.get(id)?.snapshot;
+            return (
+              (snapshot?.status === "done" || snapshot?.status === "error") &&
+              snapshot.acceptance?.status !== "pending"
+            );
+          });
+          if (questions.length > 0 || settledIds.length === unique.length)
+            return { questions, settledIds };
+          const pending = unique.filter((id) => !settledIds.includes(id));
+          onPending?.(pending);
+          yield* nextChange;
+        }
+      });
+      return loop.pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            // Parent waits observe terminal state but leave result delivery
+            // unconsumed. The caller consumes the exact terminal ids it
+            // returned, preventing a sibling settlement racing a question
+            // handoff from being dropped by publishSettlement.
+            pruneSettled();
+          }),
+        ),
+      );
+    });
+
   /** Cancel one queued/running entry, force-closing its scope after 5s. */
   const abortEntry = (entry: Entry) =>
     Effect.gen(function* () {
+      if (entry.pendingQuestion) {
+        clearPendingQuestion(entry, entry.pendingQuestion, {
+          error: new ParentQuestionError({ message: "Parent question was cancelled with the child." }),
+        });
+      }
       if (entry.acceptanceRun) {
         finishAcceptance(entry, entry.acceptanceRun, {
           status: "error",
@@ -1058,6 +1274,8 @@ const makeManager = Effect.gen(function* () {
     id: string,
     text: string,
     requestedMode: SubagentSendMode = "auto",
+    requestId?: string,
+    parentRef?: ParentRef,
   ) =>
     Effect.suspend((): Effect.Effect<SubagentSendResult, SendError> => {
       const entry = entries.get(id);
@@ -1083,6 +1301,35 @@ const makeManager = Effect.gen(function* () {
             ? "steer"
             : "follow_up"
           : requestedMode;
+      if (effectiveMode === "reply") {
+        const pending = entry.pendingQuestion;
+        if (
+          entry.snapshot.backend !== "pi" ||
+          entry.snapshot.resultDelivery !== "parent" ||
+          entry.snapshot.client !== undefined ||
+          entry.snapshot.workflow !== undefined
+        )
+          return new SendError({ message: "Only an eligible parent-owned Pi child accepts replies." });
+        if (!requestId) return new SendError({ message: "reply mode requires requestId." });
+        if (!parentRef || parentRef.epoch !== entry.parentRef.epoch || parentRef.sessionFile !== entry.parentRef.sessionFile || parentRef.leafId !== entry.parentRef.leafId)
+          return new SendError({ message: "Reply parent ownership does not match the child request." });
+        if (!pending || pending.question.requestId !== requestId)
+          return new SendError({ message: "Unknown or stale parent question requestId." });
+        if (Date.now() >= pending.question.deadlineAt) {
+          clearPendingQuestion(entry, pending, { error: new ParentQuestionError({ message: "Parent question timed out." }) });
+          return new SendError({ message: "Parent question deadline has expired." });
+        }
+        const answer = text.trim();
+        if (!answer || answer.length > PARENT_QUESTION_LIMITS.maxAnswerLength)
+          return new SendError({ message: "Reply must be non-empty and bounded." });
+        clearPendingQuestion(entry, pending, { answer });
+        return Effect.succeed({ id, mode: "reply" as const, requestId });
+      }
+      if (effectiveMode === "steer" && entry.pendingQuestion) {
+        clearPendingQuestion(entry, entry.pendingQuestion, {
+          error: new ParentQuestionError({ message: "Parent question was cancelled by steering." }),
+        });
+      }
       if (effectiveMode === "steer" && !entry.backend.capabilities.steering) {
         return new SendError({
           message: `Subagent "${id}" on the ${entry.snapshot.backend} harness does not support steering; use mode "follow_up" or "auto".`,
@@ -1213,6 +1460,12 @@ const makeManager = Effect.gen(function* () {
     setOnSettled: (hook) => {
       onSettled = hook;
     },
+    setOnQuestion: (hook) => {
+      onQuestion = hook;
+    },
+    setOnQuestionResolved: (hook) => {
+      onQuestionResolved = hook;
+    },
   };
 
   // Safety net: disposing the ManagedRuntime tears everything down even if
@@ -1308,6 +1561,7 @@ const makeManager = Effect.gen(function* () {
     observeWorkflow,
     claimWorkflow: observeWorkflow,
     waitFor,
+    waitForParent,
     cancel,
     send,
     get: (id) => Effect.sync(() => entries.get(id)?.snapshot),

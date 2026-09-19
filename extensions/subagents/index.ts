@@ -46,6 +46,7 @@ import {
   formatElapsed,
   isSubagentPending,
   REASONING_EFFORTS,
+  type ParentQuestion,
   type ParentRef,
   type SubagentSnapshot,
 } from "./src/domain.ts";
@@ -82,10 +83,13 @@ import { createParentResultCoordinator } from "./src/parent-coordinator.ts";
 import type { ParentResultEnvelope } from "./src/parent-mailbox.ts";
 import { buildSubagentWaitResult } from "./src/result-delivery.ts";
 import {
+  buildParentQuestionBatchMessage,
   buildParentResultBatchMessage,
+  PARENT_QUESTION_BATCH_OPTIONS,
   PARENT_RESULT_BATCH_OPTIONS,
+  type ParentQuestionBatchDetails,
 } from "./src/parent-message.ts";
-import { captureParentRef } from "./src/parent-ref.ts";
+import { captureParentRef, isSafeParentRef } from "./src/parent-ref.ts";
 import {
   createSubagentRuntime,
   runTool,
@@ -541,6 +545,13 @@ export default function (pi: ExtensionAPI) {
           throw new Error("Discarding stale subagent manager initialization.");
         }
         manager.view.setOnSettled(onSettled);
+        manager.view.setOnQuestion?.((question) => {
+          parentResults.onQuestion(question);
+          if (sessionContext) parentResults.flush(sessionContext);
+        });
+        manager.view.setOnQuestionResolved?.((question) => {
+          parentResults.consumeQuestions([question]);
+        });
         renderView = parentSubagentView(manager.view);
         const workflowsDir = path.join(getAgentDir(), "workflows");
         const artifactStore = new WorkflowArtifactStore({
@@ -808,8 +819,16 @@ export default function (pi: ExtensionAPI) {
     );
   };
 
+  const sendParentQuestionBatch = (batch: ReadonlyArray<ParentQuestion>) => {
+    pi.sendMessage(
+      buildParentQuestionBatchMessage(batch),
+      PARENT_QUESTION_BATCH_OPTIONS,
+    );
+  };
+
   const parentResults = createParentResultCoordinator({
     sendBatch: sendParentResultBatch,
+    sendQuestionBatch: sendParentQuestionBatch,
   });
   publishWorkflowResult = (run, parentRef) => {
     const envelope = workflowResultEnvelope(run, parentRef);
@@ -1867,9 +1886,9 @@ export default function (pi: ExtensionAPI) {
         .map((id) => standardSnapshot(manager, id))
         .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
       let lastWaitUpdate = 0;
-      await runTool(
+      const waitResult = await runTool(
         getRuntime(),
-        manager.waitFor(ids, (pending) => {
+        manager.waitForParent!(ids, (pending) => {
           const now = Date.now();
           if (now - lastWaitUpdate < 100) return;
           lastWaitUpdate = now;
@@ -1900,12 +1919,37 @@ export default function (pi: ExtensionAPI) {
         { signal, interruptMessage: "Wait aborted. Subagents keep running." },
       );
 
-      // Settlement may have happened before this wait began. Remove any
-      // automatic delivery now that the tool is returning the result.
-      parentResults.consume(waitOwners);
+      // A question returns while its child remains running. Consume only
+      // terminal results returned by this call.
+      parentResults.consume(
+        waitOwners.filter((owner) => waitResult.settledIds.includes(owner.id)),
+      );
+
+      if (waitResult.questions.length > 0) {
+        parentResults.consumeQuestions(waitResult.questions);
+        const questions = waitResult.questions.map(
+          ({ childId, requestId, question, context, deadlineAt }) =>
+            context === undefined
+              ? { childId, requestId, question, deadlineAt }
+              : { childId, requestId, question, context, deadlineAt },
+        );
+        const text = questions
+          .map((question) => {
+            const context = question.context ? `\nContext: ${question.context}` : "";
+            return `Subagent ${question.childId} asks (requestId ${question.requestId}, deadline ${new Date(question.deadlineAt).toISOString()}):\n${question.question}${context}`;
+          })
+          .join("\n\n");
+        return {
+          content: [{ type: "text", text }],
+          details: { questions },
+        };
+      }
 
       const delivery = buildSubagentWaitResult(
-        ids.map((id) => ({ id, snapshot: standardSnapshot(manager, id) })),
+        waitResult.settledIds.map((id) => ({
+          id,
+          snapshot: standardSnapshot(manager, id),
+        })),
       );
       return {
         content: [{ type: "text", text: delivery.text }],
@@ -1943,6 +1987,11 @@ export default function (pi: ExtensionAPI) {
       const report = await runTool(getRuntime(), manager.cancel(ids));
       // Cancellation consumes automatic delivery even when the target had
       // already settled before this tool call began.
+      parentResults.consumeQuestions(
+        cancelOwners.flatMap((owner) =>
+          owner.pendingQuestion === undefined ? [] : [owner.pendingQuestion],
+        ),
+      );
       parentResults.consume(cancelOwners);
 
       const lines = report.map((entry) =>
@@ -1967,6 +2016,15 @@ export default function (pi: ExtensionAPI) {
   registerSubagentParentTools(pi, {
     getManager,
     runEffect: (effect) => runTool(getRuntime(), effect),
+    getParentRef: () =>
+      sessionContext === undefined
+        ? undefined
+        : captureParentRef(sessionEpoch, sessionContext.sessionManager),
+    isParentRefSafe: (parentRef) =>
+      sessionContext !== undefined &&
+      isSafeParentRef(parentRef, sessionContext, sessionEpoch),
+    onQuestionResolved: (requestId, parentRef) =>
+      parentResults.consumeQuestion(requestId, parentRef),
   });
 
   pi.registerTool({
@@ -2098,6 +2156,38 @@ export default function (pi: ExtensionAPI) {
     },
   );
 
+  pi.registerMessageRenderer<ParentQuestionBatchDetails>(
+    "subagent-question-batch",
+    (message, { expanded }, theme) => {
+      const details: ParentQuestionBatchDetails = message.details ?? {
+        questions: [],
+      };
+      const content = Array.isArray(message.content) ? "" : message.content;
+      const header = theme.fg(
+        "accent",
+        theme.bold(
+          `${details.questions.length} subagent question${details.questions.length === 1 ? "" : "s"}`,
+        ),
+      );
+      if (expanded) {
+        const md = new Markdown(content, 0, 0, getMarkdownTheme());
+        const container = new Text(header, 0, 0);
+        return {
+          render: (width: number) => [
+            ...container.render(width),
+            ...md.render(width),
+          ],
+          invalidate: () => {
+            container.invalidate();
+            md.invalidate();
+          },
+        };
+      }
+      return new Text(`${header}\n${content}`, 0, 0);
+    },
+  );
+
+  // --- Command ------------------------------------------------------------
   // --- Command ------------------------------------------------------------
 
   registerSubagentsSettingsCommand(pi);

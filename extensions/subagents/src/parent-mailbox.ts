@@ -3,6 +3,7 @@ import type {
   SubagentSnapshot,
   SubagentAcceptanceResult,
   TerminalSubagentStatus,
+  ParentQuestion,
 } from "./domain.ts";
 import { parentRefKey } from "./parent-ref.ts";
 
@@ -22,6 +23,19 @@ export interface ParentResultEnvelope {
 
 export interface WorkflowResultEnvelope extends ParentResultEnvelope {
   readonly kind: "workflow";
+}
+
+export interface ParentQuestionMailbox {
+  readonly limits: ParentMailboxLimits;
+  enqueue(question: ParentQuestion): boolean;
+  consume(requestIds: Iterable<string>, parentRef: ParentRef): void;
+  consumeQuestions(questions: Iterable<ParentQuestion>): void;
+  removeChild(childId: string, parentRef: ParentRef): void;
+  peekMatching(predicate: (question: ParentQuestion) => boolean): ReadonlyArray<ParentQuestion>;
+  remove(questions: ReadonlyArray<ParentQuestion>): void;
+  list(): ReadonlyArray<ParentQuestion>;
+  clear(): void;
+  size(): number;
 }
 
 export interface ParentMailboxLimits {
@@ -200,6 +214,79 @@ export interface ParentMailbox {
 
 function normalizedLimit(value: number, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+export function createParentQuestionMailbox(
+  limits: ParentMailboxLimits = DEFAULT_PARENT_MAILBOX_LIMITS,
+): ParentQuestionMailbox {
+  const effectiveLimits: ParentMailboxLimits = {
+    maxCount: normalizedLimit(limits.maxCount, DEFAULT_PARENT_MAILBOX_LIMITS.maxCount),
+    maxBytes: normalizedLimit(limits.maxBytes, DEFAULT_PARENT_MAILBOX_LIMITS.maxBytes),
+  };
+  const entries: Array<{ key: string; question: ParentQuestion; bytes: number }> = [];
+  const byKey = new Map<string, (typeof entries)[number]>();
+  let totalBytes = 0;
+  const keyFor = (question: ParentQuestion) => `${parentRefKey(question.parentRef)}\u0000${question.requestId}`;
+  const removeAt = (index: number) => {
+    const [entry] = entries.splice(index, 1);
+    if (!entry) return;
+    byKey.delete(entry.key);
+    totalBytes -= entry.bytes;
+  };
+  const trim = () => {
+    while (entries.length > effectiveLimits.maxCount || totalBytes > effectiveLimits.maxBytes) removeAt(0);
+  };
+  return {
+    limits: effectiveLimits,
+    enqueue(question) {
+      const entry = { key: keyFor(question), question: { ...question, parentRef: { ...question.parentRef } }, bytes: Buffer.byteLength(JSON.stringify(question), "utf8") };
+      const existing = byKey.get(entry.key);
+      if (existing) {
+        totalBytes -= existing.bytes;
+        Object.assign(existing, entry);
+        totalBytes += existing.bytes;
+      } else {
+        entries.push(entry);
+        byKey.set(entry.key, entry);
+        totalBytes += entry.bytes;
+      }
+      trim();
+      return byKey.has(entry.key);
+    },
+    consume(requestIds, parentRef) {
+      const ids = new Set(requestIds);
+      for (let index = entries.length - 1; index >= 0; index--) {
+        const question = entries[index]!.question;
+        if (question.parentRef && ids.has(question.requestId) && parentRefKey(question.parentRef) === parentRefKey(parentRef)) removeAt(index);
+      }
+    },
+    consumeQuestions(questions) {
+      const identities = new Set(Array.from(questions, keyFor));
+      for (let index = entries.length - 1; index >= 0; index--)
+        if (identities.has(entries[index]!.key)) removeAt(index);
+    },
+    removeChild(childId, parentRef) {
+      for (let index = entries.length - 1; index >= 0; index--) {
+        const question = entries[index]!.question;
+        if (question.childId === childId && parentRefKey(question.parentRef) === parentRefKey(parentRef)) removeAt(index);
+      }
+    },
+    peekMatching(predicate) {
+      return entries.filter((entry) => predicate(entry.question)).map((entry) => entry.question);
+    },
+    remove(questions) {
+      const identities = new Set(questions.map(keyFor));
+      for (let index = entries.length - 1; index >= 0; index--)
+        if (identities.has(entries[index]!.key)) removeAt(index);
+    },
+    list: () => entries.map((entry) => entry.question),
+    clear: () => {
+      entries.length = 0;
+      byKey.clear();
+      totalBytes = 0;
+    },
+    size: () => entries.length,
+  };
 }
 
 export function createParentMailbox(

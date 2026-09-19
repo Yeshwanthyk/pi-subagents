@@ -31,9 +31,9 @@ Commands:
 
 `Ctrl+Shift+A` toggles the fleet view. Workflow children are inspectable there but remain read-only; workflow lifecycle changes go through `workflow_control`.
 
-`subagent_send({ id, message, mode? })` sends another instruction immediately. `mode` is `auto`, `steer`, or `follow_up`; explicit steering fails on a harness that does not support it, while `auto` selects the effective supported mode. Queued children remain unavailable for sending.
+`subagent_send({ id, message, mode?, requestId? })` sends another instruction. `mode` is `auto`, `steer`, `follow_up`, or `reply`; reply requires the exact `requestId` from a pending Pi child `ask_parent` question. `steer` cancels that question, while `follow_up` queues later work and is never an answer. Explicit steering fails on a harness that does not support it, while `auto` selects the effective supported mode. Queued children remain unavailable for sending.
 
-`subagent_inspect({ id })` returns a bounded, read-only snapshot of current tools, last activity, queued instruction previews, completed operations, latest output, and harness capabilities. It never waits for or consumes completion.
+`subagent_inspect({ id })` returns a bounded, read-only snapshot of current tools, pending `ask_parent` question/request ID/deadline, last activity, queued instruction previews, completed operations, latest output, and harness capabilities. It never waits for or consumes completion.
 
 `subagent_spawn` and routed tasks can declare an optional Jev post-run `gate`. Process outcome remains visible while acceptance is pending; wait and automatic parent delivery are held until the gate passes, rejects, errors, times out, or is cancelled.
 

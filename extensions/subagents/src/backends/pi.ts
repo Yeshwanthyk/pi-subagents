@@ -24,6 +24,7 @@ import type {
   ModelRegistry,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -40,11 +41,13 @@ import type {
   SpawnTask,
   SubagentEvent,
   SubagentFailureProvenance,
+  ParentQuestionRequest,
   SubagentMeta,
   TranscriptPart,
   EffectiveSubagentSendMode,
 } from "../domain.ts";
 import {
+  PARENT_QUESTION_LIMITS,
   failureKindFromProvenance,
   isReasoningEffort,
   SendError,
@@ -53,6 +56,7 @@ import {
 
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 const CHILD_TOOL_CALL_TIMEOUT_MS = 3 * 60 * 1_000;
+const CHILD_TOOL_TIMEOUT_EXEMPTIONS = new Set(["ask_parent"]);
 
 /** Tools that headless children must not receive. Everything else stays enabled. */
 const CHILD_EXCLUDED_TOOL_NAMES = [
@@ -70,6 +74,46 @@ const CHILD_EXCLUDED_TOOL_NAMES = [
   "ask_jev",
   "ask_user",
 ] as const;
+export function createAskParentTool(
+  askParent: NonNullable<SpawnTask["askParent"]>,
+) {
+  return {
+    name: "ask_parent",
+    label: "Ask Parent",
+    description:
+      "Ask the owning parent one bounded question and wait for its answer. Use only when a decision or missing fact blocks progress; the parent may answer, steer, cancel, or let the finite deadline expire.",
+    parameters: Type.Object({
+      question: Type.String({
+        maxLength: PARENT_QUESTION_LIMITS.maxQuestionLength,
+        description: "The specific question that blocks progress",
+      }),
+      context: Type.Optional(
+        Type.String({
+          maxLength: PARENT_QUESTION_LIMITS.maxContextLength,
+          description: "Minimal bounded context needed to answer",
+        }),
+      ),
+      timeoutSeconds: Type.Optional(
+        Type.Integer({
+          minimum: PARENT_QUESTION_LIMITS.minTimeoutSeconds,
+          maximum: PARENT_QUESTION_LIMITS.maxTimeoutSeconds,
+          description: "Finite wait deadline in seconds; default 300",
+        }),
+      ),
+    }),
+    async execute(
+      _toolCallId: string,
+      params: ParentQuestionRequest,
+      signal?: AbortSignal,
+    ) {
+      const answer = await askParent(params, signal);
+      return {
+        content: [{ type: "text" as const, text: answer }],
+        details: { answered: true },
+      };
+    },
+  };
+}
 
 // --- Model + effort resolution -----------------------------------------------
 
@@ -195,10 +239,13 @@ async function shutdownAndDisposeChildSession(session: AgentSession) {
  * hung tool cannot wedge a headless child forever. apply() is idempotent and
  * re-applied on agent_start to pick up tools registered between runs.
  */
-function createToolCallTimeoutGuard(timeoutMs = CHILD_TOOL_CALL_TIMEOUT_MS) {
+export function createToolCallTimeoutGuard(timeoutMs = CHILD_TOOL_CALL_TIMEOUT_MS) {
   const wrapped = new WeakSet<ToolDefinition>();
 
   const wrap = (definition: ToolDefinition) => {
+    // ask_parent owns its own finite 30s-900s deadline. The generic 180s
+    // guard must not turn its valid 300s/900s waits into early failures.
+    if (CHILD_TOOL_TIMEOUT_EXEMPTIONS.has(definition.name)) return;
     if (wrapped.has(definition)) return;
     wrapped.add(definition);
     const execute = definition.execute;
@@ -404,6 +451,9 @@ const makePiSession = (
           model,
           thinkingLevel,
           excludeTools: [...CHILD_EXCLUDED_TOOL_NAMES],
+          customTools: task.askParent
+            ? [createAskParentTool(task.askParent)]
+            : undefined,
         });
         // Start child extension session hooks/resources in headless mode.
         // A rejection here would otherwise leak the freshly created session:

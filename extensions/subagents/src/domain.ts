@@ -41,8 +41,37 @@ export function isReasoningEffort(
 export type SubagentStatus = "queued" | "running" | "done" | "error";
 export type TerminalSubagentStatus = Extract<SubagentStatus, "done" | "error">;
 export type SubagentFailureKind = "provider_stall" | "backend_failure";
-export type SubagentSendMode = "auto" | "steer" | "follow_up";
+export type SubagentSendMode = "auto" | "steer" | "follow_up" | "reply";
 export type EffectiveSubagentSendMode = Exclude<SubagentSendMode, "auto">;
+export const PARENT_QUESTION_LIMITS = {
+  maxQuestionLength: 8_192,
+  maxContextLength: 16_384,
+  maxAnswerLength: 16_384,
+  minTimeoutSeconds: 30,
+  maxTimeoutSeconds: 900,
+  defaultTimeoutSeconds: 300,
+} as const;
+
+export interface ParentQuestion {
+  readonly childId: string;
+  readonly requestId: string;
+  readonly question: string;
+  readonly context?: string;
+  readonly deadlineAt: number;
+  readonly parentRef: ParentRef;
+}
+
+export interface ParentQuestionRequest {
+  readonly question: string;
+  readonly context?: string;
+  readonly timeoutSeconds?: number;
+}
+
+export class ParentQuestionError extends Data.TaggedError(
+  "ParentQuestionError",
+)<{
+  readonly message: string;
+}> {}
 export interface SubagentCapabilities {
   readonly steering: boolean;
   readonly modelSelection: boolean;
@@ -150,6 +179,11 @@ export interface SpawnTask {
   readonly parentRef?: ParentRef;
   /** Optional parent-owned standalone acceptance; forbidden for workflow/client tasks. */
   readonly acceptance?: SubagentAcceptanceRequest;
+  /** Runtime-only parent question bridge; installed only for eligible Pi children. */
+  readonly askParent?: (
+    request: ParentQuestionRequest,
+    signal?: AbortSignal,
+  ) => Promise<string>;
   /**
    * Generic model hint, interpreted per backend:
    * pi: "provider/model-id" or bare model id; codex: model slug.
@@ -346,6 +380,8 @@ export interface SubagentSnapshot {
   readonly lastCompletedOperation?: CompletedOperation;
   readonly processTelemetry: ProcessTelemetry;
   readonly queued: ReadonlyArray<QueuedMessage>;
+  /** One live parent question, only for an eligible parent-owned Pi child. */
+  readonly pendingQuestion?: ParentQuestion;
   /** Final text of the most recent completed run (v1 `finalOutput`). */
   readonly finalText: string;
   /** True when an owner deliberately retained only a partial final report. */

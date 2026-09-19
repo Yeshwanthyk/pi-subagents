@@ -1,8 +1,11 @@
+import type { ParentQuestion } from "./domain.ts";
 import type { ParentRef, SubagentSnapshot } from "./domain.ts";
 import {
   createParentMailbox,
+  createParentQuestionMailbox,
   parentResultEnvelope,
   type ParentMailbox,
+  type ParentQuestionMailbox,
   type ParentResultEnvelope,
   type WorkflowResultEnvelope,
 } from "./parent-mailbox.ts";
@@ -17,6 +20,8 @@ import {
 export interface ParentResultCoordinatorOptions {
   readonly mailbox?: ParentMailbox;
   readonly sendBatch: (batch: ReadonlyArray<ParentResultEnvelope>) => void;
+  readonly questionMailbox?: ParentQuestionMailbox;
+  readonly sendQuestionBatch?: (batch: ReadonlyArray<ParentQuestion>) => void;
 }
 
 export type ParentFlushContext = ParentSessionContext;
@@ -33,9 +38,13 @@ interface CurrentParent {
 
 export interface ParentResultCoordinator {
   readonly mailbox: ParentMailbox;
+  readonly questionMailbox: ParentQuestionMailbox;
   startSession(context: ParentFlushContext, epoch: number): void;
   capture(epoch: number, sessionManager: ParentSessionManager): ParentRef;
   onSettled(snapshot: SubagentSnapshot, consumed: boolean): void;
+  onQuestion(question: ParentQuestion): void;
+  consumeQuestions(questions: ReadonlyArray<ParentQuestion>): void;
+  consumeQuestion(requestId: string, parentRef: ParentRef): void;
   /** Enqueue one aggregate workflow terminal result on the same parent rail. */
   onWorkflowSettled(envelope: WorkflowResultEnvelope, consumed: boolean): void;
   consume(owners: Iterable<ParentResultOwner>): void;
@@ -53,6 +62,8 @@ export function createParentResultCoordinator(
   options: ParentResultCoordinatorOptions,
 ): ParentResultCoordinator {
   const mailbox = options.mailbox ?? createParentMailbox();
+  const questionMailbox =
+    options.questionMailbox ?? createParentQuestionMailbox();
   let current: CurrentParent | undefined;
   let closed = false;
   const deliveredWorkflowResults = new Set<string>();
@@ -61,6 +72,7 @@ export function createParentResultCoordinator(
 
   const startSession = (context: ParentFlushContext, epoch: number) => {
     mailbox.clear();
+    questionMailbox.clear();
     deliveredWorkflowResults.clear();
     current = { epoch, sessionManager: context.sessionManager };
     closed = false;
@@ -73,6 +85,9 @@ export function createParentResultCoordinator(
       snapshot.client !== undefined
     )
       return;
+    if (snapshot.parentRef !== undefined) {
+      questionMailbox.removeChild(snapshot.id, snapshot.parentRef);
+    }
     const envelope = parentResultEnvelope(snapshot);
     if (envelope === undefined) return;
     if (consumed) {
@@ -80,6 +95,18 @@ export function createParentResultCoordinator(
       return;
     }
     mailbox.enqueue(envelope);
+  };
+
+  const onQuestion = (question: ParentQuestion) => {
+    if (!closed) questionMailbox.enqueue(question);
+  };
+
+  const consumeQuestions = (questions: ReadonlyArray<ParentQuestion>) => {
+    if (!closed) questionMailbox.remove(questions);
+  };
+
+  const consumeQuestion = (requestId: string, parentRef: ParentRef) => {
+    if (!closed) questionMailbox.consume([requestId], parentRef);
   };
 
   const onWorkflowSettled = (
@@ -124,16 +151,30 @@ export function createParentResultCoordinator(
       sessionManager: context.sessionManager,
       isIdle: () => true,
     };
+    const questions = questionMailbox.peekMatching((question) =>
+      isSafeParentRef(question.parentRef, safeContext, currentParent.epoch),
+    );
+    let delivered = false;
+    if (questions.length > 0 && options.sendQuestionBatch !== undefined) {
+      try {
+        options.sendQuestionBatch(questions);
+      } catch {
+        return false;
+      }
+      questionMailbox.remove(questions);
+      delivered = true;
+    }
+
     const batch = mailbox.peekMatching((envelope) =>
       isSafeParentRef(envelope.parentRef, safeContext, currentParent.epoch),
     );
-    if (batch.length === 0) return false;
+    if (batch.length === 0) return delivered;
 
     try {
       options.sendBatch(batch);
     } catch {
       // Keep the batch in the mailbox so a later idle/settled hook can retry.
-      return false;
+      return delivered;
     }
     for (const envelope of batch) {
       if (envelope.kind === "workflow") {
@@ -151,13 +192,18 @@ export function createParentResultCoordinator(
     current = undefined;
     deliveredWorkflowResults.clear();
     mailbox.clear();
+    questionMailbox.clear();
   };
 
   return {
     mailbox,
+    questionMailbox,
     startSession,
     capture: captureParentRef,
     onSettled,
+    onQuestion,
+    consumeQuestions,
+    consumeQuestion,
     onWorkflowSettled,
     consume,
     consumeWorkflow,
