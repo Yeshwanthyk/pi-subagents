@@ -141,24 +141,21 @@ export function resolveRouting(input: ResolveRoutingInput): RoutingProposal {
     return { ...base, status: "legacy", effective: explicit };
   }
 
-  const explicitIsConcrete =
-    explicit.harness !== undefined && explicit.model !== undefined;
   let matchedRoute: RouteKey | undefined;
-  let route: RuntimeSelection | undefined;
-  if (!explicitIsConcrete) {
-    if (classification?.complexity === "hard") matchedRoute = "hard";
-    else if (
-      classification?.intent === "validation" &&
-      classification.complexity === "simple"
-    )
-      matchedRoute = "simple_validation";
-    else if (classification?.intent !== undefined)
-      matchedRoute = classification.intent;
-    if (matchedRoute !== undefined)
-      route = input.settings.settings.routing.routes[matchedRoute];
-  }
+  if (classification?.complexity === "hard") matchedRoute = "hard";
+  else if (
+    classification?.intent === "validation" &&
+    classification.complexity === "simple"
+  )
+    matchedRoute = "simple_validation";
+  else if (classification?.intent !== undefined)
+    matchedRoute = classification.intent;
+  const route =
+    matchedRoute === undefined
+      ? undefined
+      : input.settings.settings.routing.routes[matchedRoute];
 
-  if (!explicitIsConcrete && matchedRoute === undefined) {
+  if (matchedRoute === undefined) {
     return {
       ...base,
       status: "unresolved",
@@ -166,7 +163,7 @@ export function resolveRouting(input: ResolveRoutingInput): RoutingProposal {
       reason: "Routing is enabled but no assignment intent was supplied",
     };
   }
-  if (!explicitIsConcrete && route === undefined) {
+  if (route === undefined) {
     return {
       ...base,
       status: "unresolved",
@@ -223,6 +220,7 @@ export function resolveRouting(input: ResolveRoutingInput): RoutingProposal {
     ...proposalBase,
     status: "resolved",
     effective: availability.effective,
-    requiresApproval: route !== undefined,
+    preference: { ...route },
+    requiresApproval: true,
   };
 }

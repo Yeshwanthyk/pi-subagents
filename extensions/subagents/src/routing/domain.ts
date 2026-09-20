@@ -101,6 +101,8 @@ export interface LegacyRoutingProposal extends RoutingProposalBase {
 
 export interface ResolvedRoutingProposal extends RoutingProposalBase {
   readonly status: "resolved";
+  /** Saved route before caller-requested runtime overrides. */
+  readonly preference?: RuntimeSelection;
   readonly effective: ConcreteRuntimeSelection;
   readonly matchedRoute?: RouteKey;
   readonly requiresApproval: boolean;

@@ -125,7 +125,7 @@ test("batch approval binds exact task, runtime, and settings snapshots", () => {
   assert.equal(store.get(proposal.id), undefined);
 });
 
-test("explicitly authorized runtimes are idempotently approved without another prompt", () => {
+test("explicit runtime arguments require a newer approval too", () => {
   const store = new SessionBatchProposalStore({
     now: () => 10,
     createId: () => "route-explicit",
@@ -142,17 +142,24 @@ test("explicitly authorized runtimes are idempotently approved without another p
       },
     ],
   });
-  assert.equal(proposal.status, "approved");
-  assert.equal(proposal.approvalSource, "explicit_runtime");
-  assert.equal(proposal.approvedAtUserInput, 8);
-  assert.equal(
-    store.approve(proposal.id, {
-      sessionId: "session-a",
-      userInput: 8,
-      bindingDigest: proposal.bindingDigest,
-    }),
-    proposal,
+  assert.equal(proposal.status, "pending");
+  assert.equal(proposal.approvalSource, undefined);
+  assert.throws(
+    () =>
+      store.approve(proposal.id, {
+        sessionId: "session-a",
+        userInput: 8,
+        bindingDigest: proposal.bindingDigest,
+      }),
+    /newer user response/,
   );
+  const approved = store.approve(proposal.id, {
+    sessionId: "session-a",
+    userInput: 9,
+    bindingDigest: proposal.bindingDigest,
+  });
+  assert.equal(approved.status, "approved");
+  assert.equal(approved.approvalSource, "newer_user_response");
 });
 
 test("proposal creation rejects unresolved, mismatched, and unsafe inputs", () => {

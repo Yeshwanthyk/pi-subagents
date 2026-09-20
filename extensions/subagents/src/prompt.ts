@@ -23,7 +23,7 @@ export const ASK_JEV_PARAMETER_DESCRIPTIONS = {
 
 /** Describes subagent_spawn, including harnesses and the fixed concurrency cap. */
 export const SUBAGENT_SPAWN_TOOL_DESCRIPTION =
-  "Spawn a background subagent and return immediately with an id, or prepare an approval-bound runtime proposal when preference routing is enabled and classification is supplied. Classification describes the actual deliverable, never the agent name or permissions. Explicit harness/model fields take precedence. The child is autonomous with its own context window and cannot orchestrate agents/workflows, ask the user, or see this conversation. Max 4 subagents run at once; excess work waits in the shared FIFO queue.";
+  "Spawn a background subagent when routing is disabled, or prepare an approval-bound runtime proposal when preference routing is enabled. Enabled routing requires classification even with runtime overrides. Classification describes the actual deliverable, never the agent name or permissions. Runtime fields request overrides; they are not user authorization. The child is autonomous with its own context window and cannot orchestrate agents/workflows, ask the user, or see this conversation. Max 4 subagents run at once; excess work waits in the shared FIFO queue.";
 
 /** Adds background subagent delegation to the parent model's available-tools prompt. */
 export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
@@ -33,8 +33,8 @@ export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
 export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
   "Use subagent_spawn for self-contained work with a clear scope, purpose, and expected output. Parallel delegation is appropriate when scopes can proceed independently, whether separate or complementary.",
   "Classify the actual deliverable when using preference routing: scout for information gathering, small_slice for a narrow change, lint for mechanical checks, implementation for product changes, and validation for review or proof. Use validation with simple complexity for lightweight validation; it selects simple_validation. Hard complexity is separate from intent. Classification never comes from the agent name and never grants permissions.",
-  "Treat a preference-derived runtime as a recommendation: its subagent_spawn proposal starts no child. Present the proposal, wait for a newer user approval, then call subagent_approve with the exact proposal id and binding digest.",
-  "Pick the subagent harness deliberately: pi unless there is a reason to prefer Codex.",
+  "When routing is enabled, every spawn requires classification and starts no child until approval. Present the saved preference, requested overrides, and effective runtime; wait for a newer user approval, then call subagent_approve with the exact proposal id and binding digest.",
+  "Use saved runtime preferences by default. Supply runtime overrides only when the user requests them; agent-supplied fields are not authorization. When routing is disabled, pick pi unless there is a reason to prefer Codex.",
   "A gated standalone result delivers compact acceptance by default; request the full report explicitly when needed. Workflow consumers that truly need a dependency report retain its content—never strip dependency evidence for compact delivery.",
   "Coordinate by scope: while a child runs, continue parent work outside its delegated scope. When its result arrives, use it as the basis for synthesis, validation, integration, or follow-up in that scope.",
   "Use subagent_wait when the next parent step requires a child's result, such as synthesis or integration that includes its work, review of its findings, or a dependent decision. If it returns an ask_parent question, answer with subagent_send mode=reply and the exact requestId; follow_up is queued work, not an answer.",

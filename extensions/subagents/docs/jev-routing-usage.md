@@ -151,7 +151,7 @@ The result contains a proposal ID, binding digest, exact effective runtimes, and
 
 using `subagent_approve`. Approval is session-local and binds task text, working directory, runtime, and the settings snapshot. Changed, expired, cross-session, or stale-settings proposals fail instead of silently rerouting. Repeated approval does not duplicate admission.
 
-When routing is enabled, `subagent_spawn` also accepts `classification`. A preference-derived runtime returns a proposal instead of starting immediately; use its ID and digest with `subagent_approve` after newer user approval. A fully explicit `harness` and `model` can be admitted without an extra preference approval. When routing is disabled, continue to provide an explicit `harness`.
+When routing is enabled, `subagent_spawn` requires `classification`, even when `harness` and `model` are supplied. Routing resolves the saved preference first; runtime fields request overrides, not user authorization. Every resolved runtime returns a proposal instead of starting immediately. Review the saved preference, requested runtime, and effective runtime, then use its ID and digest with `subagent_approve` after newer user approval. Missing classifications or saved routes fail before any child starts. When routing is disabled, continue to provide an explicit `harness`.
 
 Routing is deterministic and makes no Jev request. Missing classifications, routes, unavailable models, and ambiguous bare Pi model IDs fail or remain unresolved; the extension does not silently substitute another runtime.
 

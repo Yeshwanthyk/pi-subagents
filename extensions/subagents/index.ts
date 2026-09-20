@@ -1537,7 +1537,13 @@ export default function (pi: ExtensionAPI) {
             type: "text",
             text:
               `Prepared ${proposal.items.length} routed spawn(s) as ${proposal.id}; no child started. ` +
-              `${proposal.status === "pending" ? "A newer user response must approve this exact binding before admission." : "The exact runtimes were explicitly authorized; call subagent_approve to admit the batch."}`,
+              "A newer user response must approve this exact binding before admission.\n" +
+              proposal.items
+                .map(
+                  (item) =>
+                    `Saved preference: ${JSON.stringify(item.runtime.preference)}; requested: ${JSON.stringify(item.runtime.requested)}; effective: ${JSON.stringify(item.runtime.effective)}`,
+                )
+                .join("\n"),
           },
         ],
         details: {
@@ -1653,7 +1659,12 @@ export default function (pi: ExtensionAPI) {
         cwd: ctx.cwd,
         projectTrusted: ctx.isProjectTrusted(),
       });
-      if (settings.settings.routing.enabled && params.classification) {
+      if (settings.settings.routing.enabled) {
+        if (!params.classification) {
+          throw new Error(
+            "Classification is required while routing is enabled, including when runtime overrides are supplied. No child started.",
+          );
+        }
         const task: BoundRoutedSpawnTask = {
           prompt: params.prompt,
           name: params.name,
@@ -1680,6 +1691,7 @@ export default function (pi: ExtensionAPI) {
                 type: "text",
                 text:
                   `Prepared routed spawn ${proposal.id}; no child started. ` +
+                  `Saved preference: ${JSON.stringify(proposal.items[0]!.runtime.preference)}; requested: ${JSON.stringify(proposal.items[0]!.runtime.requested)}. ` +
                   `Review ${proposal.items[0]!.runtime.effective.harness}/${proposal.items[0]!.runtime.effective.model}` +
                   `${proposal.items[0]!.runtime.effective.effort ? `:${proposal.items[0]!.runtime.effective.effort}` : ""}, then after a newer user approval call subagent_approve with this id and binding digest.`,
               },
@@ -1733,11 +1745,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
       if (!params.harness) {
-        throw new Error(
-          settings.settings.routing.enabled
-            ? "Provide classification for preference routing, or an explicit harness for legacy/direct spawning."
-            : "harness is required while routing is disabled.",
-        );
+        throw new Error("harness is required while routing is disabled.");
       }
       const admitted = await admitStandalone(
         {
@@ -1935,7 +1943,9 @@ export default function (pi: ExtensionAPI) {
         );
         const text = questions
           .map((question) => {
-            const context = question.context ? `\nContext: ${question.context}` : "";
+            const context = question.context
+              ? `\nContext: ${question.context}`
+              : "";
             return `Subagent ${question.childId} asks (requestId ${question.requestId}, deadline ${new Date(question.deadlineAt).toISOString()}):\n${question.question}${context}`;
           })
           .join("\n\n");

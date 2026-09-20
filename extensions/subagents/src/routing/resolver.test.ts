@@ -132,15 +132,14 @@ test("hard complexity alone selects the hard route", () => {
   assert.equal(proposal.matchedRoute, "hard");
 });
 
-test("fully explicit runtime does not require classification or preference approval", () => {
+test("fully explicit runtime cannot bypass classification", () => {
   const proposal = resolveRouting({
     settings: settings({ version: 1, routing: { enabled: true } }),
     explicit: { harness: "codex", model: "specified", effort: "high" },
     lookupModel: available,
   });
-  assert.equal(proposal.status, "resolved");
-  assert.equal(proposal.matchedRoute, undefined);
-  assert.equal(proposal.requiresApproval, false);
+  assert.equal(proposal.status, "unresolved");
+  assert.equal(proposal.code, "classification_required");
 });
 
 test("enabled unresolved cases fail clearly instead of inheriting defaults", () => {
@@ -245,4 +244,48 @@ test("classification validation rejects unknown fields and values", () => {
     () => validateRoutingClassification({ intent: "guess" }),
     /Invalid routing intent/,
   );
+});
+
+test("complete runtime overrides preserve saved preference and require approval", () => {
+  const preference = { harness: "pi", model: "provider/luna", effort: "high" };
+  const proposal = resolveRouting({
+    settings: settings({
+      version: 1,
+      routing: { enabled: true, routes: { scout: preference } },
+    }),
+    classification: { intent: "scout" },
+    explicit: { harness: "codex", model: "other", effort: "medium" },
+    lookupModel: available,
+  });
+  assert.equal(proposal.status, "resolved");
+  assert.equal(proposal.matchedRoute, "scout");
+  assert.deepEqual(proposal.preference, preference);
+  assert.deepEqual(proposal.effective, {
+    harness: "codex",
+    model: "other",
+    effort: "medium",
+  });
+  assert.equal(proposal.requiresApproval, true);
+});
+
+test("empty classification cannot bypass routing with complete overrides", () => {
+  const proposal = resolveRouting({
+    settings: settings({ version: 1, routing: { enabled: true } }),
+    classification: {},
+    explicit: { harness: "pi", model: "other" },
+    lookupModel: available,
+  });
+  assert.equal(proposal.status, "unresolved");
+  assert.equal(proposal.code, "classification_required");
+});
+
+test("complete overrides do not bypass a missing saved route", () => {
+  const proposal = resolveRouting({
+    settings: settings({ version: 1, routing: { enabled: true } }),
+    classification: { intent: "scout" },
+    explicit: { harness: "pi", model: "other" },
+    lookupModel: available,
+  });
+  assert.equal(proposal.status, "unresolved");
+  assert.equal(proposal.code, "route_missing");
 });

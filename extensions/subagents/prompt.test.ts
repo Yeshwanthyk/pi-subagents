@@ -64,7 +64,12 @@ test("routing and Jev guidance preserve authority and disclosure boundaries", ()
   assert.match(spawnGuidance, /actual deliverable/);
   assert.match(spawnGuidance, /validation with simple complexity/);
   assert.match(spawnGuidance, /selects simple_validation/);
-  assert.match(spawnGuidance, /preference-derived runtime as a recommendation/);
+  assert.match(spawnGuidance, /every spawn requires classification/);
+  assert.match(spawnGuidance, /agent-supplied fields are not authorization/);
+  assert.match(
+    spawnGuidance,
+    /saved preference, requested overrides, and effective runtime/,
+  );
   assert.match(spawnGuidance, /newer user approval/);
   assert.match(
     ASK_JEV_TOOL_DESCRIPTION,

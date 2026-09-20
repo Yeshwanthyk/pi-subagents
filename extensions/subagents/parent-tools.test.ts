@@ -15,7 +15,10 @@ import {
   createSubagentParentTools,
   projectSubagentInspection,
 } from "./src/parent-tools.ts";
-import { StandaloneRoutingController } from "./src/integration/routing.ts";
+import {
+  StandaloneRoutingController,
+  type BoundRoutedSpawnTask,
+} from "./src/integration/routing.ts";
 import { loadSubagentSettings } from "./src/routing/settings.ts";
 import type { ConcreteRuntimeSelection } from "./src/routing/domain.ts";
 import { createAskJevTool } from "./src/integration/jev.ts";
@@ -336,99 +339,118 @@ test("inspection explicitly retrieves a gated report beyond the routine preview 
   assert.match(result.content[0]!.text, /report end/);
 });
 
-test("routed admission requires a newer user message and is idempotent", async () => {
-  const settings = loadSubagentSettings({
-    cwd: "/workspace",
-    projectTrusted: true,
-    globalPath: "/global.json",
-    readFile: (file) =>
-      file === "/global.json"
-        ? JSON.stringify({
-            version: 1,
-            routing: {
-              enabled: true,
-              routes: {
-                scout: {
-                  harness: "pi",
-                  model: "provider/scout",
-                  effort: "high",
+for (const override of [false, true]) {
+  test(`routed admission requires newer approval and is idempotent (override=${override})`, async () => {
+    const settings = loadSubagentSettings({
+      cwd: "/workspace",
+      projectTrusted: true,
+      globalPath: "/global.json",
+      readFile: (file) =>
+        file === "/global.json"
+          ? JSON.stringify({
+              version: 1,
+              routing: {
+                enabled: true,
+                routes: {
+                  scout: {
+                    harness: "pi",
+                    model: "provider/scout",
+                    effort: "high",
+                  },
                 },
               },
-            },
-          })
-        : undefined,
-  });
-  const controller = new StandaloneRoutingController();
-  const context = {
-    sessionId: "session-a",
-    cwd: "/workspace",
-    userInputRevision: 3,
-    settings,
-    lookupModel: (requested: ConcreteRuntimeSelection) => ({
-      available: true as const,
-      effective: requested,
-    }),
-  };
-  const proposal = controller.prepare(
-    [
-      {
-        prompt: "inspect",
-        name: "Scout",
-        cwd: "/workspace",
-        classification: { intent: "scout" },
-      },
-    ],
-    context,
-  );
-  let admissions = 0;
-  const admit = async () => {
-    admissions += 1;
-    return {
-      id: "sa-routed",
-      title: "Scout",
+            })
+          : undefined,
+    });
+    const controller = new StandaloneRoutingController();
+    const context = {
+      sessionId: "session-a",
       cwd: "/workspace",
-      harness: "pi" as const,
-      model: "provider/scout",
+      userInputRevision: 3,
+      settings,
+      lookupModel: (requested: ConcreteRuntimeSelection) => ({
+        available: true as const,
+        effective: requested,
+      }),
     };
-  };
+    const task: BoundRoutedSpawnTask = {
+      prompt: "inspect",
+      name: "Scout",
+      cwd: "/workspace",
+      classification: { intent: "scout" },
+    };
+    const requestedTask: BoundRoutedSpawnTask = override
+      ? {
+          ...task,
+          harness: "pi",
+          model: "provider/other",
+          reasoningEffort: "medium",
+        }
+      : task;
+    const proposal = controller.prepare([requestedTask], context);
+    let admissions = 0;
+    assert.equal(proposal.status, "pending");
+    assert.equal(
+      proposal.items[0]?.runtime.preference?.model,
+      "provider/scout",
+    );
+    assert.equal(
+      proposal.items[0]?.runtime.effective.model,
+      override ? "provider/other" : "provider/scout",
+    );
+    const admit = async () => {
+      admissions += 1;
+      return {
+        id: "sa-routed",
+        title: "Scout",
+        cwd: "/workspace",
+        harness: "pi" as const,
+        model: "provider/scout",
+      };
+    };
 
-  assert.throws(
-    () =>
-      controller.approveAndAdmit(
-        {
-          ...context,
-          proposalId: proposal.id,
-          bindingDigest: proposal.bindingDigest,
-        },
-        admit,
-      ),
-    /newer user response/,
-  );
-  const approvedContext = {
-    ...context,
-    userInputRevision: 4,
-    proposalId: proposal.id,
-    bindingDigest: proposal.bindingDigest,
-  };
-  const first = await controller.approveAndAdmit(approvedContext, admit);
-  assert.throws(
-    () =>
-      controller.approveAndAdmit(
-        { ...approvedContext, sessionId: "wrong-session" },
-        admit,
-      ),
-    /different session/,
-  );
-  assert.throws(
-    () =>
-      controller.approveAndAdmit({ ...approvedContext, cwd: "/other" }, admit),
-    /different working directory/,
-  );
-  const repeated = await controller.approveAndAdmit(approvedContext, admit);
-  assert.equal(first[0]?.id, "sa-routed");
-  assert.equal(repeated[0]?.id, "sa-routed");
-  assert.equal(admissions, 1);
-});
+    assert.throws(
+      () =>
+        controller.approveAndAdmit(
+          {
+            ...context,
+            proposalId: proposal.id,
+            bindingDigest: proposal.bindingDigest,
+          },
+          admit,
+        ),
+      /newer user response/,
+    );
+    assert.equal(admissions, 0);
+    const approvedContext = {
+      ...context,
+      userInputRevision: 4,
+      proposalId: proposal.id,
+      bindingDigest: proposal.bindingDigest,
+    };
+    const first = await controller.approveAndAdmit(approvedContext, admit);
+    assert.throws(
+      () =>
+        controller.approveAndAdmit(
+          { ...approvedContext, sessionId: "wrong-session" },
+          admit,
+        ),
+      /different session/,
+    );
+    assert.throws(
+      () =>
+        controller.approveAndAdmit(
+          { ...approvedContext, cwd: "/other" },
+          admit,
+        ),
+      /different working directory/,
+    );
+    const repeated = await controller.approveAndAdmit(approvedContext, admit);
+    assert.equal(first[0]?.id, "sa-routed");
+    assert.equal(repeated[0]?.id, "sa-routed");
+    assert.equal(admissions, 1);
+  });
+}
 
 test("ask_jev forwards only explicit state/questions and returns safe unavailable errors", async () => {
   const seen: unknown[] = [];
