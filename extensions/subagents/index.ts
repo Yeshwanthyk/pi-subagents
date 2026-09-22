@@ -1536,7 +1536,7 @@ export default function (pi: ExtensionAPI) {
           {
             type: "text",
             text:
-              `Prepared ${proposal.items.length} routed spawn(s) as ${proposal.id}; no child started. ` +
+              `Prepared ${proposal.items.length} routed spawn(s) as ${proposal.id} with binding digest ${proposal.bindingDigest}; no child started. ` +
               "A newer user response must approve this exact binding before admission.\n" +
               proposal.items
                 .map(
@@ -1690,7 +1690,7 @@ export default function (pi: ExtensionAPI) {
               {
                 type: "text",
                 text:
-                  `Prepared routed spawn ${proposal.id}; no child started. ` +
+                  `Prepared routed spawn ${proposal.id} with binding digest ${proposal.bindingDigest}; no child started. ` +
                   `Saved preference: ${JSON.stringify(proposal.items[0]!.runtime.preference)}; requested: ${JSON.stringify(proposal.items[0]!.runtime.requested)}. ` +
                   `Review ${proposal.items[0]!.runtime.effective.harness}/${proposal.items[0]!.runtime.effective.model}` +
                   `${proposal.items[0]!.runtime.effective.effort ? `:${proposal.items[0]!.runtime.effective.effort}` : ""}, then after a newer user approval call subagent_approve with this id and binding digest.`,
