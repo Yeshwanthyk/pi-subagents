@@ -289,3 +289,48 @@ test("complete overrides do not bypass a missing saved route", () => {
   assert.equal(proposal.status, "unresolved");
   assert.equal(proposal.code, "route_missing");
 });
+
+test("auto approval admits only the exact saved route", () => {
+  const route = { harness: "pi", model: "provider/scout", effort: "high" };
+  const snapshot = (approval: string) =>
+    settings({
+      version: 1,
+      routing: { enabled: true, approval, routes: { scout: route } },
+    });
+  const resolve = (approval: string, explicit = {}) =>
+    resolveRouting({
+      settings: snapshot(approval),
+      classification: { intent: "scout" },
+      classificationSource: "explicit",
+      explicit,
+      lookupModel: available,
+    });
+  const saved = resolve("auto");
+  assert.equal(saved.status, "resolved");
+  assert.equal(saved.requiresApproval, false);
+  const restated = resolve("auto", { harness: "pi", model: "provider/scout" });
+  assert.equal(
+    restated.status === "resolved" && restated.requiresApproval,
+    false,
+  );
+  const overridden = resolve("auto", { effort: "max" });
+  assert.equal(
+    overridden.status === "resolved" && overridden.requiresApproval,
+    true,
+  );
+  const negotiated = resolveRouting({
+    settings: snapshot("auto"),
+    classification: { intent: "scout" },
+    classificationSource: "explicit",
+    lookupModel: (requested) => ({
+      available: true,
+      effective: { ...requested, effort: "medium" },
+    }),
+  });
+  assert.equal(
+    negotiated.status === "resolved" && negotiated.requiresApproval,
+    true,
+  );
+  const asked = resolve("ask");
+  assert.equal(asked.status === "resolved" && asked.requiresApproval, true);
+});

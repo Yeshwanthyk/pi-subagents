@@ -216,11 +216,17 @@ export function resolveRouting(input: ResolveRoutingInput): RoutingProposal {
       reason: availability.reason,
     };
   }
+  // Auto approval covers only the user's own saved preference, never an override.
+  const matchesSavedRoute =
+    availability.effective.harness === route.harness &&
+    availability.effective.model === route.model &&
+    availability.effective.effort === route.effort;
   return {
     ...proposalBase,
     status: "resolved",
     effective: availability.effective,
     preference: { ...route },
-    requiresApproval: true,
+    requiresApproval:
+      input.settings.settings.routing.approval !== "auto" || !matchesSavedRoute,
   };
 }

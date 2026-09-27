@@ -196,7 +196,7 @@ function parseFile(
         : {
             approval: oneOf(
               raw.approval,
-              ["ask"] as const,
+              ["ask", "auto"] as const,
               `${label}.routing.approval`,
             ),
           }),
@@ -291,6 +291,15 @@ function apply(
               ? base.routing.routes
               : { ...base.routing.routes, ...overlay.routing.routes },
         };
+  if (
+    project &&
+    overlay.routing?.approval === "auto" &&
+    base.routing.approval !== "auto"
+  ) {
+    throw new Error(
+      "Project routing approval may only restrict the global policy",
+    );
+  }
   let jev =
     overlay.jev === undefined ? base.jev : { ...base.jev, ...overlay.jev };
   if (project && overlay.jev !== undefined) {

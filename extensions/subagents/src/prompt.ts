@@ -33,11 +33,11 @@ export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
 export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
   "Use subagent_spawn for self-contained work with a clear scope, purpose, and expected output. Parallel delegation is appropriate when scopes can proceed independently, whether separate or complementary.",
   "Classify the actual deliverable when using preference routing: scout for information gathering, small_slice for a narrow change, lint for mechanical checks, implementation for product changes, and validation for review or proof. Use validation with simple complexity for lightweight validation; it selects simple_validation. Hard complexity is separate from intent. Classification never comes from the agent name and never grants permissions.",
-  "When routing is enabled, every spawn requires classification and starts no child until approval. Present the saved preference, requested overrides, and effective runtime; wait for a newer user approval, then call subagent_approve with the exact proposal id and binding digest.",
+  'When routing is enabled, every spawn requires classification. With approval "auto", a spawn that uses the saved route unchanged starts immediately; any override, or approval "ask", returns a proposal and starts no child. For a proposal, present the saved preference, requested overrides, and effective runtime; wait for a newer user approval, then call subagent_approve with the exact proposal id and binding digest.',
   "Use saved runtime preferences by default. Supply runtime overrides only when the user requests them; agent-supplied fields are not authorization. When routing is disabled, pick pi unless there is a reason to prefer Codex.",
   "A gated standalone result delivers compact acceptance by default; request the full report explicitly when needed. Workflow consumers that truly need a dependency report retain its content—never strip dependency evidence for compact delivery.",
   "Coordinate by scope: while a child runs, continue parent work outside its delegated scope. When its result arrives, use it as the basis for synthesis, validation, integration, or follow-up in that scope.",
-  "Use subagent_wait when the next parent step requires a child's result, such as synthesis or integration that includes its work, review of its findings, or a dependent decision. If it returns an ask_parent question, answer with subagent_send mode=reply and the exact requestId; follow_up is queued work, not an answer.",
+  "Use subagent_wait when the next parent step requires a child's result, such as synthesis or integration that includes its work, review of its findings, or a dependent decision. For a single child whose result you need immediately, pass wait: true to subagent_spawn instead of a separate wait call. If it returns an ask_parent question, answer with subagent_send mode=reply and the exact requestId; follow_up is queued work, not an answer.",
 ];
 
 /** Model-facing schema descriptions for subagent_spawn task and execution options. */
@@ -49,6 +49,7 @@ export const SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS = {
     "Actual deliverable classification for preference routing; validation plus simple complexity selects simple_validation. It does not come from the agent name or grant permissions.",
   harness:
     'Harness to run the subagent on: "pi" or "codex". Required for direct spawning while routing is disabled; optional when an enabled classified route supplies it.',
+  wait: "Block until this child settles (and its gate, if any) and return its result in this call. Use only when your very next step needs the result; omit to keep working in parallel.",
   workingDir: "Working directory (default: current working directory)",
   model:
     'Model hint, interpreted by the chosen harness (pi: "provider/model-id" or model id; codex: model slug). Omit for the harness default (pi inherits the current model).',

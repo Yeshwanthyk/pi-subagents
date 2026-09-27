@@ -130,8 +130,11 @@ export class StandaloneRoutingController {
         settings: context.settings,
         lookupModel: context.lookupModel,
       });
+      // A gate adds a remote evaluation; "auto" is the user's standing consent for it.
       const runtime =
-        resolved.status === "resolved" && task.gate
+        resolved.status === "resolved" &&
+        task.gate &&
+        context.settings.settings.routing.approval !== "auto"
           ? { ...resolved, requiresApproval: true }
           : resolved;
       if (runtime.status !== "resolved") {

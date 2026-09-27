@@ -246,3 +246,40 @@ test("proposal snapshots reject cycles, excessive depth, and excessive width", (
     /exceeds 10000 values/,
   );
 });
+
+test("auto-approved saved preferences are admitted without a newer user response", () => {
+  const settings = loadSubagentSettings({
+    cwd: "/workspace",
+    projectTrusted: true,
+    globalPath: "/global.json",
+    readFile: (file) =>
+      file === "/global.json"
+        ? JSON.stringify({
+            version: 1,
+            routing: {
+              enabled: true,
+              approval: "auto",
+              routes: { scout: { harness: "pi", model: "provider/scout" } },
+            },
+          })
+        : undefined,
+  });
+  const runtime = resolveRouting({
+    settings,
+    classification: { intent: "scout" },
+    lookupModel: (requested) => ({ available: true, effective: requested }),
+  });
+  if (runtime.status !== "resolved") throw new Error("fixture did not resolve");
+  const store = new SessionBatchProposalStore();
+  const proposal = store.create({
+    sessionId: "s",
+    preparedAtUserInput: 3,
+    items: [{ input: { task: "scan" }, runtime, settings }],
+  });
+  assert.equal(proposal.status, "approved");
+  assert.equal(proposal.approvalSource, "saved_preference");
+  assert.equal(
+    store.requireApproved(proposal.id, "s", proposal.bindingDigest).id,
+    proposal.id,
+  );
+});

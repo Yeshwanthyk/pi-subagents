@@ -1,6 +1,5 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- Pi validates the declarative TypeBox gate schema before it is adapted to the equivalent Jev domain contract. */
 
-import { Buffer } from "node:buffer";
 import { Type, type Static } from "typebox";
 import type {
   SubagentAcceptanceRequest,
@@ -14,6 +13,7 @@ import {
   type JevQuestions,
 } from "../jev/domain.ts";
 import { validateJevInput } from "../jev/validation.ts";
+import { boundedGateEvidence, gateOperations } from "../gate-evidence.ts";
 
 const gateChoiceQuestion = Type.Object(
   {
@@ -67,24 +67,23 @@ export const STANDALONE_GATE_PARAMETERS = Type.Object(
 export type StandaloneGateParams = Static<typeof STANDALONE_GATE_PARAMETERS>;
 
 const MAX_GATE_EVIDENCE_BYTES = 24 * 1024;
-
 function evidence(snapshot: SubagentSnapshot): string | undefined {
   if (snapshot.finalTextTruncated || snapshot.finalText.trim().length === 0) {
     return undefined;
   }
-  const value = JSON.stringify({
-    taskGoal: snapshot.prompt,
-    report: snapshot.finalText,
-    process: {
-      status: snapshot.status,
-      outcome: snapshot.outcome?._tag,
-      error: snapshot.errorText,
+  return boundedGateEvidence(
+    {
+      taskGoal: snapshot.prompt,
+      report: snapshot.finalText,
+      process: {
+        status: snapshot.status,
+        outcome: snapshot.outcome?._tag,
+        error: snapshot.errorText,
+      },
     },
-    completeness: { report: true, truncated: false },
-  });
-  return Buffer.byteLength(value, "utf8") <= MAX_GATE_EVIDENCE_BYTES
-    ? value
-    : undefined;
+    gateOperations(snapshot.transcript),
+    MAX_GATE_EVIDENCE_BYTES,
+  );
 }
 
 function validatePredicate(gate: StandaloneGateParams): string | undefined {

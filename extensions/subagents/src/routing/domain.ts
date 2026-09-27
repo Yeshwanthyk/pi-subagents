@@ -35,7 +35,8 @@ export type RouteTable = Readonly<Partial<Record<RouteKey, RuntimeSelection>>>;
 
 export interface RoutingPolicy {
   readonly enabled: boolean;
-  readonly approval: "ask";
+  /** "auto" admits only runtimes that exactly equal the saved route; overrides still ask. */
+  readonly approval: "ask" | "auto";
   readonly ambiguous: "ask";
   readonly unavailable: "ask";
   readonly routes: RouteTable;

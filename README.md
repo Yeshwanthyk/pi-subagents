@@ -14,7 +14,7 @@ Reload an existing Pi session with `/reload`.
 
 Tools:
 
-- `subagent_spawn`
+- `subagent_spawn` — pass `wait: true` to block and return the child's result in the same call
 - `subagent_route` and `subagent_approve` — prepare and approve exact preference-routed batches
 - `subagent_wait`
 - `subagent_cancel`

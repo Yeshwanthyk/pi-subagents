@@ -151,6 +151,8 @@ The result contains a proposal ID, binding digest, exact effective runtimes, and
 
 using `subagent_approve`. Approval is session-local and binds task text, working directory, runtime, and the settings snapshot. Changed, expired, cross-session, or stale-settings proposals fail instead of silently rerouting. Repeated approval does not duplicate admission.
 
+`routing.approval` is `"ask"` (default) or `"auto"`. With `"auto"`, a `subagent_spawn` or `subagent_route` task whose effective runtime exactly equals its saved route (harness, model, and effort, including after model-catalog negotiation) is admitted immediately, gated or not, and the proposal records `approvalSource: "saved_preference"`. Any runtime override, or a catalog that changes the runtime, still returns a proposal that needs a newer user approval. A trusted project may set `"ask"` to restrict a global `"auto"`, but cannot loosen a global `"ask"` to `"auto"`.
+
 When routing is enabled, `subagent_spawn` requires `classification`, even when `harness` and `model` are supplied. Routing resolves the saved preference first; runtime fields request overrides, not user authorization. Every resolved runtime returns a proposal instead of starting immediately. Review the saved preference, requested runtime, and effective runtime, then use its ID and digest with `subagent_approve` after newer user approval. Missing classifications or saved routes fail before any child starts. When routing is disabled, continue to provide an explicit `harness`.
 
 Routing is deterministic and makes no Jev request. Missing classifications, routes, unavailable models, and ambiguous bare Pi model IDs fail or remain unresolved; the extension does not silently substitute another runtime.
@@ -249,9 +251,9 @@ A score gate uses the zero-based criterion index as its threshold:
 }
 ```
 
-Standalone gate predicates use snake-case `question_id`; `timeout_ms` is optional, defaults to 10 seconds, and must be between 1 and 120,000 milliseconds. The predicate must reference a declared question, choice values must be declared options, and score thresholds must be valid criterion indexes. The gate sends a bounded evidence envelope containing the task goal, final report, process outcome, and completeness flags. Missing or oversized evidence fails the gate rather than silently passing it.
+Standalone gate predicates use snake-case `question_id`; `timeout_ms` is optional, defaults to 10 seconds, and must be between 1 and 120,000 milliseconds. The predicate must reference a declared question, choice values must be declared options, and score thresholds must be valid criterion indexes. The gate sends a bounded evidence envelope containing the task goal, final report, process outcome, the child's most recent tool operations (up to 24; tool, arguments preview, success, and output preview of at most 400 characters each), and completeness flags. Operations let the evaluator judge what the child did rather than only what its report claims; the oldest are dropped first to stay within 24 KiB, and `completeness.operationsOmitted` counts them. Missing or oversized report evidence fails the gate rather than silently passing it.
 
-For standalone gated children, routine result delivery is deliberately compact. Automatic parent messages and `subagent_wait` return the pass/reject/error verdict, plus a bounded single-line reason for reject or error, without duplicating the report in message or tool details. The full work product remains owned by the subagent manager. Call `subagent_inspect({ id })` to retrieve the terminal gated report explicitly; inspection returns up to 24 KiB and 600 lines. If a larger report exceeds that inspection bound, use `/subagents` to inspect the retained transcript. Ungated children continue to return their report directly.
+For standalone gated children, routine result delivery is deliberately compact. Automatic parent messages and `subagent_wait` return the pass/reject/error verdict, plus a bounded single-line reason for reject or error, without duplicating the report in message or tool details. The full work product remains owned by the subagent manager. Call `subagent_inspect({ id })` to retrieve the terminal gated report explicitly; inspection returns up to 24 KiB and 600 lines. If a larger report exceeds that inspection bound, use `/subagents` to inspect the retained transcript. Ungated children continue to return their report directly. `subagent_spawn({ …, wait: true })` spawns and waits in one call, returning the same wait delivery (or an `ask_parent` question); a routed spawn that returns a proposal never waits.
 
 This compact verdict is not a correctness proof. Jev judges the bounded report supplied by the child against the declared questions and predicate; it does not independently inspect the repository, rerun checks, or establish that the report is true. Retrieve the report and use deterministic verification when correctness depends on its claims.
 
@@ -334,7 +336,7 @@ flow({
 });
 ```
 
-Evaluation tasks must be `readOnly: true` and cannot also declare a gate. Workflow gate rejection is recorded as `gate_rejected`, does not become a backend failure, and does not trigger backend retry policy. Dependants remain blocked until the gate result is persisted and accepted. Truncated or missing required evidence fails closed.
+Evaluation tasks must be `readOnly: true` and cannot also declare a gate. Workflow gate rejection is recorded as `gate_rejected`, does not become a backend failure, and does not trigger backend retry policy. Dependants remain blocked until the gate result is persisted and accepted. Workflow gate evidence contains the task goal, the bounded report, and the same bounded tool-operation list as standalone gates. Truncated or missing required evidence fails closed.
 
 ## Acceptance state
 

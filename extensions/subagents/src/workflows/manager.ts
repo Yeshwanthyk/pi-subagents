@@ -52,6 +52,11 @@ import {
 } from "./controls.ts";
 import type { WorkflowRunArtifactStore } from "./artifacts.ts";
 import {
+  boundedGateEvidence,
+  gateOperations,
+  type GateOperations,
+} from "../gate-evidence.ts";
+import {
   recoverWorkflowArtifacts,
   type WorkflowRecoveryFailure,
   type WorkflowRecoveryReport,
@@ -138,6 +143,8 @@ interface ResolvedExecutionOptions {
   readonly defaultBackend: BackendName;
 }
 
+/** Below MAX_EVALUATION_STATE_BYTES so consumed inputs are never the reason a gate fails. */
+const MAX_WORKFLOW_GATE_EVIDENCE_BYTES = 24 * 1024;
 interface WorkflowChildSnapshot {
   readonly id: string;
   readonly workflow?: WorkflowOwnership;
@@ -146,6 +153,8 @@ interface WorkflowChildSnapshot {
   readonly startedAt?: number;
   readonly finalText: string;
   readonly finalTextTruncated: boolean;
+  /** Bounded tool history for post-run gates; the transcript stays manager-owned. */
+  readonly operations: GateOperations;
   readonly errorText?: string;
 }
 interface ChildSettlement {
@@ -175,6 +184,7 @@ function projectChildSnapshot(
     finalTextTruncated:
       snapshot.finalTextTruncated === true ||
       utf8Bytes(snapshot.finalText) > MAX_WORKFLOW_EVENT_TEXT_BYTES,
+    operations: gateOperations(snapshot.transcript),
   };
   if (error === undefined) return projected;
   return {
@@ -1331,6 +1341,7 @@ export class WorkflowManager {
     attemptId: string,
     finalText: string,
     finalTextTruncated: boolean,
+    operations: GateOperations,
   ): Promise<WorkflowEvaluationResult | undefined> {
     const state = this.requireEntry(execution.runId).state;
     const task = state.tasks[taskId];
@@ -1361,12 +1372,15 @@ export class WorkflowManager {
     let acceptedResult: WorkflowEvaluationResult | undefined;
     operation = Promise.resolve().then(async () => {
       try {
+        const state = boundedGateEvidence(
+          { goal: task.definition.prompt, report: finalText },
+          operations,
+          MAX_WORKFLOW_GATE_EVIDENCE_BYTES,
+        );
+        if (state === undefined)
+          throw new Error("Gate evidence exceeds the completeness bound.");
         const payload = validateWorkflowEvaluationPayload({
-          state: JSON.stringify({
-            goal: task.definition.prompt,
-            report: finalText,
-            completeness: { report: true, truncated: false },
-          }),
+          state,
           questions: gate.questions,
         });
         const raw = await this.evaluateWithDeadline(
@@ -1939,6 +1953,7 @@ export class WorkflowManager {
         child.attemptId,
         finalText,
         snapshot.finalTextTruncated,
+        snapshot.operations,
       );
       const afterGate = this.requireEntry(execution.runId).state.tasks[
         child.taskId

@@ -705,6 +705,88 @@ test("a delayed post-run gate blocks dependants until its persisted pass", async
   );
 });
 
+test("workflow gate evidence includes the child's tool operations", async () => {
+  let state = "";
+  const executor: WorkflowChildExecutor = {
+    spawn: async (_backend, spawnTask) =>
+      executionChild("ops-child", spawnTask.workflow!, "running"),
+    awaitSettlement: async (id, expected) => ({
+      ...executionChild(id, expected!, "done", {
+        _tag: "Completed",
+        finalText: "add returns a + b",
+      }),
+      transcript: [
+        {
+          kind: "assistant",
+          parts: [
+            {
+              type: "toolCall",
+              toolId: "t1",
+              name: "read",
+              argsPreview: '{"path":"math.js"}',
+            },
+          ],
+        },
+        {
+          kind: "toolResult",
+          toolId: "t1",
+          name: "read",
+          isError: false,
+          outputPreview: "export const add = (a, b) => a + b;",
+        },
+      ],
+    }),
+    cancel: async () => [],
+  };
+  const evaluator: WorkflowEvaluator = {
+    evaluate: async (payload) => {
+      state = payload.state;
+      return {
+        ok: true,
+        answers: { verdict: { type: "choice", value: "pass" } },
+      };
+    },
+  };
+  const workflows = new WorkflowManager({
+    createId: () => "wf-gate-ops",
+    execution: { executor, evaluator, evaluationPolicy },
+  });
+  const created = workflows.createRun({
+    evaluationPolicy,
+    tasks: [
+      task("gated", "read math.js", {
+        gate: {
+          questions: {
+            verdict: {
+              type: "choice",
+              question: "Accept?",
+              options: ["pass", "reject"],
+            },
+          },
+          predicate: {
+            type: "choice_equals",
+            questionId: "verdict",
+            value: "pass",
+          },
+        },
+      }),
+    ],
+  });
+  const settled = await workflows.execute(created.id).completion;
+  assert.equal(settled.status, "completed");
+  const parsed = JSON.parse(state);
+  assert.equal(parsed.report, "add returns a + b");
+  assert.deepEqual(parsed.operations, [
+    {
+      tool: "read",
+      args: '{"path":"math.js"}',
+      ok: true,
+      output: "export const add = (a, b) => a + b;",
+    },
+  ]);
+  assert.equal(parsed.completeness.operationsOmitted, 0);
+});
+
 test("gate rejection is semantic, skips dependants, and never becomes a backend retry", async () => {
   let spawns = 0;
   const executor: WorkflowChildExecutor = {
@@ -1038,11 +1120,7 @@ test("workflow execution rejects changed evaluator policy and obsolete enabled f
       { ...evaluationPolicy, model: "jev-new" },
       /policy/iu,
     ],
-    [
-      "wf-policy-obsolete-enabled",
-      legacyPolicy,
-      /enabled.*obsolete/iu,
-    ],
+    ["wf-policy-obsolete-enabled", legacyPolicy, /enabled.*obsolete/iu],
   ] as const) {
     const workflows = new WorkflowManager({
       createId: () => id,

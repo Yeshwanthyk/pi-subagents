@@ -45,7 +45,7 @@ export interface BatchProposal {
   readonly expiresAt: number;
   readonly bindingDigest: string;
   readonly status: BatchProposalStatus;
-  readonly approvalSource?: "newer_user_response" | "explicit_runtime";
+  readonly approvalSource?: "newer_user_response" | "saved_preference";
   readonly approvedAtUserInput?: number;
   readonly items: ReadonlyArray<BatchProposalItem>;
 }
@@ -243,7 +243,7 @@ export class SessionBatchProposalStore {
       ...(requiresApproval
         ? {}
         : {
-            approvalSource: "explicit_runtime" as const,
+            approvalSource: "saved_preference" as const,
             approvedAtUserInput: input.preparedAtUserInput,
           }),
       items: Object.freeze(items),

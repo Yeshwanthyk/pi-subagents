@@ -594,6 +594,82 @@ test("standalone gate rejects missing or truncated evidence without evaluating",
   assert.equal(evaluations, 0);
 });
 
+test("standalone gate evidence includes bounded child operations", async () => {
+  let state = "";
+  const acceptance = createStandaloneJevAcceptance(
+    {
+      evaluator: "jev",
+      questions: {
+        verdict: {
+          type: "choice",
+          question: "Accept?",
+          options: ["yes", "no"],
+        },
+      },
+      predicate: {
+        type: "choice_equals",
+        question_id: "verdict",
+        value: "yes",
+      },
+    },
+    {
+      async evaluate(input) {
+        state = input.state;
+        // SAFETY: the gate under test declares exactly one choice question, "verdict", with option "yes".
+        return {
+          ok: true as const,
+          answers: {
+            verdict: { type: "choice" as const, value: "yes" },
+          },
+          metadata: {
+            schemaVersion: 1,
+            requestedModel: "m",
+            actualModel: "m",
+            durationMs: 1,
+            inputDigest: "d",
+          },
+        } as never;
+      },
+    },
+  );
+  const calls = Array.from({ length: 30 }, (_, i) => i);
+  const done = snapshot("sa-ops", {
+    status: "done",
+    finalText: "Tests pass.",
+    transcript: calls.flatMap((i) => [
+      {
+        kind: "assistant" as const,
+        parts: [
+          {
+            type: "toolCall" as const,
+            toolId: `t${i}`,
+            name: "bash",
+            argsPreview: `npm test -- ${i}`,
+          },
+        ],
+      },
+      {
+        kind: "toolResult" as const,
+        toolId: `t${i}`,
+        name: "bash",
+        isError: i === 29,
+        outputPreview: "x".repeat(1000),
+      },
+    ]),
+  });
+  const result = await acceptance.evaluate(done, new AbortController().signal);
+  assert.equal(result.status, "pass");
+  const parsed = JSON.parse(state);
+  assert.equal(parsed.operations.length, 24);
+  assert.equal(parsed.completeness.operationsOmitted, 6);
+  assert.deepEqual(parsed.operations.at(-1), {
+    tool: "bash",
+    args: "npm test -- 29",
+    ok: false,
+    output: `${"x".repeat(400)}…`,
+  });
+});
+
 test("settings command validates and atomically saves only an explicit temp scope", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "subagents-settings-"));
   const globalPath = path.join(root, "agent", "subagents.json");

@@ -29,6 +29,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
+  AgentToolUpdateCallback,
   ExtensionAPI,
   ExtensionContext,
   ExtensionUIContext,
@@ -1479,6 +1480,110 @@ export default function (pi: ExtensionAPI) {
   );
   // --- Tools -------------------------------------------------------------
 
+  interface WaitProgressDetails {
+    readonly pending: ReadonlyArray<string>;
+    readonly activity: ReadonlyArray<{
+      readonly id: string;
+      readonly status: SubagentSnapshot["status"];
+      readonly lastActivityAt: number;
+      readonly currentTool?: string;
+    }>;
+  }
+
+  /** Block until listed parent-owned children settle or ask; shared by subagent_wait and spawn wait. */
+  const collectChildren = async (
+    requestedIds: ReadonlyArray<string>,
+    signal: AbortSignal | undefined,
+    onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+  ) => {
+    const manager = await getManager();
+    const ids = [...new Set(requestedIds)];
+    if (ids.length === 0) throw new Error("Provide at least one subagent id.");
+    const known = standardSnapshots(manager).map((snap) => snap.id);
+    const unknown = ids.filter((id) => !standardSnapshot(manager, id));
+    if (unknown.length > 0) {
+      throw new Error(
+        `Unknown subagent id(s): ${unknown.join(", ")}. Known: ${known.join(", ") || "none"}.`,
+      );
+    }
+
+    const waitOwners = ids
+      .map((id) => standardSnapshot(manager, id))
+      .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
+    let lastWaitUpdate = 0;
+    const waitResult = await runTool(
+      getRuntime(),
+      manager.waitForParent!(ids, (pending) => {
+        const now = Date.now();
+        if (now - lastWaitUpdate < 100) return;
+        lastWaitUpdate = now;
+        const snapshots = ids
+          .map((id) => standardSnapshot(manager, id))
+          .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
+        onUpdate?.({
+          content: [
+            {
+              type: "text",
+              text: renderSubagentWaitSummary(
+                snapshots,
+                ui?.theme ?? PLAIN_THEME,
+              ),
+            },
+          ],
+          details: {
+            pending,
+            activity: snapshots.map((snapshot) => ({
+              id: snapshot.id,
+              status: snapshot.status,
+              lastActivityAt: snapshot.lastActivityAt,
+              currentTool: snapshot.liveTools[0]?.name,
+            })),
+          } satisfies WaitProgressDetails,
+        });
+      }),
+      { signal, interruptMessage: "Wait aborted. Subagents keep running." },
+    );
+
+    // A question returns while its child remains running. Consume only
+    // terminal results returned by this call.
+    parentResults.consume(
+      waitOwners.filter((owner) => waitResult.settledIds.includes(owner.id)),
+    );
+
+    if (waitResult.questions.length > 0) {
+      parentResults.consumeQuestions(waitResult.questions);
+      const questions = waitResult.questions.map(
+        ({ childId, requestId, question, context, deadlineAt }) =>
+          context === undefined
+            ? { childId, requestId, question, deadlineAt }
+            : { childId, requestId, question, context, deadlineAt },
+      );
+      const text = questions
+        .map((question) => {
+          const context = question.context
+            ? `\nContext: ${question.context}`
+            : "";
+          return `Subagent ${question.childId} asks (requestId ${question.requestId}, deadline ${new Date(question.deadlineAt).toISOString()}):\n${question.question}${context}`;
+        })
+        .join("\n\n");
+      return {
+        content: [{ type: "text" as const, text }],
+        details: { questions },
+      };
+    }
+
+    const delivery = buildSubagentWaitResult(
+      waitResult.settledIds.map((id) => ({
+        id,
+        snapshot: standardSnapshot(manager, id),
+      })),
+    );
+    return {
+      content: [{ type: "text" as const, text: delivery.text }],
+      details: delivery.details,
+    };
+  };
+
   pi.registerTool({
     name: "subagent_route",
     label: "Route Subagents",
@@ -1629,6 +1734,11 @@ export default function (pi: ExtensionAPI) {
       }),
       classification: Type.Optional(ROUTING_CLASSIFICATION_PARAMETERS),
       gate: Type.Optional(STANDALONE_GATE_PARAMETERS),
+      wait: Type.Optional(
+        Type.Boolean({
+          description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.wait,
+        }),
+      ),
       harness: Type.Optional(
         StringEnum(BACKEND_NAMES, {
           description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.harness,
@@ -1650,7 +1760,28 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      // Spawn and collect in one tool call, saving a parent turn when the next step needs the result.
+      const deliver = async <Details extends { readonly id: string }>(spawned: {
+        content: [{ type: "text"; text: string }];
+        details: Details;
+      }) => {
+        if (!params.wait) return spawned;
+        const waited = await collectChildren(
+          [spawned.details.id],
+          signal,
+          onUpdate,
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Spawned subagent ${spawned.details.id} and waited for it.\n\n${waited.content[0].text}`,
+            },
+          ],
+          details: { ...spawned.details, wait: waited.details },
+        };
+      };
       const cwd = path.resolve(ctx.cwd, params.working_dir ?? ".");
       if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
         throw new Error(`working_dir is not a directory: ${cwd}`);
@@ -1728,7 +1859,7 @@ export default function (pi: ExtensionAPI) {
         );
         if (!admitted)
           throw new Error("Routed spawn admission returned no result");
-        return {
+        return deliver({
           content: [
             {
               type: "text",
@@ -1742,7 +1873,7 @@ export default function (pi: ExtensionAPI) {
             },
           ],
           details: admitted,
-        };
+        });
       }
       if (!params.harness) {
         throw new Error("harness is required while routing is disabled.");
@@ -1763,7 +1894,7 @@ export default function (pi: ExtensionAPI) {
         },
         ctx,
       );
-      return {
+      return deliver({
         content: [
           {
             type: "text",
@@ -1783,7 +1914,7 @@ export default function (pi: ExtensionAPI) {
           harness: params.harness,
           model: admitted.snap.meta.modelLabel,
         },
-      };
+      });
     },
     renderCall(args, theme, context) {
       // SAFETY: this renderer only returns Text components for this tool row,
@@ -1878,93 +2009,7 @@ export default function (pi: ExtensionAPI) {
       }),
     }),
     async execute(_toolCallId, params, signal, onUpdate) {
-      const manager = await getManager();
-      const ids = [...new Set(params.ids)];
-      if (ids.length === 0)
-        throw new Error("Provide at least one subagent id.");
-      const known = standardSnapshots(manager).map((snap) => snap.id);
-      const unknown = ids.filter((id) => !standardSnapshot(manager, id));
-      if (unknown.length > 0) {
-        throw new Error(
-          `Unknown subagent id(s): ${unknown.join(", ")}. Known: ${known.join(", ") || "none"}.`,
-        );
-      }
-
-      const waitOwners = ids
-        .map((id) => standardSnapshot(manager, id))
-        .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
-      let lastWaitUpdate = 0;
-      const waitResult = await runTool(
-        getRuntime(),
-        manager.waitForParent!(ids, (pending) => {
-          const now = Date.now();
-          if (now - lastWaitUpdate < 100) return;
-          lastWaitUpdate = now;
-          const snapshots = ids
-            .map((id) => standardSnapshot(manager, id))
-            .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
-          onUpdate?.({
-            content: [
-              {
-                type: "text",
-                text: renderSubagentWaitSummary(
-                  snapshots,
-                  ui?.theme ?? PLAIN_THEME,
-                ),
-              },
-            ],
-            details: {
-              pending,
-              activity: snapshots.map((snapshot) => ({
-                id: snapshot.id,
-                status: snapshot.status,
-                lastActivityAt: snapshot.lastActivityAt,
-                currentTool: snapshot.liveTools[0]?.name,
-              })),
-            },
-          });
-        }),
-        { signal, interruptMessage: "Wait aborted. Subagents keep running." },
-      );
-
-      // A question returns while its child remains running. Consume only
-      // terminal results returned by this call.
-      parentResults.consume(
-        waitOwners.filter((owner) => waitResult.settledIds.includes(owner.id)),
-      );
-
-      if (waitResult.questions.length > 0) {
-        parentResults.consumeQuestions(waitResult.questions);
-        const questions = waitResult.questions.map(
-          ({ childId, requestId, question, context, deadlineAt }) =>
-            context === undefined
-              ? { childId, requestId, question, deadlineAt }
-              : { childId, requestId, question, context, deadlineAt },
-        );
-        const text = questions
-          .map((question) => {
-            const context = question.context
-              ? `\nContext: ${question.context}`
-              : "";
-            return `Subagent ${question.childId} asks (requestId ${question.requestId}, deadline ${new Date(question.deadlineAt).toISOString()}):\n${question.question}${context}`;
-          })
-          .join("\n\n");
-        return {
-          content: [{ type: "text", text }],
-          details: { questions },
-        };
-      }
-
-      const delivery = buildSubagentWaitResult(
-        waitResult.settledIds.map((id) => ({
-          id,
-          snapshot: standardSnapshot(manager, id),
-        })),
-      );
-      return {
-        content: [{ type: "text", text: delivery.text }],
-        details: delivery.details,
-      };
+      return collectChildren(params.ids, signal, onUpdate);
     },
   });
 

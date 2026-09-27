@@ -137,11 +137,7 @@ test("legacy Jev enabled settings require migration", () => {
 
 test("project Jev settings cannot change credential selection", () => {
   assert.throws(
-    () =>
-      loader(
-        { version: 1 },
-        { version: 1, jev: { apiKeyEnv: "OTHER" } },
-      ),
+    () => loader({ version: 1 }, { version: 1, jev: { apiKeyEnv: "OTHER" } }),
     /cannot change credentials/,
   );
   assert.throws(
@@ -179,5 +175,28 @@ test("project Jev settings may only restrict global limits", () => {
         { version: 1, jev: { timeoutMs: 5_001 } },
       ),
     /may only restrict/,
+  );
+});
+
+test("project routing approval may restrict but never loosen the global policy", () => {
+  assert.equal(
+    loader({ version: 1, routing: { approval: "auto" } }).settings.routing
+      .approval,
+    "auto",
+  );
+  assert.equal(
+    loader(
+      { version: 1, routing: { approval: "auto" } },
+      { version: 1, routing: { approval: "ask" } },
+    ).settings.routing.approval,
+    "ask",
+  );
+  assert.throws(
+    () => loader({ version: 1 }, { version: 1, routing: { approval: "auto" } }),
+    /may only restrict/,
+  );
+  assert.throws(
+    () => loader({ version: 1, routing: { approval: "always" } }),
+    /approval/,
   );
 });
