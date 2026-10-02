@@ -1,63 +1,87 @@
 ---
 name: verify-pi-subagents
-description: Verify the pi-subagents extension through the real `pi` CLI (print/JSON mode) — spawn, wait, inspect, and Jev post-run gates — with per-event timing. Use after changing extensions/subagents, the Jev client, gate evidence, or result delivery, or when asked whether gates/Jev actually work or how fast subagent runs are.
+description: Verify and benchmark the pi-subagents extension through the real `pi` CLI (print/JSON mode). It covers single spawn, spawn-and-wait, 4- and 6-way parallel children, and a 3-task workflow, with per-event timing and a before/after comparison. Use after changing extensions/subagents (spawn, wait, scheduling, concurrency, workflows, result delivery), or when asked how fast subagent runs are or whether a change made them faster.
 ---
 
 # Verify pi-subagents (CLI)
 
-Drives a real `pi -p --mode json` parent with this repo's extension loaded (`-ne -e extensions/subagents/index.ts`), so the parent model calls the actual `subagent_spawn` / `subagent_wait` / `subagent_inspect` tools, which spawn a real Pi child and run a real Jev gate. Every JSONL event is timestamped by the driver.
+The driver runs a real `pi -p --mode json` parent with an extension loaded (`-ne -e $EXT`). The parent model calls the real `subagent_*` / `workflow*` tools, and those spawn real Pi children. The driver timestamps every JSONL event. `EXT` defaults to this repo's `extensions/subagents/index.ts`. Point it at another checkout, such as a baseline worktree, to measure the same scenarios against older code.
 
 ## Launch
 
 No server. Each scenario is one short-lived `pi` process in its own scratch project:
 
-- `scripts/drive.mjs` creates `<evidence>/<i>-<scenario>/proj/` with `math.js`, `git init`, and `.pi/subagents.json` = `{"version":1,"routing":{"enabled":false}}`.
-- `-a` trusts that project for the run, so the overlay disables routing. Otherwise your global `routing.enabled: true` turns every spawn into an approval proposal that print mode cannot answer.
-- `--no-session` means no session file is written. The process exits after the parent's final reply. A 300 s kill timer is the teardown backstop.
+- `scripts/drive.mjs` creates `<evidence>/<run>-<scenario>/proj/` with `math.js`, an empty `.marks/`, `git init`, and `.pi/subagents.json` = `{"version":1,"routing":{"enabled":false}}`.
+- `-a` trusts that project for the run, so the overlay disables routing. Otherwise a global `routing.enabled: true` turns every spawn into an approval proposal that print mode cannot answer.
+- `--no-session` means no session file is written. The process exits after the parent's final reply to the last message. A `TIMEOUT_MS` (default 600 s) kill timer is the teardown backstop.
+- Multi-message print mode: `pi -p … "<msg1>" "<msg2>"` sends each message as a new user input in one session. The `workflow` scenario uses it because approval needs a newer user input than preparation.
 
 Readiness: the process exits 0 and `events.jsonl` contains `agent_end`.
 
-## Doctor (read-only, ~1 s)
-
-Run from the repo root:
+## Doctor (read-only, ~10 s)
 
 ```bash
-pi --version                                   # pi installed
-test -n "$TYPESAFE_API_KEY" || test -f ~/.pi/agent/jev-credentials.json   # Jev credential present
-node --experimental-strip-types .claude/skills/verify-pi-subagents/scripts/jev-probe.ts 1
+pi --version
+pi --list-models deepseek-v4.1-flash      # default model must be listed (opencode-go provider)
+pi -p --no-session -ne -e extensions/subagents/index.ts --model opencode-go/deepseek-v4.1-flash --thinking low "say hi"
 ```
 
-`jev-probe.ts` uses the repo's real `JevClient` with the global `jev.timeoutMs`/`model` from `~/.pi/agent/subagents.json`. It sends two synthetic reports (good → `pass`, bad → `reject`) and prints latency and headroom against the timeout. It exits non-zero on any error or wrong verdict. If it fails, stop: the gate scenarios will fail for credential or network reasons, not product reasons.
+The last command must print a reply.
 
-Model availability: `pi --list-models luna` must list the parent/child models (default `openai-codex/gpt-6-luna` for both). Override with `PARENT_MODEL=… CHILD_MODEL=…`.
+- If it prints `400 …`, the provider rejects one of the extension's tool schemas. Top-level `Type.Union` parameters (`workflow`, `workflow_control`) are rejected by OpenAI-compatible endpoints. Run the spawn scenarios with `HIDE_TOOLS=workflow,workflow_control`, which loads EXT through `scripts/tool-filter.ts`. Record that the workflow scenario is blocked.
+- If it prints `Failed to load extension`, EXT does not load. Stop and fix the extension.
+
+Do not default to `openai-codex/*` models; they are not available here.
 
 ## Drive
 
 ```bash
-node .claude/skills/verify-pi-subagents/scripts/drive.mjs                    # pass reject ungated
-node .claude/skills/verify-pi-subagents/scripts/drive.mjs pass pass pass     # repeat for flakiness/latency spread
-node .claude/skills/verify-pi-subagents/scripts/drive.mjs wait               # spawn with wait: true (one tool call)
+# all 5 scenarios, serial, default model for parent+child, this repo's extension
+node .claude/skills/verify-pi-subagents/scripts/drive.mjs
+# pick scenarios / repeat / target another checkout
+RUNS=3 node .claude/skills/verify-pi-subagents/scripts/drive.mjs parallel4 parallel6
+EXT=/tmp/pi-subagents-baseline/extensions/subagents/index.ts PARENT_MODEL=… CHILD_MODEL=… VERIFY_OUT=/tmp/verify-pi-subagents/baseline-<slug> node …/drive.mjs
 ```
 
-Scenarios run concurrently (separate dirs and processes, no shared session). Each prompts the parent to call `subagent_spawn` with exact JSON, then `subagent_wait`, then `subagent_inspect`. The `wait` scenario instead passes `wait: true` and makes no other tool call, so its timings come from the spawn call. Exit code 0 means every scenario matched its expectation.
+Env: `EXT`, `PARENT_MODEL` / `CHILD_MODEL` (default `opencode-go/deepseek-v4.1-flash`), `VERIFY_OUT`, `RUNS` (default 1), `CONCURRENCY` (default 1; keep it at 1 for timing work), `THINKING` (parent, default `low`), `TIMEOUT_MS`, `HIDE_TOOLS`, `PI_BIN`, `PI_AGENT_DIR`.
+
+The prompts are capability-neutral. They state the goal ("start 4 children at once, then collect all results") and only the spawn fields that every version has (`harness`, `model`, `reasoning_effort`). The parent then uses whatever the loaded tools offer, such as `wait: true`, batch spawn, or wait-for-first. So the same scenario measures both old and new code. Parent compliance is probabilistic: read `toolCalls` before blaming the product.
+
+| Scenario | Goal given to the parent | ok when |
+| --- | --- | --- |
+| `single` | spawn one child that reads `math.js`, wait, report what `add` returns | exit 0, child done, answer mentions `a + b`/sum |
+| `wait` | same, "in as few tool calls as possible" | same |
+| `parallel4` / `parallel6` | start N children at once; each runs `sleep 8 && touch .marks/child-i` and replies with i; collect all | N children seen done and N marker files |
+| `workflow` | msg1: prepare the fixed `flow({tasks:[A sleep 2, B sleep 25, C needs A sleep 10]})` draft (readOnly, pinned to `CHILD_MODEL`, effort low); msg2: approve, poll `workflow_check`, report | run journal says completed, all 3 tasks completed |
+
+## Compare
+
+```bash
+node .claude/skills/verify-pi-subagents/scripts/compare.mjs <baselineDir> <afterDir>
+```
+
+Either argument can be a single drive output or a `VERIFY_OUT` dir that holds several timestamped drives. For each parent model and scenario, compare.mjs takes the median over passing records (or over all records if none passed) and prints before, after, the delta, and the % change. Records run with `HIDE_TOOLS` are grouped separately.
 
 ## Evidence
 
-Evidence lives at `${VERIFY_OUT:-$TMPDIR/verify-pi-subagents}/<ISO-timestamp>/` and the path is printed as the last line. It holds:
+Evidence lives at `${VERIFY_OUT:-$TMPDIR/verify-pi-subagents}/<ISO-timestamp>/`, and the path is printed as the last line, after a compact table. It holds:
 
-- `summary.json`, with one record per scenario:
-  - `ok`, `acceptance`, `childStatus`, `waitText`: the compact gated delivery.
-  - `childReport`: the `subagent_inspect` text, which includes the child's tool operations and final output.
-  - Timings: `toSpawnCallMs` (parent think before spawning), `spawnToWaitEndMs` (child run + gate), `afterWaitMs` (parent's closing turns), `wallMs`.
-  - `parentUsage`: tokens.
-- `<i>-<scenario>/events.jsonl`: the raw pi events with `t` (ms since launch). This is the initiating tool call and its result.
-- `<i>-<scenario>/stderr.txt`
+- `summary.json`, with one record per scenario run. All times are ms since the `pi` launch unless noted.
+  - `ok`, `exit`, `wallMs`, `parentTurns` (assistant messages), `toolCalls` (by name), `toolCallsTotal`, `parentTokens` (input/output/cacheRead/cacheWrite/cost).
+  - `firstSpawnCallMs`.
+  - `firstResultMs` / `lastResultMs`: when the parent first saw each child terminal, from any `subagent_*` tool result or a pushed parent message. `childTimes` is filled when tool details expose epoch `startedAt`/`settledAt`/… .
+  - Parallel: `sleepDoneMs[]`, `firstSleepDoneMs`, `lastSleepDoneMs`, taken from the `.marks/child-i` file mtimes. They show when each child actually finished its sleep, independent of what the parent observed. A queued child shows up as a later cluster.
+  - Workflow: `workflow.{draftId, preparedMs, approvedMs, runId, checkCalls, runStatus}`. Also `runWallMs` (WorkflowStarted→terminal), `approveToTerminalMs`, `tasks.{A,B,C}.{queuedMs,startMs,finishMs}` (ms after WorkflowStarted), and `cStartAfterAFinishMs` / `cStartAfterBFinishMs`. These come from the run journal at `~/.pi/agent/workflows/runs/project-*/<runId>/journal*`, with the last `workflow_check` attempts as a cross-check. A level barrier shows up as `cStartAfterBFinishMs ≈ 0`.
+- `<run>-<scenario>/events.jsonl`: raw pi events, each with `t`.
+- `<run>-<scenario>/command.json`: the exact argv.
+- `<run>-<scenario>/stderr.txt`.
+- `<run>-<scenario>/proj/`.
 
-Gate latency is not exposed by snapshots. Estimate it from `jev-probe.ts` and from the gated-vs-ungated difference in `spawnToWaitEndMs`.
+The parent's `wallMs` in `workflow` includes however long the parent chooses to sleep between checks. Use `runWallMs` and the task offsets for scheduler speed.
 
 ## Cleanup
 
-Nothing long-lived is started. The scratch projects sit inside the evidence dir, so keep them as proof and delete the whole timestamped dir when you no longer need it. If a run was killed, check `pgrep -fl "extensions/subagents/index.ts"` and kill only PIDs whose cwd is under the evidence dir.
+Nothing long-lived is started. Workflow runs leave journals under `~/.pi/agent/workflows/runs/project-<hash of scratch dir>/`. They are harmless; delete those dirs together with the evidence dir if you want. If a run was killed, check `pgrep -fl "extensions/subagents/index.ts"` and kill only PIDs whose cwd is under the evidence dir.
 
 ## Features
 
@@ -65,21 +89,10 @@ See [features/README.md](features/README.md).
 
 ## Findings log
 
-- 2026-09-27 baseline, `openai-codex/gpt-6-luna` for both parent and child:
-  - Jev p50 was 130 ms and max 168 ms, against the 1000 ms global `jev.timeoutMs`.
-  - Wall time per scenario was 12–19 s. Parent LLM turns took about 4–9 s before the spawn and 4–7 s after the wait. The child plus gate took 3–8 s. The gate is under 3% of wall time, so speed work belongs in parent turn count and model latency, not Jev.
-- 2026-09-27 defect found and fixed:
-  - The standalone gate envelope sent only `{taskGoal, report}`. Jev therefore rejected correct reports on process questions like "based on actually reading the file", 4 of 4 times, and gave coin-flip confidence (~0.5) on loose questions.
-  - `standalone-gate.ts` now adds up to 24 recent `operations` (tool, args, ok, output preview ≤400 chars; oldest dropped first to stay within 24 KiB).
-  - After the fix: 3 of 3 pass, 1 of 1 reject.
-- Workflow gates had the same gap. They now share `src/gate-evidence.ts` with standalone gates, and a unit test (`execution.test.ts`) covers them, but no live workflow drive exists yet.
-- A `-ne` harness artifact adds about 1 s between the spawn tool result and the next parent turn: the first child compiles 20 global extensions and 54 skills (`DefaultResourceLoader.reload`), and later children take about 15 ms. This is not product latency in a normal session where the parent already loaded those modules.
-- Per-turn breakdown (2026-09-27, luna):
-  - Each parent LLM turn takes 1.5–8 s. The first turn carries about 9.5k uncached prompt tokens, and later turns hit the cache.
-  - A child usually finishes while the parent is still composing its `subagent_wait` call, so wait returns in about 1 ms.
-  - The main lever is the number of parent turns.
-- 2026-09-27 speed changes:
-  - `subagent_spawn` accepts `wait: true`. Live `wait` runs took 2 parent turns, against 4 for spawn→wait→inspect (wall time 15.8 s vs 16.3 s in one run, where the variance comes from the model's turns).
-  - Routing supports `approval: "auto"`: a spawn whose effective runtime equals the saved route starts without a proposal. Overrides still propose. A project overlay may only restrict it.
-  - Global routes: `lint` effort lowered to `low`, `small_slice` to `medium`.
-  - Full drive (wait, pass, reject, ungated) all PASS.
+- 2026-09-27 (historical: Jev gates, `jev-probe.ts`, and the gated scenarios were removed with the product's Jev/gate feature): Jev p50 was 130 ms, under 3% of wall time. The gate envelope bug (missing `operations`) was fixed before the removal.
+- A `-ne` harness artifact adds about 1 s between the spawn tool result and the next parent turn: the first child compiles the global extensions and skills (`DefaultResourceLoader.reload`), and later children take about 15 ms.
+- Per-turn breakdown (2026-09-27): each parent LLM turn takes 1.5–8 s. A child usually finishes while the parent is still composing its wait call. The main lever is the number of parent turns. `subagent_spawn` `wait: true` cuts spawn→wait→inspect from 4 turns to 2.
+- 2026-10-01 baseline (`ef43a6f`):
+  - With `opencode-go/deepseek-v4.1-flash` as the parent, every request returns `400` while the extension is loaded. The cause is the top-level `Type.Union` parameter schemas of `workflow` and `workflow_control`.
+  - Opus once sent a mis-shaped first `workflow` call against the same union and recovered on retry.
+  - The workflow level barrier is visible: C (needs A only) is queued within ~15 ms of B finishing, not A.
