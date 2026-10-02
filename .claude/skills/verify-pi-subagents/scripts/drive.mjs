@@ -62,11 +62,13 @@ const WORKFLOW_SOURCE = [
 ].join("\n");
 
 const SCENARIOS = {
-  single: { messages: [single("")] },
-  wait: { messages: [single(" Do this in as few tool calls as possible.")] },
-  parallel4: { parallel: 4, messages: [parallel(4)] },
-  parallel6: { parallel: 6, messages: [parallel(6)] },
+  // floorMs: unavoidable child sleep on the critical path; overhead = wall - floor.
+  single: { floorMs: 0, messages: [single("")] },
+  wait: { floorMs: 0, messages: [single(" Do this in as few tool calls as possible.")] },
+  parallel4: { floorMs: 8000, parallel: 4, messages: [parallel(4)] },
+  parallel6: { floorMs: 8000, parallel: 6, messages: [parallel(6)] },
   workflow: {
+    floorMs: 25000,
     workflow: true,
     messages: [
       `Prepare a workflow draft with the workflow tool. Use the preview "Barrier probe: A and B are independent; C needs A only." and exactly this source:\n\n${WORKFLOW_SOURCE}\n\nDo not approve it in this response.`,
@@ -346,7 +348,15 @@ await Promise.all(
   }),
 );
 summaries.sort((a, b) => a.run - b.run || names.indexOf(a.scenario) - names.indexOf(b.scenario));
+for (const r of summaries) r.overheadMs = r.ok ? r.wallMs - (SCENARIOS[r.scenario].floorMs ?? 0) : undefined;
+// Hillclimb metric: per run, the sum of overhead across the scenarios in this invocation.
+const suite = [];
+for (let run = 1; run <= RUNS; run++) {
+  const rows = summaries.filter((r) => r.run === run);
+  suite.push({ run, ok: rows.every((r) => r.ok), overheadMs: rows.reduce((a, r) => a + (r.overheadMs ?? 0), 0) });
+}
 fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summaries, null, 2));
+fs.writeFileSync(path.join(OUT, "suite.json"), JSON.stringify({ scenarios: names, suite }, null, 2));
 
 const s = (ms) => (ms === undefined ? "-" : (ms / 1000).toFixed(1));
 console.log(`parent=${PARENT} child=${CHILD} ext=${EXT}${HIDE_TOOLS ? ` hide=${HIDE_TOOLS}` : ""}`);
@@ -365,5 +375,11 @@ for (const r of summaries) {
     `${r.ok ? "PASS" : "FAIL"} ${r.scenario.padEnd(10)} ${String(r.run).padEnd(4)} ${s(r.wallMs).padStart(6)} ${String(r.parentTurns ?? "-").padStart(5)} ${String(r.toolCallsTotal ?? "-").padStart(5)} ${tok.padEnd(13)} ${s(r.firstResultMs).padStart(7)} ${s(r.lastResultMs).padStart(6)}  ${extra}`,
   );
 }
+for (const n of names) {
+  const o = summaries.filter((r) => r.scenario === n && r.overheadMs !== undefined).map((r) => r.overheadMs);
+  if (o.length) console.log(`overhead ${n.padEnd(10)} mean=${s(o.reduce((a, b) => a + b, 0) / o.length)}s min=${s(Math.min(...o))} max=${s(Math.max(...o))} n=${o.length}`);
+}
+const so = suite.filter((x) => x.ok).map((x) => x.overheadMs);
+console.log(`SUITE overhead per run: ${suite.map((x) => `${s(x.overheadMs)}${x.ok ? "" : "(FAIL)"}`).join(" ")}  mean=${so.length ? s(so.reduce((a, b) => a + b, 0) / so.length) : "-"}s`);
 console.log(`evidence: ${OUT}`);
 process.exit(summaries.every((r) => r.ok) ? 0 : 1);

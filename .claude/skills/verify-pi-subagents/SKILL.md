@@ -62,6 +62,12 @@ node .claude/skills/verify-pi-subagents/scripts/compare.mjs <baselineDir> <after
 
 Either argument can be a single drive output or a `VERIFY_OUT` dir that holds several timestamped drives. For each parent model and scenario, compare.mjs takes the median over passing records (or over all records if none passed) and prints before, after, the delta, and the % change. Records run with `HIDE_TOOLS` are grouped separately.
 
+### Overhead metric
+
+drive.mjs also prints per-scenario `overhead` (wall minus the sleep on the critical path: 0, 0, 8, 8, 25 s) and a `SUITE` line, and writes `suite.json`. For hillclimbing, score the **sum of per-scenario medians** over `RUNS>=3`. One provider stall can add 100 s to a single run.
+
+Provider latency drifts by more than most effects between sequential drives. Run control and candidate **concurrently** (two drive.mjs processes with different `EXT` and `VERIFY_OUT`) and compare only within a pair. When a change touches one path, drive just that scenario with more runs.
+
 ## Evidence
 
 Evidence lives at `${VERIFY_OUT:-$TMPDIR/verify-pi-subagents}/<ISO-timestamp>/`, and the path is printed as the last line, after a compact table. It holds:
@@ -77,7 +83,7 @@ Evidence lives at `${VERIFY_OUT:-$TMPDIR/verify-pi-subagents}/<ISO-timestamp>/`,
 - `<run>-<scenario>/stderr.txt`.
 - `<run>-<scenario>/proj/`.
 
-The parent's `wallMs` in `workflow` includes however long the parent chooses to sleep between checks. Use `runWallMs` and the task offsets for scheduler speed.
+The parent's `wallMs` in `workflow` includes how the parent waits. Since `workflow_check` gained `wait: true`, parents normally make one blocking check (`checkCalls=1`). Older builds show `bash` sleep polls. Use `runWallMs` and the task offsets for scheduler speed.
 
 ## Cleanup
 
@@ -96,3 +102,8 @@ See [features/README.md](features/README.md).
   - With `opencode-go/deepseek-v4.1-flash` as the parent, every request returns `400` while the extension is loaded. The cause is the top-level `Type.Union` parameter schemas of `workflow` and `workflow_control`.
   - Opus once sent a mis-shaped first `workflow` call against the same union and recovered on retry.
   - The workflow level barrier is visible: C (needs A only) is queued within ~15 ms of B finishing, not A.
+- 2026-10-02 hillclimb (paired, RUNS=3, overhead = wall − sleep floor):
+  - Child spawn→session is ~0.45 s and result delivery is immediate. A child costs its two model turns on ~15–22k tokens of context, because children load the user's full extensions, skills, and AGENTS.md.
+  - parallel6 trails parallel4 because of provider tail latency. One child of six often takes 5–9 s for a 3-token turn.
+  - Parent extra `bash` calls (`mkdir`/`ls .marks`) are the model checking side effects named in the workload prompt. They are not extension behavior.
+  - The remaining workflow cost is turns: prepare (~4 s), the mandated preview text (5–7 s), approve (~2.5 s), check (~2.5 s), and the final report (~5 s).
