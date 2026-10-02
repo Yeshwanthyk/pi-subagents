@@ -5,9 +5,11 @@
  * single Effect service interface.
  *
  * Tools (for the parent LLM):
- * - subagent_spawn: fire-and-forget spawn (prompt, title, agent, working_dir,
- *   model, reasoning_effort). Max 4 running at once across all backends.
- * - subagent_wait: block until the listed parent-owned subagents settle, return results.
+ * - subagent_spawn: fire-and-forget spawn of one task or a `tasks` batch
+ *   (prompt, name, harness, working_dir, model, reasoning_effort). At most
+ *   `maxRunning` (settings, default 6) run at once across all backends.
+ * - subagent_wait: block until all (or, with mode "any", one) of the listed
+ *   parent-owned subagents settle, return results.
  * - subagent_cancel: stop one or more queued/running parent-owned subagents.
  * - subagent_send: send another instruction to one parent-owned subagent.
  * - subagent_inspect: peek at a parent-owned subagent's status and recent activity.
@@ -25,7 +27,6 @@
  * `codex app-server` process.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
@@ -41,11 +42,12 @@ import {
   ProjectTrustStore,
 } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
-import { Type, type Static } from "typebox";
+import { Type } from "typebox";
 import {
   BACKEND_NAMES,
   formatElapsed,
   isSubagentPending,
+  MAX_RUNNING_LIMITS,
   REASONING_EFFORTS,
   type ParentQuestion,
   type ParentRef,
@@ -75,14 +77,19 @@ import {
   SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS,
   SUBAGENT_SPAWN_PROMPT_GUIDELINES,
   SUBAGENT_SPAWN_PROMPT_SNIPPET,
-  SUBAGENT_SPAWN_TOOL_DESCRIPTION,
+  subagentSpawnToolDescription,
   SUBAGENT_WAIT_PARAMETER_DESCRIPTIONS,
   SUBAGENT_WAIT_TOOL_DESCRIPTION,
 } from "./src/prompt.ts";
 import { registerSubagentParentTools } from "./src/parent-tools.ts";
 import { createParentResultCoordinator } from "./src/parent-coordinator.ts";
 import type { ParentResultEnvelope } from "./src/parent-mailbox.ts";
-import { buildSubagentWaitResult } from "./src/result-delivery.ts";
+import {
+  buildSubagentWaitResult,
+  formatWaitRemainder,
+  partitionWaitResult,
+  type WaitMode,
+} from "./src/result-delivery.ts";
 import {
   buildParentQuestionBatchMessage,
   buildParentResultBatchMessage,
@@ -109,7 +116,6 @@ import {
   applyWorkflowControl,
   staticWorkflowDefinitionPreparer,
   WorkflowToolLifecycle,
-  type WorkflowControlRequest,
 } from "./src/workflows/tools.ts";
 import { WorkflowControls } from "./src/workflows/controls.ts";
 import { showWorkflowDraftReview } from "./src/workflows/draft-review.ts";
@@ -121,24 +127,35 @@ import {
 import {
   WORKFLOW_CHECK_TOOL_DESCRIPTION,
   WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS,
-  WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS,
   WORKFLOW_CONTROL_TOOL_DESCRIPTION,
   WORKFLOW_LIST_TOOL_DESCRIPTION,
-  WORKFLOW_PARAMETER_DESCRIPTIONS,
   WORKFLOW_PROMPT_GUIDELINES,
   WORKFLOW_PROMPT_SNIPPET,
   WORKFLOW_TOOL_DESCRIPTION,
 } from "./src/workflows/prompt.ts";
 import { openSubagentPicker } from "./src/ui/takeover.ts";
-import { createJevClient, type JevClient } from "./src/jev/client.ts";
-import { hasJevCredential } from "./src/jev/credentials.ts";
-import type { JevEvaluator } from "./src/jev/domain.ts";
 import { loadSubagentSettings } from "./src/routing/settings.ts";
-import {
-  createAskJevTool,
-  createJevWorkflowEvaluator,
-} from "./src/integration/jev.ts";
 import { registerSubagentsSettingsCommand } from "./src/integration/settings-command.ts";
+import {
+  admitBatch,
+  batchOutcomes,
+  formatBatchSpawnResult,
+  MAX_SPAWN_BATCH,
+  normalizeSpawnRequest,
+  resolveWorkingDir,
+  SPAWN_BATCH_TASK_PARAMETERS,
+  taskLabel,
+  type BatchSpawnOutcome,
+  type SpawnedTask,
+} from "./src/integration/spawn-batch.ts";
+import {
+  parseWorkflowControlRequest,
+  parseWorkflowToolRequest,
+  WORKFLOW_CONTROL_TOOL_PARAMS,
+  WORKFLOW_TOOL_PARAMS,
+  type WorkflowControlToolParams,
+  type WorkflowToolParams,
+} from "./src/integration/workflow-params.ts";
 import {
   ROUTING_CLASSIFICATION_PARAMETERS,
   ROUTED_SPAWN_TASK_PARAMETERS,
@@ -150,10 +167,6 @@ import type {
   ConcreteRuntimeSelection,
   ModelLookup,
 } from "./src/routing/domain.ts";
-import {
-  createStandaloneJevAcceptance,
-  STANDALONE_GATE_PARAMETERS,
-} from "./src/integration/standalone-gate.ts";
 import { createWorkflowRoutingPreparer } from "./src/integration/workflow-routing.ts";
 import {
   formatWorkflowList,
@@ -185,6 +198,7 @@ import {
   renderSubagentWaitSummary,
 } from "./src/ui/activity-card.ts";
 
+const WAIT_MODES = ["all", "any"] as const;
 const HEADLESS_LABEL_MAX_LENGTH = 80;
 const HEADLESS_OUTPUT_MAX_LENGTH = 2_000;
 const HEADLESS_NOTIFY_MAX_LENGTH = 300;
@@ -204,90 +218,6 @@ const PLAIN_THEME = {
   fg: (_color: string, text: string) => text,
   bold: (text: string) => text,
 } as Theme;
-
-const WORKFLOW_TOOL_PARAMS = Type.Union([
-  Type.Object({
-    preview: Type.String({
-      description: WORKFLOW_PARAMETER_DESCRIPTIONS.preview,
-    }),
-    source: Type.String({
-      description: WORKFLOW_PARAMETER_DESCRIPTIONS.source,
-    }),
-    args: Type.Optional(
-      Type.String({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.args }),
-    ),
-    background: Type.Optional(
-      Type.Boolean({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.background }),
-    ),
-  }),
-  Type.Object({
-    preview: Type.String({
-      description: WORKFLOW_PARAMETER_DESCRIPTIONS.preview,
-    }),
-    spec: Type.Any({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.spec }),
-    args: Type.Optional(
-      Type.String({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.args }),
-    ),
-    background: Type.Optional(
-      Type.Boolean({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.background }),
-    ),
-  }),
-  Type.Object({
-    preview: Type.String({
-      description: WORKFLOW_PARAMETER_DESCRIPTIONS.preview,
-    }),
-    savedWorkflow: Type.String({
-      description: WORKFLOW_PARAMETER_DESCRIPTIONS.savedWorkflow,
-    }),
-    args: Type.Optional(
-      Type.String({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.args }),
-    ),
-    background: Type.Optional(
-      Type.Boolean({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.background }),
-    ),
-  }),
-  Type.Object({
-    draftId: Type.String({
-      description: WORKFLOW_PARAMETER_DESCRIPTIONS.draftId,
-    }),
-  }),
-]);
-type WorkflowToolParams = Static<typeof WORKFLOW_TOOL_PARAMS>;
-const WORKFLOW_CONTROL_TOOL_PARAMS = Type.Union([
-  Type.Object({
-    action: Type.Union(
-      [Type.Literal("pause"), Type.Literal("resume"), Type.Literal("cancel")],
-      {
-        description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.action,
-      },
-    ),
-    runId: Type.String({
-      description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.runId,
-    }),
-    reason: Type.Optional(
-      Type.String({
-        description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.reason,
-      }),
-    ),
-  }),
-  Type.Object({
-    action: Type.Union([Type.Literal("retry"), Type.Literal("skip")], {
-      description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.action,
-    }),
-    runId: Type.String({
-      description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.runId,
-    }),
-    taskId: Type.String({
-      description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.taskId,
-    }),
-    reason: Type.Optional(
-      Type.String({
-        description: WORKFLOW_CONTROL_PARAMETER_DESCRIPTIONS.reason,
-      }),
-    ),
-  }),
-]);
-type WorkflowControlToolParams = Static<typeof WORKFLOW_CONTROL_TOOL_PARAMS>;
 
 export interface HeadlessSubagentsUI {
   select(title: string, options: string[]): Promise<string | undefined>;
@@ -450,16 +380,13 @@ export async function runHeadlessSubagentsDialog(
 }
 
 function describeSubagent(snap: SubagentSnapshot) {
-  const acceptance = snap.acceptance
-    ? `, acceptance:${snap.acceptance.status}`
-    : "";
   const details = [
     `${snap.backend}: ${snap.meta.modelLabel ?? "?"}`,
     formatContextUtilization(snap.usage),
     formatElapsed(snap),
     snap.cwd,
   ].filter(Boolean);
-  return `${snap.id} [${snap.status}${acceptance}] "${snap.title}" (${details.join(", ")})`;
+  return `${snap.id} [${snap.status}] "${snap.title}" (${details.join(", ")})`;
 }
 
 /**
@@ -509,16 +436,42 @@ export default function (pi: ExtensionAPI) {
   let workflowControls: WorkflowControls | undefined;
   let workflowLifecycle: WorkflowToolLifecycle | undefined;
   const standaloneRouting = new StandaloneRoutingController();
-  // One client (and therefore one aggregate admission queue) is pinned to each
-  // session. Config changes fail closed until reload; credential availability
-  // is checked by the client for every explicit evaluation.
-  let jevClient: JevClient | undefined;
-  let jevConfigIdentity: string | undefined;
   const workflowParentRefs = new Map<string, ParentRef>();
   let publishWorkflowResult:
     ((run: WorkflowReadModel, parentRef: ParentRef) => void) | undefined;
 
-  const getRuntime = () => (runtime ??= createSubagentRuntime());
+  /** Cap advertised by the registered subagent_spawn description. */
+  let registeredSpawnCap: number = MAX_RUNNING_LIMITS.default;
+  /** Cap read for the current session; a runtime keeps the cap it was created with. */
+  let sessionMaxRunning: number | undefined;
+  let runtimeMaxRunning: number | undefined;
+
+  /** Effective maxRunning from settings; invalid settings fall back to the default with a warning. */
+  const readMaxRunning = (ctx: ExtensionContext | undefined): number => {
+    try {
+      return loadSubagentSettings({
+        cwd: ctx?.cwd ?? process.cwd(),
+        projectTrusted: ctx?.isProjectTrusted() ?? false,
+      }).settings.maxRunning;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (ctx?.hasUI) {
+        ctx.ui.notify(
+          `Subagent settings are invalid; using maxRunning ${MAX_RUNNING_LIMITS.default}: ${message.slice(0, 256)}`,
+          "warning",
+        );
+      }
+      return MAX_RUNNING_LIMITS.default;
+    }
+  };
+
+  const getRuntime = () => {
+    if (!runtime) {
+      runtimeMaxRunning = sessionMaxRunning ?? readMaxRunning(sessionContext);
+      runtime = createSubagentRuntime({ maxRunning: runtimeMaxRunning });
+    }
+    return runtime;
+  };
 
   /** Resolve one manager per session epoch; stale completions cannot install hooks. */
   const getManager = () => {
@@ -581,9 +534,6 @@ export default function (pi: ExtensionAPI) {
               return {
                 settings,
                 lookupModel: lookupRoutedModel(ctx),
-                jevCredentialPresent: hasJevCredential({
-                  apiKeyEnv: settings.settings.jev.apiKeyEnv,
-                }),
               };
             },
           ),
@@ -604,22 +554,8 @@ export default function (pi: ExtensionAPI) {
     manager: SubagentManagerApi,
   ): WorkflowExecutionOptions => {
     const parentRef = captureParentRef(sessionEpoch, ctx.sessionManager);
-    const jev = loadSubagentSettings({
-      cwd: ctx.cwd,
-      projectTrusted: ctx.isProjectTrusted(),
-    }).settings.jev;
     return {
       subagents: manager,
-      evaluator: createJevWorkflowEvaluator(
-        getJevEvaluator(ctx.cwd, ctx.isProjectTrusted()),
-      ),
-      evaluationPolicy: {
-        provider: "jev",
-        apiKeyEnv: jev.apiKeyEnv,
-        model: jev.model,
-        timeoutMs: jev.timeoutMs,
-        maxConcurrent: jev.maxConcurrent,
-      },
       cwd: ctx.cwd,
       parentRef,
       onTerminal: (run) => {
@@ -887,23 +823,21 @@ export default function (pi: ExtensionAPI) {
     sessionEpoch += 1;
     workflowParentRefs.clear();
     standaloneRouting.clear();
-    jevClient = undefined;
-    jevConfigIdentity = undefined;
-    try {
-      jevConfigIdentity = JSON.stringify(
-        loadSubagentSettings({
-          cwd: ctx.cwd,
-          projectTrusted: ctx.isProjectTrusted(),
-        }).settings.jev,
-      );
-    } catch {
-      jevConfigIdentity = "invalid-at-session-start";
-    }
     sessionClosed = false;
     parentResults.startSession(ctx, sessionEpoch);
     browserUI?.setWidget(BROWSER_ACTIVITY_WIDGET_KEY, undefined);
     sessionContext = ctx;
     ui = ctx.hasUI ? ctx.ui : undefined;
+    sessionMaxRunning = readMaxRunning(ctx);
+    // Tool descriptions are static per registration; re-register so the model
+    // sees the cap this session's runtime enforces.
+    const effectiveCap = runtime
+      ? (runtimeMaxRunning ?? sessionMaxRunning)
+      : sessionMaxRunning;
+    if (effectiveCap !== registeredSpawnCap) {
+      registeredSpawnCap = effectiveCap;
+      registerSpawnTool(effectiveCap);
+    }
     browserUI = ctx.mode === "rpc" && ctx.hasUI ? ctx.ui : undefined;
     browserRevision = 0;
     const startEpoch = sessionEpoch;
@@ -968,10 +902,10 @@ export default function (pi: ExtensionAPI) {
     workflowControls = undefined;
     workflowParentRefs.clear();
     standaloneRouting.clear();
-    jevClient = undefined;
     const closing = runtime;
-    jevConfigIdentity = undefined;
     runtime = undefined;
+    runtimeMaxRunning = undefined;
+    sessionMaxRunning = undefined;
     managerInitialization = undefined;
     // Seal workflow state and propagate cancellation while the shared
     // SubagentManager runtime is still alive, then dispose child scopes.
@@ -1004,9 +938,10 @@ export default function (pi: ExtensionAPI) {
         cwd: ctx.cwd,
         userInput: userInputRevision,
       };
-      if ("draftId" in params) {
+      const parsed = parseWorkflowToolRequest(params);
+      if (parsed.kind === "approve") {
         const execution = workflowExecutionFor(ctx, manager);
-        const approved = lifecycle.approve(params.draftId, context, execution);
+        const approved = lifecycle.approve(parsed.draftId, context, execution);
         if (execution.parentRef) {
           workflowParentRefs.set(approved.run.id, execution.parentRef);
         }
@@ -1022,27 +957,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const request =
-        "source" in params
-          ? {
-              preview: params.preview,
-              source: params.source,
-              args: params.args,
-              background: params.background,
-            }
-          : "savedWorkflow" in params
-            ? {
-                preview: params.preview,
-                savedWorkflow: params.savedWorkflow,
-                args: params.args,
-                background: params.background,
-              }
-            : {
-                preview: params.preview,
-                spec: params.spec,
-                args: params.args,
-                background: params.background,
-              };
+      const { kind: _kind, ...request } = parsed;
       const prepared = lifecycle.prepare(request, context);
       return {
         content: [{ type: "text", text: prepared.message }],
@@ -1121,19 +1036,16 @@ export default function (pi: ExtensionAPI) {
       const manager = await getManager();
       const controls = workflowControls;
       if (!controls) throw new Error("Workflow controls are not initialized.");
-      // SAFETY: TypeBox validates the discriminated control union before the
-      // handler runs; this restores the corresponding domain request type.
-      const state = await applyWorkflowControl(
-        controls,
-        params as WorkflowControlRequest,
-      );
+      const request = parseWorkflowControlRequest(params);
+      const state = await applyWorkflowControl(controls, request);
       scheduleObservability(manager);
       const projection = projectWorkflowRun(state, manager.view.list());
-      const taskSuffix = "taskId" in params ? ` task ${params.taskId}` : "";
+      const taskId = "taskId" in request ? request.taskId : undefined;
+      const taskSuffix = taskId === undefined ? "" : ` task ${taskId}`;
       const details = {
-        action: params.action,
+        action: request.action,
         runId: state.id,
-        taskId: "taskId" in params ? params.taskId : undefined,
+        taskId,
         status: state.status,
         version: state.version,
         projection,
@@ -1343,9 +1255,13 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  const lookupRoutedModel =
-    (ctx: ExtensionContext): ModelLookup =>
-    (requested) => {
+  /**
+   * Build one model lookup per prepare/batch call. The registry listing is
+   * read at most once per lookup instance, not once per routed task.
+   */
+  const lookupRoutedModel = (ctx: ExtensionContext): ModelLookup => {
+    let allModels: ReturnType<typeof ctx.modelRegistry.getAll> | undefined;
+    return (requested) => {
       if (requested.harness === "codex") {
         return { available: true, effective: requested };
       }
@@ -1360,9 +1276,8 @@ export default function (pi: ExtensionAPI) {
               reason: `Unknown pi model "${requested.model}"`,
             };
       }
-      const matches = ctx.modelRegistry
-        .getAll()
-        .filter((model) => model.id === requested.model);
+      allModels ??= ctx.modelRegistry.getAll();
+      const matches = allModels.filter((model) => model.id === requested.model);
       if (matches.length !== 1) {
         return {
           available: false,
@@ -1380,6 +1295,7 @@ export default function (pi: ExtensionAPI) {
         },
       };
     };
+  };
 
   const admitStandalone = async (
     task: Omit<BoundRoutedSpawnTask, "classification"> & {
@@ -1393,10 +1309,8 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
   ) => {
     const manager = await getManager();
+    // Callers validate working_dir once (resolveWorkingDir) before admission.
     const cwd = path.resolve(task.cwd);
-    if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
-      throw new Error(`working_dir is not a directory: ${cwd}`);
-    }
     const parentRef = captureParentRef(sessionEpoch, ctx.sessionManager);
     const title = task.name.trim().slice(0, 160) || "subagent";
     const snap = await runTool(
@@ -1407,12 +1321,6 @@ export default function (pi: ExtensionAPI) {
         cwd,
         model: runtimeSelection.model,
         reasoningEffort: runtimeSelection.effort,
-        acceptance: task.gate
-          ? createStandaloneJevAcceptance(
-              task.gate,
-              getJevEvaluator(ctx.cwd, ctx.isProjectTrusted()),
-            )
-          : undefined,
         parentRef,
         parent: {
           parentCwd: ctx.cwd,
@@ -1432,52 +1340,6 @@ export default function (pi: ExtensionAPI) {
     return { snap, cwd, title };
   };
 
-  const unavailableJevEvaluator = (message: string): JevEvaluator => ({
-    async evaluate() {
-      return {
-        ok: false,
-        error: { code: "not_configured", message },
-      };
-    },
-  });
-
-  const resolveJevDelegate = (
-    cwd: string,
-    projectTrusted: boolean,
-  ): JevEvaluator => {
-    const config = loadSubagentSettings({ cwd, projectTrusted }).settings.jev;
-    const identity = JSON.stringify(config);
-    if (jevConfigIdentity !== undefined && jevConfigIdentity !== identity) {
-      return unavailableJevEvaluator(
-        "Jev configuration changed during this session; reload before evaluating",
-      );
-    }
-    if (!jevClient) {
-      jevClient = createJevClient({
-        apiKeyEnv: config.apiKeyEnv,
-        model: config.model,
-        timeoutMs: config.timeoutMs,
-        maxConcurrent: config.maxConcurrent,
-      });
-    }
-    return jevClient;
-  };
-
-  const getJevEvaluator = (
-    cwd: string,
-    projectTrusted: boolean,
-  ): JevEvaluator => ({
-    evaluate(input, options) {
-      return resolveJevDelegate(cwd, projectTrusted).evaluate(input, options);
-    },
-  });
-
-  pi.registerTool(
-    createAskJevTool({
-      getEvaluator: ({ cwd, projectTrusted }) =>
-        getJevEvaluator(cwd, projectTrusted),
-    }),
-  );
   // --- Tools -------------------------------------------------------------
 
   interface WaitProgressDetails {
@@ -1495,6 +1357,7 @@ export default function (pi: ExtensionAPI) {
     requestedIds: ReadonlyArray<string>,
     signal: AbortSignal | undefined,
     onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+    mode: WaitMode = "all",
   ) => {
     const manager = await getManager();
     const ids = [...new Set(requestedIds)];
@@ -1510,45 +1373,83 @@ export default function (pi: ExtensionAPI) {
     const waitOwners = ids
       .map((id) => standardSnapshot(manager, id))
       .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
+    const delivered = (id: string) => {
+      const parentRef = waitOwners.find((owner) => owner.id === id)?.parentRef;
+      return (
+        parentRef !== undefined && parentResults.wasDelivered(id, parentRef)
+      );
+    };
     let lastWaitUpdate = 0;
     const waitResult = await runTool(
       getRuntime(),
-      manager.waitForParent!(ids, (pending) => {
-        const now = Date.now();
-        if (now - lastWaitUpdate < 100) return;
-        lastWaitUpdate = now;
-        const snapshots = ids
-          .map((id) => standardSnapshot(manager, id))
-          .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
-        onUpdate?.({
-          content: [
-            {
-              type: "text",
-              text: renderSubagentWaitSummary(
-                snapshots,
-                ui?.theme ?? PLAIN_THEME,
-              ),
-            },
-          ],
-          details: {
-            pending,
-            activity: snapshots.map((snapshot) => ({
-              id: snapshot.id,
-              status: snapshot.status,
-              lastActivityAt: snapshot.lastActivityAt,
-              currentTool: snapshot.liveTools[0]?.name,
-            })),
-          } satisfies WaitProgressDetails,
-        });
-      }),
+      manager.waitForParent!(
+        ids,
+        (pending) => {
+          const now = Date.now();
+          if (now - lastWaitUpdate < 100) return;
+          lastWaitUpdate = now;
+          const snapshots = ids
+            .map((id) => standardSnapshot(manager, id))
+            .filter((snapshot): snapshot is SubagentSnapshot => !!snapshot);
+          onUpdate?.({
+            content: [
+              {
+                type: "text",
+                text: renderSubagentWaitSummary(
+                  snapshots,
+                  ui?.theme ?? PLAIN_THEME,
+                ),
+              },
+            ],
+            details: {
+              pending,
+              activity: snapshots.map((snapshot) => ({
+                id: snapshot.id,
+                status: snapshot.status,
+                lastActivityAt: snapshot.lastActivityAt,
+                currentTool: snapshot.liveTools[0]?.name,
+              })),
+            } satisfies WaitProgressDetails,
+          });
+        },
+        { mode, alreadyDelivered: delivered },
+      ),
       { signal, interruptMessage: "Wait aborted. Subagents keep running." },
     );
 
-    // A question returns while its child remains running. Consume only
-    // terminal results returned by this call.
+    // Partition synchronously after the wait returns: the parent is busy in
+    // this tool call, so automatic delivery cannot interleave before consume.
+    const partition = partitionWaitResult({
+      mode,
+      requestedIds: ids,
+      settledIds: waitResult.settledIds,
+      delivered,
+    });
+    // A question returns while its child remains running. Consume exactly the
+    // terminal results this call returns, and always return what it consumes.
     parentResults.consume(
-      waitOwners.filter((owner) => waitResult.settledIds.includes(owner.id)),
+      waitOwners.filter((owner) => partition.returned.includes(owner.id)),
     );
+    const delivery =
+      partition.returned.length === 0
+        ? undefined
+        : buildSubagentWaitResult(
+            partition.returned.map((id) => ({
+              id,
+              snapshot: standardSnapshot(manager, id),
+            })),
+          );
+    const remainder =
+      mode === "any" || waitResult.questions.length > 0
+        ? formatWaitRemainder(partition)
+        : "";
+    const waitDetails = {
+      mode,
+      pending: partition.pending,
+      ...(partition.alreadyDelivered.length === 0
+        ? {}
+        : { alreadyDelivered: partition.alreadyDelivered }),
+    };
 
     if (waitResult.questions.length > 0) {
       parentResults.consumeQuestions(waitResult.questions);
@@ -1567,20 +1468,34 @@ export default function (pi: ExtensionAPI) {
         })
         .join("\n\n");
       return {
-        content: [{ type: "text" as const, text }],
-        details: { questions },
+        content: [
+          {
+            type: "text" as const,
+            text: [text, delivery?.text, remainder]
+              .filter((part) => part !== undefined && part.length > 0)
+              .join("\n\n---\n\n"),
+          },
+        ],
+        details: {
+          questions,
+          ...(delivery ? delivery.details : {}),
+          ...waitDetails,
+        },
       };
     }
 
-    const delivery = buildSubagentWaitResult(
-      waitResult.settledIds.map((id) => ({
-        id,
-        snapshot: standardSnapshot(manager, id),
-      })),
-    );
+    const text =
+      delivery === undefined
+        ? "No new results: every listed subagent result was already delivered."
+        : delivery.text;
     return {
-      content: [{ type: "text" as const, text: delivery.text }],
-      details: delivery.details,
+      content: [
+        {
+          type: "text" as const,
+          text: remainder ? `${text}\n\n${remainder}` : text,
+        },
+      ],
+      details: { results: delivery?.details.results ?? [], ...waitDetails },
     };
   };
 
@@ -1612,16 +1527,12 @@ export default function (pi: ExtensionAPI) {
         );
       }
       const tasks: BoundRoutedSpawnTask[] = params.tasks.map((task) => {
-        const cwd = path.resolve(ctx.cwd, task.working_dir ?? ".");
-        if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
-          throw new Error(`working_dir is not a directory: ${cwd}`);
-        }
+        const cwd = resolveWorkingDir(ctx.cwd, task.working_dir);
         return {
           prompt: task.prompt,
           name: task.name,
           cwd,
           classification: task.classification,
-          ...(task.gate === undefined ? {} : { gate: task.gate }),
           ...(task.harness === undefined ? {} : { harness: task.harness }),
           ...(task.model === undefined ? {} : { model: task.model }),
           ...(task.reasoning_effort === undefined
@@ -1719,284 +1630,377 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
-    name: "subagent_spawn",
-    label: "Spawn Subagent",
-    description: SUBAGENT_SPAWN_TOOL_DESCRIPTION,
-    promptSnippet: SUBAGENT_SPAWN_PROMPT_SNIPPET,
-    promptGuidelines: SUBAGENT_SPAWN_PROMPT_GUIDELINES,
-    parameters: Type.Object({
-      prompt: Type.String({
-        description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.prompt,
-      }),
-      name: Type.String({
-        description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.name,
-      }),
-      classification: Type.Optional(ROUTING_CLASSIFICATION_PARAMETERS),
-      gate: Type.Optional(STANDALONE_GATE_PARAMETERS),
-      wait: Type.Optional(
-        Type.Boolean({
-          description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.wait,
-        }),
-      ),
-      harness: Type.Optional(
-        StringEnum(BACKEND_NAMES, {
-          description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.harness,
-        }),
-      ),
-      working_dir: Type.Optional(
-        Type.String({
-          description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.workingDir,
-        }),
-      ),
-      model: Type.Optional(
-        Type.String({
-          description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.model,
-        }),
-      ),
-      reasoning_effort: Type.Optional(
-        StringEnum(REASONING_EFFORTS, {
-          description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.reasoningEffort,
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      // Spawn and collect in one tool call, saving a parent turn when the next step needs the result.
-      const deliver = async <Details extends { readonly id: string }>(spawned: {
-        content: [{ type: "text"; text: string }];
-        details: Details;
-      }) => {
-        if (!params.wait) return spawned;
-        const waited = await collectChildren(
-          [spawned.details.id],
-          signal,
-          onUpdate,
-        );
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Spawned subagent ${spawned.details.id} and waited for it.\n\n${waited.content[0].text}`,
-            },
-          ],
-          details: { ...spawned.details, wait: waited.details },
+  /** subagent_spawn admission output before any requested wait. */
+  interface SpawnToolResult {
+    readonly content: [{ type: "text"; text: string }];
+    readonly details:
+      | SpawnedTask
+      | {
+          readonly kind: "batch_spawn";
+          readonly ids: ReadonlyArray<string>;
+          readonly results: ReadonlyArray<BatchSpawnOutcome>;
         };
-      };
-      const cwd = path.resolve(ctx.cwd, params.working_dir ?? ".");
-      if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
-        throw new Error(`working_dir is not a directory: ${cwd}`);
-      }
-      const settings = loadSubagentSettings({
-        cwd: ctx.cwd,
-        projectTrusted: ctx.isProjectTrusted(),
-      });
-      if (settings.settings.routing.enabled) {
-        if (!params.classification) {
+  }
+
+  /** Register subagent_spawn with the session's effective running cap in its description. */
+  const registerSpawnTool = (maxRunning: number) =>
+    pi.registerTool({
+      name: "subagent_spawn",
+      label: "Spawn Subagent",
+      description: subagentSpawnToolDescription(maxRunning),
+      promptSnippet: SUBAGENT_SPAWN_PROMPT_SNIPPET,
+      promptGuidelines: SUBAGENT_SPAWN_PROMPT_GUIDELINES,
+      parameters: Type.Object({
+        prompt: Type.Optional(
+          Type.String({
+            description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.prompt,
+          }),
+        ),
+        name: Type.Optional(
+          Type.String({
+            description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.name,
+          }),
+        ),
+        classification: Type.Optional(ROUTING_CLASSIFICATION_PARAMETERS),
+        wait: Type.Optional(
+          Type.Boolean({
+            description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.wait,
+          }),
+        ),
+        wait_mode: Type.Optional(
+          StringEnum(WAIT_MODES, {
+            description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.waitMode,
+          }),
+        ),
+        harness: Type.Optional(
+          StringEnum(BACKEND_NAMES, {
+            description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.harness,
+          }),
+        ),
+        working_dir: Type.Optional(
+          Type.String({
+            description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.workingDir,
+          }),
+        ),
+        model: Type.Optional(
+          Type.String({
+            description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.model,
+          }),
+        ),
+        reasoning_effort: Type.Optional(
+          StringEnum(REASONING_EFFORTS, {
+            description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.reasoningEffort,
+          }),
+        ),
+        tasks: Type.Optional(
+          Type.Array(SPAWN_BATCH_TASK_PARAMETERS, {
+            minItems: 1,
+            maxItems: MAX_SPAWN_BATCH,
+            description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.tasks,
+          }),
+        ),
+      }),
+      async execute(_toolCallId, params, signal, onUpdate, ctx) {
+        const { batch, tasks } = normalizeSpawnRequest(params);
+        if (params.wait_mode !== undefined && params.wait !== true) {
           throw new Error(
-            "Classification is required while routing is enabled, including when runtime overrides are supplied. No child started.",
+            "wait_mode applies only with wait: true. No child started.",
           );
         }
-        const task: BoundRoutedSpawnTask = {
-          prompt: params.prompt,
-          name: params.name,
-          cwd,
-          classification: params.classification,
-          ...(params.gate === undefined ? {} : { gate: params.gate }),
-          ...(params.harness === undefined ? {} : { harness: params.harness }),
-          ...(params.model === undefined ? {} : { model: params.model }),
-          ...(params.reasoning_effort === undefined
-            ? {}
-            : { reasoningEffort: params.reasoning_effort }),
-        };
-        const proposal = standaloneRouting.prepare([task], {
-          sessionId: ctx.sessionManager.getSessionId(),
-          cwd: ctx.cwd,
-          userInputRevision,
-          settings,
-          lookupModel: lookupRoutedModel(ctx),
+        const waitMode: WaitMode = params.wait_mode ?? "all";
+        // Validate every task before admitting any, so input mistakes start nothing.
+        const inputErrors: string[] = [];
+        const cwds = tasks.map((task, index) => {
+          try {
+            return resolveWorkingDir(ctx.cwd, task.working_dir);
+          } catch (error) {
+            inputErrors.push(
+              `${taskLabel(task, index, batch)}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            return "";
+          }
         });
-        if (proposal.status === "pending") {
-          return {
-            content: [
-              {
-                type: "text",
-                text:
-                  `Prepared routed spawn ${proposal.id} with binding digest ${proposal.bindingDigest}; no child started. ` +
-                  `Saved preference: ${JSON.stringify(proposal.items[0]!.runtime.preference)}; requested: ${JSON.stringify(proposal.items[0]!.runtime.requested)}. ` +
-                  `Review ${proposal.items[0]!.runtime.effective.harness}/${proposal.items[0]!.runtime.effective.model}` +
-                  `${proposal.items[0]!.runtime.effective.effort ? `:${proposal.items[0]!.runtime.effective.effort}` : ""}, then after a newer user approval call subagent_approve with this id and binding digest.`,
-              },
-            ],
-            details: {
-              kind: "routing_proposal",
-              proposalId: proposal.id,
-              bindingDigest: proposal.bindingDigest,
-              status: proposal.status,
-              runtime: proposal.items[0]!.runtime,
-            },
-          };
-        }
-        const [admitted] = await standaloneRouting.approveAndAdmit(
-          {
-            proposalId: proposal.id,
-            bindingDigest: proposal.bindingDigest,
+        const noChildStarted = () =>
+          new Error(`${inputErrors.join("\n")}\nNo child started.`);
+        if (inputErrors.length > 0) throw noChildStarted();
+        const settings = loadSubagentSettings({
+          cwd: ctx.cwd,
+          projectTrusted: ctx.isProjectTrusted(),
+        });
+        const routed = settings.settings.routing.enabled;
+        tasks.forEach((task, index) => {
+          if (routed && !task.classification) {
+            inputErrors.push(
+              `${taskLabel(task, index, batch)}: classification is required while routing is enabled, including when runtime overrides are supplied`,
+            );
+          }
+          if (!routed && !task.harness) {
+            inputErrors.push(
+              `${taskLabel(task, index, batch)}: harness is required while routing is disabled`,
+            );
+          }
+        });
+        if (inputErrors.length > 0) throw noChildStarted();
+
+        let settled: ReadonlyArray<PromiseSettledResult<SpawnedTask>>;
+        if (routed) {
+          const bound: BoundRoutedSpawnTask[] = tasks.map((task, index) => ({
+            prompt: task.prompt,
+            name: task.name,
+            cwd: cwds[index]!,
+            // Checked above: routing requires a classification for every task.
+            classification: task.classification!,
+            ...(task.harness === undefined ? {} : { harness: task.harness }),
+            ...(task.model === undefined ? {} : { model: task.model }),
+            ...(task.reasoning_effort === undefined
+              ? {}
+              : { reasoningEffort: task.reasoning_effort }),
+          }));
+          // One registry snapshot serves both preparation and admission checks.
+          const lookupModel = lookupRoutedModel(ctx);
+          const routingContext = {
             sessionId: ctx.sessionManager.getSessionId(),
             cwd: ctx.cwd,
             userInputRevision,
             settings,
-            lookupModel: lookupRoutedModel(ctx),
-          },
-          async (approvedTask, runtime) => {
-            const result = await admitStandalone(approvedTask, runtime, ctx);
-            return {
-              id: result.snap.id,
-              title: result.snap.title,
-              cwd: result.cwd,
-              harness: runtime.harness,
-              model: result.snap.meta.modelLabel,
+            lookupModel,
+          };
+          const proposal = standaloneRouting.prepare(bound, routingContext);
+          if (proposal.status === "pending") {
+            const describe = (item: (typeof proposal.items)[number]) => {
+              const { effective } = item.runtime;
+              return (
+                `Saved preference: ${JSON.stringify(item.runtime.preference)}; requested: ${JSON.stringify(item.runtime.requested)}. ` +
+                `Review ${effective.harness}/${effective.model}${effective.effort ? `:${effective.effort}` : ""}`
+              );
             };
-          },
-        );
-        if (!admitted)
-          throw new Error("Routed spawn admission returned no result");
-        return deliver({
-          content: [
+            const header = batch
+              ? `Prepared routed batch spawn ${proposal.id} (${proposal.items.length} task(s)) with binding digest ${proposal.bindingDigest}; no child started.`
+              : `Prepared routed spawn ${proposal.id} with binding digest ${proposal.bindingDigest}; no child started.`;
+            const body = batch
+              ? proposal.items
+                  .map(
+                    (item, index) =>
+                      `- tasks[${index}] "${tasks[index]!.name}": ${describe(item)}`,
+                  )
+                  .join("\n")
+              : `${describe(proposal.items[0]!)}.`;
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `${header}\n${body}\nAfter a newer user approval, call subagent_approve with this id and binding digest.`,
+                },
+              ],
+              details: {
+                kind: "routing_proposal",
+                proposalId: proposal.id,
+                bindingDigest: proposal.bindingDigest,
+                status: proposal.status,
+                ...(batch
+                  ? {
+                      items: proposal.items.map((item) => ({
+                        runtime: item.runtime,
+                      })),
+                    }
+                  : { runtime: proposal.items[0]!.runtime }),
+              },
+            };
+          }
+          settled = await standaloneRouting.approveAndAdmitSettled(
             {
-              type: "text",
-              text: buildSubagentSpawnResult({
-                id: admitted.id,
-                title: admitted.title,
-                harness: admitted.harness,
-                modelLabel: admitted.model ?? "?",
-                cwd: admitted.cwd,
-              }),
+              ...routingContext,
+              proposalId: proposal.id,
+              bindingDigest: proposal.bindingDigest,
             },
-          ],
-          details: admitted,
-        });
-      }
-      if (!params.harness) {
-        throw new Error("harness is required while routing is disabled.");
-      }
-      const admitted = await admitStandalone(
-        {
-          prompt: params.prompt,
-          name: params.name,
-          cwd,
-          ...(params.gate === undefined ? {} : { gate: params.gate }),
-        },
-        {
-          harness: params.harness,
-          ...(params.model === undefined ? {} : { model: params.model }),
-          ...(params.reasoning_effort === undefined
-            ? {}
-            : { effort: params.reasoning_effort }),
-        },
-        ctx,
-      );
-      return deliver({
-        content: [
-          {
-            type: "text",
-            text: buildSubagentSpawnResult({
+            async (approvedTask, runtime) => {
+              const result = await admitStandalone(approvedTask, runtime, ctx);
+              return {
+                id: result.snap.id,
+                title: result.snap.title,
+                cwd: result.cwd,
+                harness: runtime.harness,
+                model: result.snap.meta.modelLabel,
+              };
+            },
+          );
+        } else {
+          settled = await admitBatch(tasks, async (task, index) => {
+            // Checked above: direct spawning requires a harness for every task.
+            const harness = task.harness!;
+            const admitted = await admitStandalone(
+              { prompt: task.prompt, name: task.name, cwd: cwds[index]! },
+              {
+                harness,
+                ...(task.model === undefined ? {} : { model: task.model }),
+                ...(task.reasoning_effort === undefined
+                  ? {}
+                  : { effort: task.reasoning_effort }),
+              },
+              ctx,
+            );
+            return {
               id: admitted.snap.id,
               title: admitted.snap.title,
-              harness: params.harness,
-              modelLabel: admitted.snap.meta.modelLabel ?? "?",
-              cwd,
-            }),
-          },
-        ],
-        details: {
-          id: admitted.snap.id,
-          title: admitted.snap.title,
-          cwd,
-          harness: params.harness,
-          model: admitted.snap.meta.modelLabel,
-        },
-      });
-    },
-    renderCall(args, theme, context) {
-      // SAFETY: this renderer only returns Text components for this tool row,
-      // so a previously rendered component, when present, is a Text.
-      const component =
-        (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      component.setText(
-        `${theme.fg("warning", "■")} ${theme.fg("toolTitle", theme.bold("subagent "))}` +
-          theme.fg("accent", args.name?.trim() || "starting…") +
-          theme.fg("dim", ` · ${args.harness ?? "pi"}`),
-      );
-      return component;
-    },
-    renderResult(result, { expanded }, theme, context) {
-      // SAFETY: execute always attaches id/title/cwd/harness/model details,
-      // and the renderer must tolerate restored renders without them.
-      const details = result.details as
-        | {
-            id?: string;
-            title?: string;
-            harness?: string;
-            cwd?: string;
-            proposalId?: string;
-          }
-        | undefined;
-      const id = details?.id;
-      if (!id && details?.proposalId) {
-        return new Text(
-          `${theme.fg("warning", "■")} ${theme.fg("accent", "routing proposal")} ${theme.fg("muted", details.proposalId)}\n  ${theme.fg("dim", "No child started; exact runtime awaits approval.")}`,
-          0,
-          0,
-        );
-      }
-      const snapshot = id ? renderView?.get(id) : undefined;
-
-      // Keep the in-transcript card live while the agent runs: subscribe for
-      // this id (throttled — pi backends can emit an event per token) and drop
-      // the subscription once the agent settles. Mirrors the bash tool's
-      // state.interval + context.invalidate() pattern.
-      // SAFETY: this renderer owns the per-tool-row state it persists in
-      // context.state (unsubActivity handle and lastActivityRefresh timestamp).
-      const state = context.state as
-        | { unsubActivity?: () => void; lastActivityRefresh?: number }
-        | undefined;
-      const settled = !snapshot || !isSubagentPending(snapshot.status);
-      if (state) {
-        if (settled && state.unsubActivity) {
-          state.unsubActivity();
-          state.unsubActivity = undefined;
-        } else if (!settled && !state.unsubActivity && renderView) {
-          state.unsubActivity = renderView.subscribeTo(id!, () => {
-            const now = Date.now();
-            if (now - (state.lastActivityRefresh ?? 0) >= 100) {
-              state.lastActivityRefresh = now;
-              context.invalidate();
-            }
+              cwd: admitted.cwd,
+              harness,
+              model: admitted.snap.meta.modelLabel,
+            };
           });
         }
-      }
 
-      // SAFETY: this renderer only returns Text components for this tool row,
-      // so a previously rendered component, when present, is a Text.
-      const component =
-        (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      if (snapshot) {
+        const outcomes = batchOutcomes(tasks, settled);
+        const started = outcomes.flatMap((outcome) =>
+          outcome.ok ? [outcome] : [],
+        );
+        let spawned: SpawnToolResult;
+        if (!batch) {
+          const [only] = outcomes;
+          if (!only?.ok) {
+            throw new Error(
+              only?.error ?? "Spawn admission returned no result",
+            );
+          }
+          spawned = {
+            content: [
+              {
+                type: "text",
+                text: buildSubagentSpawnResult({
+                  id: only.id,
+                  title: only.title,
+                  harness: only.harness,
+                  modelLabel: only.model ?? "?",
+                  cwd: only.cwd,
+                }),
+              },
+            ],
+            details: {
+              id: only.id,
+              title: only.title,
+              cwd: only.cwd,
+              harness: only.harness,
+              model: only.model,
+            },
+          };
+        } else {
+          spawned = {
+            content: [{ type: "text", text: formatBatchSpawnResult(outcomes) }],
+            details: {
+              kind: "batch_spawn",
+              ids: started.map((outcome) => outcome.id),
+              results: outcomes,
+            },
+          };
+        }
+        // Spawn and collect in one tool call, saving a parent turn when the next step needs the result.
+        if (!params.wait || started.length === 0) return spawned;
+        const waited = await collectChildren(
+          started.map((outcome) => outcome.id),
+          signal,
+          onUpdate,
+          waitMode,
+        );
+        const label = batch
+          ? `Spawned ${started.length} subagent(s) and waited (${waitMode}).`
+          : `Spawned subagent ${started[0]!.id} and waited for it.`;
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `${label}\n\n${batch ? `${spawned.content[0].text}\n\n` : ""}${waited.content[0].text}`,
+            },
+          ],
+          details: { ...spawned.details, wait: waited.details },
+        };
+      },
+      renderCall(args, theme, context) {
+        // SAFETY: this renderer only returns Text components for this tool row,
+        // so a previously rendered component, when present, is a Text.
+        const component =
+          (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+        const label = args.tasks
+          ? `${args.tasks.length} task(s)`
+          : args.name?.trim() || "starting…";
         component.setText(
-          renderSubagentActivity(snapshot, theme, { expanded }),
+          `${theme.fg("warning", "■")} ${theme.fg("toolTitle", theme.bold("subagent "))}` +
+            theme.fg("accent", label) +
+            theme.fg(
+              "dim",
+              ` · ${args.tasks ? "batch" : (args.harness ?? "pi")}`,
+            ),
         );
         return component;
-      }
-      const first = result.content[0];
-      const fallback =
-        first?.type === "text" ? first.text : "Subagent launch recorded.";
-      component.setText(
-        `${theme.fg("success", "■")} ${theme.fg("accent", id ?? "subagent")}${theme.fg(
-          "muted",
-          ` · ${details?.title ?? "historical launch"}`,
-        )}\n  ${theme.fg("dim", fallback.split("\n", 1)[0] ?? "")}`,
-      );
-      return component;
-    },
-  });
+      },
+      renderResult(result, { expanded }, theme, context) {
+        // SAFETY: execute always attaches id/title/cwd/harness/model details,
+        // and the renderer must tolerate restored renders without them.
+        const details = result.details as
+          | {
+              id?: string;
+              title?: string;
+              harness?: string;
+              cwd?: string;
+              proposalId?: string;
+            }
+          | undefined;
+        const id = details?.id;
+        if (!id && details?.proposalId) {
+          return new Text(
+            `${theme.fg("warning", "■")} ${theme.fg("accent", "routing proposal")} ${theme.fg("muted", details.proposalId)}\n  ${theme.fg("dim", "No child started; exact runtime awaits approval.")}`,
+            0,
+            0,
+          );
+        }
+        const snapshot = id ? renderView?.get(id) : undefined;
+
+        // Keep the in-transcript card live while the agent runs: subscribe for
+        // this id (throttled — pi backends can emit an event per token) and drop
+        // the subscription once the agent settles. Mirrors the bash tool's
+        // state.interval + context.invalidate() pattern.
+        // SAFETY: this renderer owns the per-tool-row state it persists in
+        // context.state (unsubActivity handle and lastActivityRefresh timestamp).
+        const state = context.state as
+          | { unsubActivity?: () => void; lastActivityRefresh?: number }
+          | undefined;
+        const settled = !snapshot || !isSubagentPending(snapshot.status);
+        if (state) {
+          if (settled && state.unsubActivity) {
+            state.unsubActivity();
+            state.unsubActivity = undefined;
+          } else if (!settled && !state.unsubActivity && renderView) {
+            state.unsubActivity = renderView.subscribeTo(id!, () => {
+              const now = Date.now();
+              if (now - (state.lastActivityRefresh ?? 0) >= 100) {
+                state.lastActivityRefresh = now;
+                context.invalidate();
+              }
+            });
+          }
+        }
+
+        // SAFETY: this renderer only returns Text components for this tool row,
+        // so a previously rendered component, when present, is a Text.
+        const component =
+          (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+        if (snapshot) {
+          component.setText(
+            renderSubagentActivity(snapshot, theme, { expanded }),
+          );
+          return component;
+        }
+        const first = result.content[0];
+        const fallback =
+          first?.type === "text" ? first.text : "Subagent launch recorded.";
+        component.setText(
+          `${theme.fg("success", "■")} ${theme.fg("accent", id ?? "subagent")}${theme.fg(
+            "muted",
+            ` · ${details?.title ?? "historical launch"}`,
+          )}\n  ${theme.fg("dim", fallback.split("\n", 1)[0] ?? "")}`,
+        );
+        return component;
+      },
+    });
+  registerSpawnTool(registeredSpawnCap);
 
   pi.registerTool({
     name: "subagent_wait",
@@ -2007,9 +2011,14 @@ export default function (pi: ExtensionAPI) {
         maxItems: 64,
         description: SUBAGENT_WAIT_PARAMETER_DESCRIPTIONS.ids,
       }),
+      mode: Type.Optional(
+        StringEnum(WAIT_MODES, {
+          description: SUBAGENT_WAIT_PARAMETER_DESCRIPTIONS.mode,
+        }),
+      ),
     }),
     async execute(_toolCallId, params, signal, onUpdate) {
-      return collectChildren(params.ids, signal, onUpdate);
+      return collectChildren(params.ids, signal, onUpdate, params.mode);
     },
   });
 

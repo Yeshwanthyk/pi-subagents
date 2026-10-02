@@ -27,11 +27,15 @@ import type {
 import { Type } from "typebox";
 import {
   createAgentSession,
+  CONFIG_DIR_NAME,
+  DefaultPackageManager,
   DefaultResourceLoader,
   getAgentDir,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { statSync } from "node:fs";
+import { join, resolve as resolvePath } from "node:path";
 import type { Cause, Scope } from "effect";
 import { Effect, Queue, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
@@ -71,7 +75,6 @@ const CHILD_EXCLUDED_TOOL_NAMES = [
   "subagent_approve",
   "workflow",
   "workflow_control",
-  "ask_jev",
   "ask_user",
 ] as const;
 export function createAskParentTool(
@@ -180,13 +183,215 @@ function resolvePiModel(
 
 // --- Session resources -------------------------------------------------------
 
-/** Load normal global/package resources and trust-gated project resources. */
-async function createChildResources(cwd: string, projectTrusted: boolean) {
-  const agentDir = getAgentDir();
+//
+// What is shared vs per child (verified against the pi SDK resource loader):
+// - Extension instances are NOT shareable. Their factories capture an
+//   ExtensionAPI wired to the loader's `runtime`, which each AgentSession's
+//   ExtensionRunner mutates via bindCore() and invalidates on dispose. Every
+//   child therefore loads its own extension set (pi itself caches the module
+//   imports, so this re-runs only the cheap factories).
+// - SettingsManager is mutable (setters, reload, trust) and is created per
+//   child; it is cheap (two small JSON reads).
+// - Package resolution and the loaded skills, prompt templates, themes, and
+//   context files are plain data derived from (agentDir, cwd, trust,
+//   settings). They are loaded once per key into a snapshot and handed to
+//   each child loader through the SDK's override hooks.
+
+type ResolvedPackagePaths = Awaited<
+  ReturnType<InstanceType<typeof DefaultPackageManager>["resolve"]>
+>;
+interface PiChildResourceSnapshot {
+  readonly resolvedPaths: ResolvedPackagePaths;
+  readonly skills: ReturnType<DefaultResourceLoader["getSkills"]>;
+  readonly prompts: ReturnType<DefaultResourceLoader["getPrompts"]>;
+  readonly themes: ReturnType<DefaultResourceLoader["getThemes"]>;
+  readonly agentsFiles: ReturnType<DefaultResourceLoader["getAgentsFiles"]>;
+}
+
+/** Resource snapshots older than this are reloaded on the next spawn. */
+export const PI_CHILD_RESOURCE_TTL_MS = 30_000;
+
+/**
+ * Keyed promise cache with a time-to-live and a cheap validity fingerprint.
+ * Concurrent first requests for one key share a single in-flight load; a
+ * rejected load is evicted so the next request retries.
+ */
+export class TimedLoadCache<V> {
+  private readonly entries = new Map<
+    string,
+    { value: Promise<V>; loadedAt: number; fingerprint: string }
+  >();
+  private readonly ttlMs: number;
+  private readonly now: () => number;
+  constructor(ttlMs: number, now: () => number = Date.now) {
+    this.ttlMs = ttlMs;
+    this.now = now;
+  }
+
+  get(key: string, fingerprint: string, load: () => Promise<V>): Promise<V> {
+    const time = this.now();
+    const cached = this.entries.get(key);
+    if (
+      cached &&
+      cached.fingerprint === fingerprint &&
+      time - cached.loadedAt < this.ttlMs
+    ) {
+      return cached.value;
+    }
+    for (const [entryKey, entry] of this.entries) {
+      if (time - entry.loadedAt >= this.ttlMs) this.entries.delete(entryKey);
+    }
+    const entry = { value: load(), loadedAt: time, fingerprint };
+    this.entries.set(key, entry);
+    entry.value.catch(() => {
+      if (this.entries.get(key) === entry) this.entries.delete(key);
+    });
+    return entry.value;
+  }
+
+  clear() {
+    this.entries.clear();
+  }
+
+  get size() {
+    return this.entries.size;
+  }
+}
+
+const childResourceCache = new TimedLoadCache<PiChildResourceSnapshot>(
+  PI_CHILD_RESOURCE_TTL_MS,
+);
+
+/** Drop all cached child resource snapshots (tests, /reload). */
+export function clearPiChildResourceCache() {
+  childResourceCache.clear();
+}
+
+function mtimeOf(path: string) {
+  try {
+    return String(statSync(path).mtimeMs);
+  } catch {
+    return "-";
+  }
+}
+
+/** Settings files decide package/resource resolution; an edit invalidates. */
+function resourceFingerprint(cwd: string, agentDir: string) {
+  return [
+    mtimeOf(join(agentDir, "settings.json")),
+    mtimeOf(join(cwd, CONFIG_DIR_NAME, "settings.json")),
+  ].join("|");
+}
+
+/**
+ * Serve a precomputed package resolution to a loader. DefaultResourceLoader
+ * owns its package manager privately; when the SDK shape is not what we
+ * expect, the loader keeps resolving on its own (correct, just slower).
+ */
+function useResolvedPackagePaths(
+  loader: DefaultResourceLoader,
+  resolvedPaths: ResolvedPackagePaths,
+) {
+  const packageManager: unknown = loader["packageManager"];
+  if (packageManager instanceof DefaultPackageManager) {
+    packageManager.resolve = async () => structuredClone(resolvedPaths);
+  }
+}
+
+async function loadChildResourceSnapshot(
+  cwd: string,
+  agentDir: string,
+  projectTrusted: boolean,
+): Promise<PiChildResourceSnapshot> {
   const settingsManager = SettingsManager.create(cwd, agentDir, {
     projectTrusted,
   });
-  const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+  const resolvedPaths = await new DefaultPackageManager({
+    cwd,
+    agentDir,
+    settingsManager,
+  }).resolve();
+  // Extensions are deliberately skipped: they are loaded per child.
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    settingsManager,
+    noExtensions: true,
+  });
+  useResolvedPackagePaths(loader, resolvedPaths);
+  await loader.reload();
+  return {
+    resolvedPaths,
+    skills: loader.getSkills(),
+    prompts: loader.getPrompts(),
+    themes: loader.getThemes(),
+    agentsFiles: loader.getAgentsFiles(),
+  };
+}
+
+/** Snapshot entries first, then extension-discovered ones not shadowed by name. */
+function mergeByName<T>(
+  cached: readonly T[],
+  discovered: readonly T[],
+  name: (item: T) => string | undefined,
+) {
+  const seen = new Set(cached.map(name));
+  return [...cached, ...discovered.filter((item) => !seen.has(name(item)))];
+}
+
+/**
+ * Load normal global/package resources and trust-gated project resources.
+ * Package resolution, skills, prompts, themes, and context files come from
+ * a shared snapshot; settings and extensions are fresh for every child.
+ */
+export async function createPiChildResources(
+  cwd: string,
+  projectTrusted: boolean,
+  agentDir: string = getAgentDir(),
+) {
+  const resolvedCwd = resolvePath(cwd);
+  const resolvedAgentDir = resolvePath(agentDir);
+  const snapshot = await childResourceCache.get(
+    JSON.stringify([resolvedAgentDir, resolvedCwd, projectTrusted]),
+    resourceFingerprint(resolvedCwd, resolvedAgentDir),
+    () =>
+      loadChildResourceSnapshot(resolvedCwd, resolvedAgentDir, projectTrusted),
+  );
+  const settingsManager = SettingsManager.create(cwd, agentDir, {
+    projectTrusted,
+  });
+  // The no* flags skip disk loads; the overrides then serve the snapshot.
+  // Overrides also run for extendResources(), where `base` holds only the
+  // extension-discovered resources, so those are merged after the snapshot.
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    settingsManager,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    skillsOverride: (base) => ({
+      skills: mergeByName(snapshot.skills.skills, base.skills, (s) => s.name),
+      diagnostics: [...snapshot.skills.diagnostics, ...base.diagnostics],
+    }),
+    promptsOverride: (base) => ({
+      prompts: mergeByName(
+        snapshot.prompts.prompts,
+        base.prompts,
+        (p) => p.name,
+      ),
+      diagnostics: [...snapshot.prompts.diagnostics, ...base.diagnostics],
+    }),
+    themesOverride: (base) => ({
+      themes: mergeByName(snapshot.themes.themes, base.themes, (t) => t.name),
+      diagnostics: [...snapshot.themes.diagnostics, ...base.diagnostics],
+    }),
+    agentsFilesOverride: () => ({
+      agentsFiles: [...snapshot.agentsFiles.agentsFiles],
+    }),
+  });
+  useResolvedPackagePaths(loader, snapshot.resolvedPaths);
   await loader.reload();
   return { loader, settingsManager };
 }
@@ -210,6 +415,38 @@ function waitBounded(operation: Promise<unknown>, timeoutMs: number) {
 }
 
 /** Emit child session_shutdown (bounded), then dispose. Never throws. */
+/**
+ * Resolve once the session's active run has stopped: on its agent_settled
+ * event, or after a bounded fallback in case that event never arrives.
+ * Handlers registered earlier (the event translator) run first, so the
+ * run's own RunSettled lands before the caller resumes.
+ */
+export function waitForRunToStop(
+  session: Pick<AgentSession, "isStreaming" | "subscribe">,
+  timeoutMs = CHILD_SHUTDOWN_TIMEOUT_MS,
+): Promise<void> {
+  if (!session.isStreaming) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let unsubscribe: (() => void) | undefined;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      unsubscribe?.();
+      resolve();
+    };
+    unsubscribe = session.subscribe((event) => {
+      if (event.type === "agent_settled") finish();
+    });
+    if (done) unsubscribe();
+    timer = setTimeout(finish, timeoutMs);
+    // The run may have stopped between the first check and subscribing.
+    if (!session.isStreaming) finish();
+  });
+}
+
 async function shutdownAndDisposeChildSession(session: AgentSession) {
   try {
     if (session.extensionRunner.hasHandlers("session_shutdown")) {
@@ -438,7 +675,7 @@ const makePiSession = (
 
     const session = yield* Effect.tryPromise({
       try: async () => {
-        const { loader, settingsManager } = await createChildResources(
+        const { loader, settingsManager } = await createPiChildResources(
           task.cwd,
           task.parent.projectTrusted,
         );
@@ -724,9 +961,7 @@ const makePiSession = (
         // interrupt as complete while the run keeps working would let the
         // manager settle a run that is still mutating the workspace. The
         // manager bounds this effect at 5s and force-disposes on timeout.
-        while (!state.closed && session.isStreaming) {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
+        if (!state.closed) await waitForRunToStop(session);
         // No streaming run means no agent_settled will arrive; emit the
         // terminal event (once) so the run cannot look running forever.
         if (!state.closed && !state.settled) {

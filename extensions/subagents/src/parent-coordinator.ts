@@ -17,6 +17,8 @@ import {
   type ParentSessionManager,
 } from "./parent-ref.ts";
 
+const MAX_DELIVERED_RECORDS = 1_024;
+
 export interface ParentResultCoordinatorOptions {
   readonly mailbox?: ParentMailbox;
   readonly sendBatch: (batch: ReadonlyArray<ParentResultEnvelope>) => void;
@@ -48,6 +50,8 @@ export interface ParentResultCoordinator {
   /** Enqueue one aggregate workflow terminal result on the same parent rail. */
   onWorkflowSettled(envelope: WorkflowResultEnvelope, consumed: boolean): void;
   consume(owners: Iterable<ParentResultOwner>): void;
+  /** True once a standalone result was returned by a wait/cancel or sent as a message. */
+  wasDelivered(id: string, parentRef: ParentRef): boolean;
   consumeWorkflow(runId: string, parentRef: ParentRef): void;
   flush(context: ParentFlushContext): boolean;
   close(): void;
@@ -67,6 +71,17 @@ export function createParentResultCoordinator(
   let current: CurrentParent | undefined;
   let closed = false;
   const deliveredWorkflowResults = new Set<string>();
+  /** Bounded record of standalone results that already reached the parent. */
+  const deliveredSubagentResults = new Set<string>();
+  const markSubagentDelivered = (id: string, parentRef: ParentRef) => {
+    const key = workflowResultKey(id, parentRef);
+    deliveredSubagentResults.delete(key);
+    deliveredSubagentResults.add(key);
+    if (deliveredSubagentResults.size > MAX_DELIVERED_RECORDS) {
+      const oldest = deliveredSubagentResults.values().next().value;
+      if (oldest !== undefined) deliveredSubagentResults.delete(oldest);
+    }
+  };
   const workflowResultKey = (id: string, parentRef: ParentRef) =>
     `${parentRefKey(parentRef)}\u0000${id}`;
 
@@ -74,6 +89,7 @@ export function createParentResultCoordinator(
     mailbox.clear();
     questionMailbox.clear();
     deliveredWorkflowResults.clear();
+    deliveredSubagentResults.clear();
     current = { epoch, sessionManager: context.sessionManager };
     closed = false;
   };
@@ -92,8 +108,13 @@ export function createParentResultCoordinator(
     if (envelope === undefined) return;
     if (consumed) {
       mailbox.consume([envelope.id], envelope.parentRef);
+      markSubagentDelivered(snapshot.id, envelope.parentRef);
       return;
     }
+    // A restarted child settles with a new, undelivered result.
+    deliveredSubagentResults.delete(
+      workflowResultKey(snapshot.id, envelope.parentRef),
+    );
     mailbox.enqueue(envelope);
   };
 
@@ -133,8 +154,12 @@ export function createParentResultCoordinator(
       )
         continue;
       mailbox.consume([owner.id], owner.parentRef);
+      markSubagentDelivered(owner.id, owner.parentRef);
     }
   };
+
+  const wasDelivered = (id: string, parentRef: ParentRef) =>
+    deliveredSubagentResults.has(workflowResultKey(id, parentRef));
 
   const consumeWorkflow = (runId: string, parentRef: ParentRef) => {
     if (closed) return;
@@ -181,6 +206,8 @@ export function createParentResultCoordinator(
         deliveredWorkflowResults.add(
           workflowResultKey(envelope.id, envelope.parentRef),
         );
+      } else {
+        markSubagentDelivered(envelope.id, envelope.parentRef);
       }
     }
     mailbox.remove(batch);
@@ -191,6 +218,7 @@ export function createParentResultCoordinator(
     closed = true;
     current = undefined;
     deliveredWorkflowResults.clear();
+    deliveredSubagentResults.clear();
     mailbox.clear();
     questionMailbox.clear();
   };
@@ -206,6 +234,7 @@ export function createParentResultCoordinator(
     consumeQuestion,
     onWorkflowSettled,
     consume,
+    wasDelivered,
     consumeWorkflow,
     flush,
     close,

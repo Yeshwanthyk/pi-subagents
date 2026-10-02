@@ -14,44 +14,14 @@ import type { WorkflowDefinitionPreparer } from "../workflows/tools.ts";
 export interface WorkflowRoutingPreparationContext {
   readonly settings: SettingsSnapshot;
   readonly lookupModel: ModelLookup;
-  readonly jevCredentialPresent: boolean;
-}
-
-function effectiveEvaluationPolicy(context: WorkflowRoutingPreparationContext) {
-  const jev = context.settings.settings.jev;
-  return {
-    provider: "jev" as const,
-    apiKeyEnv: jev.apiKeyEnv,
-    model: jev.model,
-    timeoutMs: jev.timeoutMs,
-    maxConcurrent: jev.maxConcurrent,
-  };
 }
 
 function routeDefinition(
   definition: ValidatedWorkflowDefinition,
   context: WorkflowRoutingPreparationContext,
 ): ValidatedWorkflowDefinition {
-  const requiresJev = definition.tasks.some(
-    (task) => task.execution?.type === "evaluation" || task.gate !== undefined,
-  );
-  if (requiresJev && !context.jevCredentialPresent) {
-    throw new Error(
-      "Workflow requests Jev evaluation or a gate, but the configured Jev credential is missing.",
-    );
-  }
-  if (
-    requiresJev &&
-    JSON.stringify(definition.evaluationPolicy) !==
-      JSON.stringify(effectiveEvaluationPolicy(context))
-  ) {
-    throw new Error(
-      "Workflow evaluation policy does not match the current validated Jev settings.",
-    );
-  }
   if (!context.settings.settings.routing.enabled) return definition;
   const tasks = definition.tasks.map((task): WorkflowTaskDefinition => {
-    if (task.execution?.type === "evaluation") return task;
     const classification =
       task.classification ?? classificationForWorkflowKind(task.kind);
     const proposal = resolveRouting({
@@ -96,16 +66,7 @@ export function createWorkflowRoutingPreparer(
       return routeDefinition(base.prepareSource(source), getContext());
     },
     prepareSpec(spec) {
-      const context = getContext();
-      const requiresJev = spec.tasks.some(
-        (task) =>
-          task.execution?.type === "evaluation" || task.gate !== undefined,
-      );
-      const prepared =
-        requiresJev && spec.evaluationPolicy === undefined
-          ? { ...spec, evaluationPolicy: effectiveEvaluationPolicy(context) }
-          : spec;
-      return routeDefinition(base.prepareSpec(prepared), context);
+      return routeDefinition(base.prepareSpec(spec), getContext());
     },
   };
 }

@@ -23,10 +23,13 @@ import { SpawnError } from "./src/domain.ts";
 import {
   SubagentManager,
   SubagentManagerLive,
+  subagentManagerLayer,
   parentSubagentView,
   operatorSubagentView,
+  type SubagentManagerOptions,
   type SubagentManagerApi,
 } from "./src/manager.ts";
+import { MAX_RUNNING_LIMITS } from "./src/domain.ts";
 import { createParentResultCoordinator } from "./src/parent-coordinator.ts";
 import type { ParentSessionManager } from "./src/parent-ref.ts";
 import { runTool } from "./src/runtime.ts";
@@ -47,9 +50,14 @@ const TestRegistryLive = Layer.sync(BackendRegistry, () => {
   );
 });
 
-const createTestRuntime = () =>
+/** Explicit cap for slot-accounting tests written against a four-slot manager. */
+const FOUR_SLOTS: SubagentManagerOptions = { maxRunning: 4 };
+
+const createTestRuntime = (options?: SubagentManagerOptions) =>
   ManagedRuntime.make(
-    SubagentManagerLive.pipe(Layer.provide(TestRegistryLive)),
+    (options ? subagentManagerLayer(options) : SubagentManagerLive).pipe(
+      Layer.provide(TestRegistryLive),
+    ),
   );
 
 const parent: ParentContext = {
@@ -124,9 +132,12 @@ function makeControlledBackend(
   };
 }
 
-const createRuntimeWith = (backend: SubagentBackend) =>
+const createRuntimeWith = (
+  backend: SubagentBackend,
+  options?: SubagentManagerOptions,
+) =>
   ManagedRuntime.make(
-    SubagentManagerLive.pipe(
+    (options ? subagentManagerLayer(options) : SubagentManagerLive).pipe(
       Layer.provide(
         Layer.succeed(
           BackendRegistry,
@@ -142,9 +153,10 @@ async function withControlledManager(
     runtime: ReturnType<typeof createRuntimeWith>,
     controlled: ReturnType<typeof makeControlledBackend>,
   ) => Promise<void>,
+  options?: SubagentManagerOptions,
 ) {
   const controlled = makeControlledBackend();
-  const runtime = createRuntimeWith(controlled.backend);
+  const runtime = createRuntimeWith(controlled.backend, options);
   try {
     const manager = await runtime.runPromise(SubagentManager);
     await run(manager, runtime, controlled);
@@ -183,8 +195,9 @@ async function withManager(
     manager: SubagentManagerApi,
     runtime: ReturnType<typeof createTestRuntime>,
   ) => Promise<void>,
+  options?: SubagentManagerOptions,
 ) {
-  const runtime = createTestRuntime();
+  const runtime = createTestRuntime(options);
   try {
     const manager = await runtime.runPromise(SubagentManager);
     await run(manager, runtime);
@@ -275,7 +288,7 @@ test("listener re-subscription waits for the next notification pass", async () =
     assert.equal(calls[0], "first");
     assert.ok(calls.slice(1).every((call) => call === "second"));
     assert.ok(calls.includes("second"));
-  });
+  }, FOUR_SLOTS);
 });
 
 test("activity snapshots track live and completed tool operations", async () => {
@@ -358,72 +371,116 @@ test("cancel interrupts a running stub subagent", async () => {
   });
 });
 
-test("shared admission is FIFO across direct and workflow-owned tasks", async () => {
+test("shared admission is round-robin across owners and FIFO within each owner", async () => {
+  await withControlledManager(
+    async (manager, runtime, controlled) => {
+      const workflow = { runId: "wf-1", taskId: "writer" } as const;
+      // Direct parent work floods the queue before the workflow run enqueues.
+      const prompts = ["D1", "D2", "D3", "D4", "D5", "W1", "W2"];
+      const spawns = await runTool(
+        runtime,
+        Effect.forEach(
+          prompts,
+          (prompt) =>
+            manager.spawn(
+              "codex",
+              prompt.startsWith("W")
+                ? { ...task(prompt), workflow }
+                : task(prompt),
+            ),
+          { concurrency: "unbounded" },
+        ),
+      );
+      await waitUntil(
+        () => controlled.starts.length === 2,
+        "only two backend sessions should start initially",
+      );
+      assert.deepEqual(controlled.starts, ["D1", "D2"]);
+      assert.deepEqual(
+        spawns.slice(2).map((snapshot) => snapshot.status),
+        ["queued", "queued", "queued", "queued", "queued"],
+      );
+      assert.deepEqual(spawns[5]?.workflow, workflow);
+
+      // Each freed slot goes to the next owner in turn, oldest task first.
+      const expected = ["D3", "W1", "D4", "W2", "D5"];
+      const finishing = ["D1", "D2", "D3", "W1", "D4"];
+      for (const [index, prompt] of finishing.entries()) {
+        await controlled.complete(prompt);
+        await waitUntil(
+          () => controlled.starts.length === 3 + index,
+          `${expected[index]} should start after ${prompt} completes`,
+        );
+      }
+      assert.deepEqual(controlled.starts, ["D1", "D2", ...expected]);
+
+      const settlement = runTool(
+        runtime,
+        manager.awaitSettlement(spawns[6]!.id),
+      );
+      await controlled.complete("W2", "workflow result");
+      assert.equal((await settlement)?.finalText, "workflow result");
+    },
+    { maxRunning: 2 },
+  );
+});
+
+test("default manager honours a running cap of six", async () => {
   await withControlledManager(async (manager, runtime, controlled) => {
+    assert.equal(manager.maxRunning, MAX_RUNNING_LIMITS.default);
+    assert.equal(manager.maxRunning, 6);
     const spawns = await runTool(
       runtime,
       Effect.forEach(
-        [1, 2, 3, 4, 5, 6, 7],
-        (n) => {
-          const spawnTask = task(`Task ${n}`);
-          return manager.spawn(
-            "codex",
-            n === 6
-              ? {
-                  ...spawnTask,
-                  workflow: { runId: "wf-1", taskId: "writer" },
-                }
-              : spawnTask,
-          );
-        },
+        Array.from({ length: 8 }, (_, index) => `six-${index + 1}`),
+        (prompt) => manager.spawn("codex", task(prompt)),
         { concurrency: "unbounded" },
       ),
     );
     await waitUntil(
-      () => controlled.starts.length === 4,
-      "only four backend sessions should start initially",
-    );
-    assert.deepEqual(controlled.starts, [
-      "Task 1",
-      "Task 2",
-      "Task 3",
-      "Task 4",
-    ]);
-    assert.deepEqual(
-      spawns.slice(4).map((snapshot) => snapshot.status),
-      ["queued", "queued", "queued"],
-    );
-    assert.deepEqual(spawns[5]?.workflow, {
-      runId: "wf-1",
-      taskId: "writer",
-    });
-
-    await controlled.complete("Task 2");
-    await waitUntil(
-      () => controlled.starts.length === 5,
-      "Task 5 should start",
-    );
-    assert.equal(controlled.starts[4], "Task 5");
-    const fifthSettlement = runTool(
-      runtime,
-      manager.awaitSettlement(spawns[4]!.id),
-    );
-    await controlled.complete("Task 5", "fifth result");
-    assert.equal((await fifthSettlement)?.finalText, "fifth result");
-
-    await controlled.complete("Task 4");
-    await waitUntil(
       () => controlled.starts.length === 6,
-      "Task 6 should start",
+      "six tasks should start",
     );
-    assert.equal(controlled.starts[5], "Task 6");
-    await controlled.complete("Task 1");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(controlled.starts.length, 6);
+    assert.deepEqual(
+      spawns.map((snapshot) => snapshot.status),
+      [...Array(6).fill("running"), "queued", "queued"],
+    );
+    await controlled.complete("six-1");
     await waitUntil(
       () => controlled.starts.length === 7,
-      "Task 7 should start",
+      "the seventh task should start when a slot frees",
     );
-    assert.equal(controlled.starts[6], "Task 7");
+    assert.equal(controlled.starts[6], "six-7");
+    assert.equal(manager.view.get(spawns[7]!.id)?.status, "queued");
   });
+});
+
+test("configured cap bounds idle restarts with the configured number", async () => {
+  await withManager(
+    async (manager, runtime) => {
+      assert.equal(manager.maxRunning, 2);
+      const settled = await runTool(
+        runtime,
+        manager.spawn("codex", task("early finisher")),
+      );
+      await runTool(runtime, manager.waitFor([settled.id]));
+      await runTool(
+        runtime,
+        Effect.forEach(
+          [1, 2],
+          (n) => manager.spawn("codex", task(`Task ${n}`)),
+          { concurrency: "unbounded" },
+        ),
+      );
+      await assert.rejects(
+        runTool(runtime, manager.send(settled.id, "go again")),
+        /Max 2 subagents/,
+      );
+    },
+    { maxRunning: 2 },
+  );
 });
 
 test("cancelling queued work never starts its backend session", async () => {
@@ -449,7 +506,7 @@ test("cancelling queued work never starts its backend session", async () => {
     await controlled.complete("cancel-queued-1");
     await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(controlled.starts.includes("cancel-queued-5"), false);
-  });
+  }, FOUR_SLOTS);
 });
 
 test("running cancellation releases one slot exactly once", async () => {
@@ -487,7 +544,7 @@ test("running cancellation releases one slot exactly once", async () => {
       "sixth task should start",
     );
     assert.equal(controlled.starts[5], "cancel-running-6");
-  });
+  }, FOUR_SLOTS);
 });
 
 test("parallel spawns reserve no more than the global running limit", async () => {
@@ -513,7 +570,7 @@ test("parallel spawns reserve no more than the global running limit", async () =
       spawns.filter((snapshot) => snapshot.status === "queued").length,
       16,
     );
-  });
+  }, FOUR_SLOTS);
 });
 
 test("backend admission failure settles the record and releases its slot", async () => {
@@ -581,7 +638,7 @@ test("idle restarts respect the concurrency cap", async () => {
       /Max 4 subagents/,
     );
     assert.equal(manager.view.get(settled.id)?.status, "done");
-  });
+  }, FOUR_SLOTS);
 });
 
 test("settled client agents cannot restart from the manager view", async () => {
@@ -691,24 +748,40 @@ test("explicit steering fails when a backend does not support it", async () => {
 
 test("parent questions yield before settlement and replies preserve the running slot", async () => {
   await withPiControlledManager(async (manager, runtime, controlled) => {
-    const parentRef = { epoch: 7, sessionFile: "/parent.jsonl", leafId: "leaf" } as const;
+    const parentRef = {
+      epoch: 7,
+      sessionFile: "/parent.jsonl",
+      leafId: "leaf",
+    } as const;
     const child = await runTool(
       runtime,
       manager.spawn("pi", { ...task("ask-parent"), parentRef }),
     );
-    await waitUntil(() => controlled.task("ask-parent") !== undefined, "Pi child should be admitted");
+    await waitUntil(
+      () => controlled.task("ask-parent") !== undefined,
+      "Pi child should be admitted",
+    );
     const ask = controlled.task("ask-parent")!.askParent!({
       question: "Which option?",
       context: "Two valid options remain.",
     });
-    await waitUntil(() => manager.view.get(child.id)?.pendingQuestion !== undefined, "question should be visible");
+    await waitUntil(
+      () => manager.view.get(child.id)?.pendingQuestion !== undefined,
+      "question should be visible",
+    );
     const waiting = runTool(runtime, manager.waitForParent!([child.id]));
     const result = await waiting;
     assert.equal(result.questions[0]?.question, "Which option?");
     assert.equal(manager.view.get(child.id)?.status, "running");
     const reply = await runTool(
       runtime,
-      manager.send(child.id, "choose B", "reply", result.questions[0]!.requestId, parentRef),
+      manager.send(
+        child.id,
+        "choose B",
+        "reply",
+        result.questions[0]!.requestId,
+        parentRef,
+      ),
     );
     assert.deepEqual(reply, {
       id: child.id,
@@ -717,57 +790,23 @@ test("parent questions yield before settlement and replies preserve the running 
     });
     assert.equal(await ask, "choose B");
     await controlled.complete("ask-parent", "done after answer");
-    assert.equal((await runTool(runtime, manager.awaitSettlement(child.id)))?.finalText, "done after answer");
+    assert.equal(
+      (await runTool(runtime, manager.awaitSettlement(child.id)))?.finalText,
+      "done after answer",
+    );
   });
 });
-test("parent wait keeps acceptance-pending terminals pending", async () => {
-  await withPiControlledManager(async (manager, runtime, controlled) => {
-    let release!: (result: { status: "pass" }) => void;
-    const verdict = new Promise<{ status: "pass" }>((resolve) => {
-      release = resolve;
-    });
-    const child = await runTool(
-      runtime,
-      manager.spawn("pi", {
-        ...task("parent-wait-acceptance"),
-        acceptance: { timeoutMs: 2_000, evaluate: () => verdict },
-      }),
-    );
-    await waitUntil(
-      () => controlled.task("parent-wait-acceptance") !== undefined,
-      "acceptance child should be admitted",
-    );
-    await controlled.complete("parent-wait-acceptance", "accepted later");
-    await waitUntil(
-      () =>
-        manager.view.get(child.id)?.status === "done" &&
-        manager.view.get(child.id)?.acceptance?.status === "pending",
-      "process should settle behind the acceptance gate",
-    );
-
-    let returned = false;
-    const waiting = runTool(runtime, manager.waitForParent!([child.id])).then(
-      (result) => {
-        returned = true;
-        return result;
-      },
-    );
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    assert.equal(returned, false);
-    release({ status: "pass" });
-    const result = await waiting;
-    assert.deepEqual(result.questions, []);
-    assert.deepEqual(result.settledIds, [child.id]);
-  });
-});
-
 test("parent wait observes a sibling settlement without suppressing its delivery", async () => {
   await withPiControlledManager(async (manager, runtime, controlled) => {
     const settled: Array<{ id: string; consumed: boolean }> = [];
     manager.view.setOnSettled((snapshot, consumed) =>
       settled.push({ id: snapshot.id, consumed }),
     );
-    const parentRef = { epoch: 10, sessionFile: "/parent.jsonl", leafId: "leaf" } as const;
+    const parentRef = {
+      epoch: 10,
+      sessionFile: "/parent.jsonl",
+      leafId: "leaf",
+    } as const;
     const questionChild = await runTool(
       runtime,
       manager.spawn("pi", { ...task("parent-wait-question"), parentRef }),
@@ -812,35 +851,78 @@ test("parent wait observes a sibling settlement without suppressing its delivery
 
 test("parent question replies reject wrong, stale, duplicate, expired, and queued-answer paths", async () => {
   await withPiControlledManager(async (manager, runtime, controlled) => {
-    const parentRef = { epoch: 8, sessionFile: "/parent.jsonl", leafId: "leaf" } as const;
-    const child = await runTool(runtime, manager.spawn("pi", { ...task("question-races"), parentRef }));
-    await waitUntil(() => controlled.task("question-races") !== undefined, "race child should be admitted");
-    const ask = controlled.task("question-races")!.askParent!({ question: "Need a choice" });
-    await waitUntil(() => manager.view.get(child.id)?.pendingQuestion !== undefined, "race question should be visible");
+    const parentRef = {
+      epoch: 8,
+      sessionFile: "/parent.jsonl",
+      leafId: "leaf",
+    } as const;
+    const child = await runTool(
+      runtime,
+      manager.spawn("pi", { ...task("question-races"), parentRef }),
+    );
+    await waitUntil(
+      () => controlled.task("question-races") !== undefined,
+      "race child should be admitted",
+    );
+    const ask = controlled.task("question-races")!.askParent!({
+      question: "Need a choice",
+    });
+    await waitUntil(
+      () => manager.view.get(child.id)?.pendingQuestion !== undefined,
+      "race question should be visible",
+    );
     const request = manager.view.get(child.id)!.pendingQuestion!;
     await assert.rejects(
-      runTool(runtime, manager.send(child.id, "wrong owner", "reply", request.requestId, { ...parentRef, leafId: "other" })),
+      runTool(
+        runtime,
+        manager.send(child.id, "wrong owner", "reply", request.requestId, {
+          ...parentRef,
+          leafId: "other",
+        }),
+      ),
       /parent ownership/,
     );
     await assert.rejects(
-      runTool(runtime, manager.send(child.id, "stale", "reply", "pq-stale", parentRef)),
+      runTool(
+        runtime,
+        manager.send(child.id, "stale", "reply", "pq-stale", parentRef),
+      ),
       /stale/,
     );
-    const followUp = await runTool(runtime, manager.send(child.id, "queued work", "follow_up"));
+    const followUp = await runTool(
+      runtime,
+      manager.send(child.id, "queued work", "follow_up"),
+    );
     assert.equal(followUp.mode, "follow_up");
     assert.notEqual(manager.view.get(child.id)?.pendingQuestion, undefined);
     await runTool(runtime, manager.send(child.id, "steer instead", "steer"));
     await assert.rejects(ask, /cancelled by steering/);
     assert.equal(manager.view.get(child.id)?.pendingQuestion, undefined);
 
-    const expired = controlled.task("question-races")!.askParent!({ question: "Expire me" });
-    await waitUntil(() => manager.view.get(child.id)?.pendingQuestion?.requestId !== request.requestId, "second question should be visible");
+    const expired = controlled.task("question-races")!.askParent!({
+      question: "Expire me",
+    });
+    await waitUntil(
+      () =>
+        manager.view.get(child.id)?.pendingQuestion?.requestId !==
+        request.requestId,
+      "second question should be visible",
+    );
     const second = manager.view.get(child.id)!.pendingQuestion!;
     const originalNow = Date.now;
     Date.now = () => originalNow() + 301_000;
     try {
       await assert.rejects(
-        runTool(runtime, manager.send(child.id, "too late", "reply", second.requestId, parentRef)),
+        runTool(
+          runtime,
+          manager.send(
+            child.id,
+            "too late",
+            "reply",
+            second.requestId,
+            parentRef,
+          ),
+        ),
         /expired/,
       );
     } finally {
@@ -853,18 +935,39 @@ test("parent question replies reject wrong, stale, duplicate, expired, and queue
 
 test("parent question cleanup covers tool abort and child cancellation", async () => {
   await withPiControlledManager(async (manager, runtime, controlled) => {
-    const parentRef = { epoch: 9, sessionFile: "/parent.jsonl", leafId: "leaf" } as const;
-    const child = await runTool(runtime, manager.spawn("pi", { ...task("abort-question"), parentRef }));
-    await waitUntil(() => controlled.task("abort-question") !== undefined, "abort child should be admitted");
+    const parentRef = {
+      epoch: 9,
+      sessionFile: "/parent.jsonl",
+      leafId: "leaf",
+    } as const;
+    const child = await runTool(
+      runtime,
+      manager.spawn("pi", { ...task("abort-question"), parentRef }),
+    );
+    await waitUntil(
+      () => controlled.task("abort-question") !== undefined,
+      "abort child should be admitted",
+    );
     const controller = new AbortController();
-    const aborted = controlled.task("abort-question")!.askParent!({ question: "Abort me" }, controller.signal);
-    await waitUntil(() => manager.view.get(child.id)?.pendingQuestion !== undefined, "abort question should be visible");
+    const aborted = controlled.task("abort-question")!.askParent!(
+      { question: "Abort me" },
+      controller.signal,
+    );
+    await waitUntil(
+      () => manager.view.get(child.id)?.pendingQuestion !== undefined,
+      "abort question should be visible",
+    );
     controller.abort();
     await assert.rejects(aborted, /aborted/);
     assert.equal(manager.view.get(child.id)?.pendingQuestion, undefined);
 
-    const cancelled = controlled.task("abort-question")!.askParent!({ question: "Cancel me" });
-    await waitUntil(() => manager.view.get(child.id)?.pendingQuestion !== undefined, "cancel question should be visible");
+    const cancelled = controlled.task("abort-question")!.askParent!({
+      question: "Cancel me",
+    });
+    await waitUntil(
+      () => manager.view.get(child.id)?.pendingQuestion !== undefined,
+      "cancel question should be visible",
+    );
     await runTool(runtime, manager.cancel([child.id]));
     await assert.rejects(cancelled, /cancelled with the child/);
     assert.equal(manager.view.get(child.id)?.pendingQuestion, undefined);
@@ -1060,7 +1163,7 @@ test("workflow observation closes the queued-to-running-to-terminal race", async
     await controlled.complete("admission-queued", "race-safe");
     assert.equal((await settled).finalText, "race-safe");
     await runTool(runtime, observed.release);
-  });
+  }, FOUR_SLOTS);
 });
 
 test("claimed workflow settlement survives terminal pruning and late lookup", async () => {
@@ -1151,373 +1254,85 @@ test("workflow cancellation settles once and releases exactly one slot", async (
   });
 });
 
-test("standalone acceptance holds settlement and delivery while releasing coding capacity", async () => {
+test('parent wait mode "all" returns only when every listed child is terminal', async () => {
   await withControlledManager(async (manager, runtime, controlled) => {
-    let release!: (value: { status: "pass" }) => void;
-    const verdict = new Promise<{ status: "pass" }>((resolve) => {
-      release = resolve;
-    });
-    const delivered: string[] = [];
-    manager.view.setOnSettled((snapshot) => delivered.push(snapshot.id));
-    const gated = await runtime.runPromise(
-      manager.spawn("codex", {
-        ...task("gated"),
-        acceptance: { timeoutMs: 2000, evaluate: () => verdict },
+    const [first, second] = await runTool(
+      runtime,
+      Effect.forEach(["all-1", "all-2"], (prompt) =>
+        manager.spawn("codex", task(prompt)),
+      ),
+    );
+    await waitUntil(
+      () => controlled.starts.length === 2,
+      "both children should start",
+    );
+    let returned = false;
+    const waiting = runTool(
+      runtime,
+      manager.waitForParent!([first!.id, second!.id], undefined, {
+        mode: "all",
       }),
-    );
-    await waitUntil(
-      () => controlled.starts.includes("gated"),
-      "gated child starts",
-    );
-    let settled = false;
-    const settlement = runtime
-      .runPromise(manager.awaitSettlement(gated.id))
-      .then(() => {
-        settled = true;
-      });
-    let waited = false;
-    const waiting = runtime.runPromise(manager.waitFor([gated.id])).then(() => {
-      waited = true;
+    ).then((result) => {
+      returned = true;
+      return result;
     });
-    await controlled.complete("gated");
+    await controlled.complete("all-1");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(returned, false, '"all" must not return after one child');
+    await controlled.complete("all-2");
+    const result = await waiting;
+    assert.deepEqual([...result.settledIds].sort(), [first!.id, second!.id]);
+  });
+});
+
+test('parent wait mode "any" returns the first fresh result and skips delivered ones', async () => {
+  await withControlledManager(async (manager, runtime, controlled) => {
+    const [first, second, third] = await runTool(
+      runtime,
+      Effect.forEach(["any-1", "any-2", "any-3"], (prompt) =>
+        manager.spawn("codex", task(prompt)),
+      ),
+    );
     await waitUntil(
-      () => gated.acceptance?.status === "pending",
-      "gate starts",
+      () => controlled.starts.length === 3,
+      "all children should start",
     );
-    assert.equal(gated.status, "done");
-    assert.equal(settled, false);
-    assert.equal(waited, false);
-    assert.deepEqual(delivered, []);
-    await assert.rejects(
-      runtime.runPromise(manager.send(gated.id, "continue")),
-      /awaiting acceptance/,
-    );
-    for (let index = 0; index < 4; index++) {
-      await runtime.runPromise(
-        manager.spawn("codex", task(`capacity-${index}`)),
+    const delivered = new Set<string>();
+    const ids = [first!.id, second!.id, third!.id];
+    const waitAny = () =>
+      runTool(
+        runtime,
+        manager.waitForParent!(ids, undefined, {
+          mode: "any",
+          alreadyDelivered: (id) => delivered.has(id),
+        }),
       );
-    }
-    await waitUntil(
-      () => controlled.starts.length === 5,
-      "gate does not occupy coding capacity",
-    );
-    release({ status: "pass" });
-    await Promise.all([settlement, waiting]);
-    assert.equal(gated.acceptance?.status, "pass");
-    assert.deepEqual(delivered, [gated.id]);
-  });
-});
 
-test("standalone acceptance cancellation ignores late verdicts and publishes once", async () => {
-  await withControlledManager(async (manager, runtime, controlled) => {
-    let release!: (value: { status: "pass" }) => void;
-    let signal: AbortSignal | undefined;
-    const verdict = new Promise<{ status: "pass" }>((resolve) => {
-      release = resolve;
+    const firstWait = waitAny();
+    await controlled.complete("any-2", "second finished first");
+    const firstResult = await firstWait;
+    assert.deepEqual(firstResult.settledIds, [second!.id]);
+    assert.equal(manager.view.get(first!.id)?.status, "running");
+    delivered.add(second!.id);
+
+    // A delivered terminal child alone must not satisfy the next "any" wait.
+    let returned = false;
+    const secondWait = waitAny().then((result) => {
+      returned = true;
+      return result;
     });
-    const delivered: string[] = [];
-    manager.view.setOnSettled((snapshot) => delivered.push(snapshot.id));
-    const gated = await runtime.runPromise(
-      manager.spawn("codex", {
-        ...task("cancel-gate"),
-        acceptance: {
-          timeoutMs: 2000,
-          evaluate: (_snapshot, abortSignal) => {
-            signal = abortSignal;
-            return verdict;
-          },
-        },
-      }),
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(returned, false, "an already-delivered result is not new");
+    await controlled.complete("any-1");
+    const secondResult = await secondWait;
+    assert.deepEqual(
+      [...secondResult.settledIds].sort(),
+      [first!.id, second!.id].sort(),
     );
-    await waitUntil(() => controlled.starts.length === 1, "child starts");
-    await controlled.complete("cancel-gate");
-    await waitUntil(() => signal !== undefined, "gate evaluates");
-    const results = await runtime.runPromise(manager.cancel([gated.id]));
-    assert.equal(results[0]?.cancelled, true);
-    assert.equal(signal?.aborted, true);
-    assert.equal(gated.acceptance?.status, "error");
-    release({ status: "pass" });
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(gated.acceptance?.status, "error");
-    assert.deepEqual(delivered, [gated.id]);
-  });
-});
+    delivered.add(first!.id);
 
-test("standalone acceptance timeout is not process failure and does not expose evaluator errors", async () => {
-  await withControlledManager(async (manager, runtime, controlled) => {
-    const gated = await runtime.runPromise(
-      manager.spawn("codex", {
-        ...task("timeout-gate"),
-        acceptance: { timeoutMs: 20, evaluate: () => new Promise(() => {}) },
-      }),
-    );
-    await waitUntil(() => controlled.starts.length === 1, "child starts");
-    await controlled.complete("timeout-gate");
-    await runtime.runPromise(manager.awaitSettlement(gated.id));
-    assert.equal(gated.status, "done");
-    assert.equal(gated.outcome?._tag, "Completed");
-    assert.deepEqual(gated.acceptance, {
-      status: "error",
-      reason: "Acceptance gate timed out.",
-    });
-  });
-});
-
-test("manager rejects acceptance hooks on workflow-owned children", async () => {
-  await withControlledManager(async (manager, runtime) => {
-    await assert.rejects(
-      runtime.runPromise(
-        manager.spawn("codex", {
-          ...task("workflow-gate"),
-          workflow: { runId: "run", taskId: "task", attemptId: "attempt" },
-          acceptance: {
-            timeoutMs: 1000,
-            evaluate: async () => ({ status: "pass" }),
-          },
-        }),
-      ),
-      /parent-owned task/,
-    );
-  });
-});
-
-test("process failure bypasses standalone acceptance", async () => {
-  await withControlledManager(async (manager, runtime, controlled) => {
-    let evaluations = 0;
-    const failed = await runtime.runPromise(
-      manager.spawn("codex", {
-        ...task("failed-before-gate"),
-        acceptance: {
-          timeoutMs: 1000,
-          evaluate: async () => {
-            evaluations++;
-            return { status: "pass" };
-          },
-        },
-      }),
-    );
-    await waitUntil(() => controlled.starts.length === 1, "child starts");
-    await controlled.emit("failed-before-gate", {
-      _tag: "RunSettled",
-      outcome: { _tag: "Failed", errorText: "process failed" },
-    });
-    const settled = await runtime.runPromise(
-      manager.awaitSettlement(failed.id),
-    );
-    assert.equal(settled?.outcome?._tag, "Failed");
-    assert.equal(settled?.acceptance, undefined);
-    assert.equal(evaluations, 0);
-  });
-});
-
-test("standalone acceptance preserves rejection and hides evaluator errors", async () => {
-  await withControlledManager(async (manager, runtime, controlled) => {
-    const rejected = await runtime.runPromise(
-      manager.spawn("codex", {
-        ...task("rejected-gate"),
-        acceptance: {
-          timeoutMs: 1000,
-          evaluate: async () => ({
-            status: "reject",
-            reason: "insufficient proof",
-          }),
-        },
-      }),
-    );
-    const errored = await runtime.runPromise(
-      manager.spawn("codex", {
-        ...task("errored-gate"),
-        acceptance: {
-          timeoutMs: 1000,
-          evaluate: async () => {
-            throw new Error("private provider failure");
-          },
-        },
-      }),
-    );
-    await waitUntil(() => controlled.starts.length === 2, "children start");
-    await Promise.all([
-      controlled.complete("rejected-gate"),
-      controlled.complete("errored-gate"),
-    ]);
-    await Promise.all([
-      runtime.runPromise(manager.awaitSettlement(rejected.id)),
-      runtime.runPromise(manager.awaitSettlement(errored.id)),
-    ]);
-    assert.equal(rejected.outcome?._tag, "Completed");
-    assert.deepEqual(rejected.acceptance, {
-      status: "reject",
-      reason: "insufficient proof",
-    });
-    assert.equal(errored.outcome?._tag, "Completed");
-    assert.deepEqual(errored.acceptance, {
-      status: "error",
-      reason: "Acceptance gate evaluation failed.",
-    });
-  });
-});
-
-test("standalone acceptance converts invalid evaluator output to a bounded error", async () => {
-  await withControlledManager(async (manager, runtime, controlled) => {
-    const invalid = await runtime.runPromise(
-      manager.spawn("codex", {
-        ...task("invalid-gate"),
-        acceptance: {
-          timeoutMs: 1000,
-          // SAFETY: Deliberately violate the compile-time callback contract to
-          // prove that JavaScript evaluator output is checked at runtime.
-          evaluate: async () => ({ status: "maybe", reason: 42 }) as never,
-        },
-      }),
-    );
-    await waitUntil(() => controlled.starts.length === 1, "child starts");
-    await controlled.complete("invalid-gate");
-    await runtime.runPromise(manager.awaitSettlement(invalid.id));
-    assert.deepEqual(invalid.acceptance, {
-      status: "error",
-      reason: "Acceptance gate returned an invalid result.",
-    });
-  });
-});
-
-test("acceptance timeout fences late gate and process results exactly once", async () => {
-  await withControlledManager(async (manager, runtime, controlled) => {
-    let release!: (value: { status: "pass" }) => void;
-    let signal: AbortSignal | undefined;
-    const verdict = new Promise<{ status: "pass" }>((resolve) => {
-      release = resolve;
-    });
-    const delivered: string[] = [];
-    manager.view.setOnSettled((snapshot) => delivered.push(snapshot.id));
-    const gated = await runtime.runPromise(
-      manager.spawn("codex", {
-        ...task("late-gate"),
-        acceptance: {
-          timeoutMs: 20,
-          evaluate: (_snapshot, abortSignal) => {
-            signal = abortSignal;
-            return verdict;
-          },
-        },
-      }),
-    );
-    await waitUntil(() => controlled.starts.length === 1, "child starts");
-    await controlled.complete("late-gate");
-    await runtime.runPromise(manager.awaitSettlement(gated.id));
-    assert.equal(signal?.aborted, true);
-    release({ status: "pass" });
-    await controlled.complete("late-gate", "duplicate process result");
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.deepEqual(gated.acceptance, {
-      status: "error",
-      reason: "Acceptance gate timed out.",
-    });
-    assert.deepEqual(delivered, [gated.id]);
-  });
-});
-
-test("shutdown aborts a pending acceptance and settles its handle without delivery", async () => {
-  const controlled = makeControlledBackend();
-  const runtime = createRuntimeWith(controlled.backend);
-  const manager = await runtime.runPromise(SubagentManager);
-  let signal: AbortSignal | undefined;
-  const delivered: string[] = [];
-  manager.view.setOnSettled((snapshot) => delivered.push(snapshot.id));
-  const gated = await runtime.runPromise(
-    manager.spawn("codex", {
-      ...task("shutdown-gate"),
-      acceptance: {
-        timeoutMs: 2000,
-        evaluate: (_snapshot, abortSignal) => {
-          signal = abortSignal;
-          return new Promise(() => {});
-        },
-      },
-    }),
-  );
-  await waitUntil(() => controlled.starts.length === 1, "child starts");
-  await controlled.complete("shutdown-gate");
-  await waitUntil(() => signal !== undefined, "gate starts");
-  await runtime.runPromise(manager.disposeAll);
-  const settled = await runtime.runPromise(manager.awaitSettlement(gated.id));
-  assert.equal(signal?.aborted, true);
-  assert.deepEqual(settled?.acceptance, {
-    status: "error",
-    reason: "Acceptance gate was cancelled during shutdown.",
-  });
-  assert.deepEqual(delivered, []);
-  await runtime.dispose();
-});
-
-test("manager rejects acceptance on client delivery and invalid timeouts", async () => {
-  await withControlledManager(async (manager, runtime) => {
-    const acceptance = {
-      timeoutMs: 1000,
-      evaluate: async () => ({ status: "pass" as const }),
-    };
-    await assert.rejects(
-      runtime.runPromise(
-        manager.spawn("codex", {
-          ...task("client-gate"),
-          resultDelivery: "client",
-          client: { id: "owner", correlationId: "correlation" },
-          acceptance,
-        }),
-      ),
-      /parent-owned task/,
-    );
-    await assert.rejects(
-      runtime.runPromise(
-        manager.spawn("codex", {
-          ...task("invalid-timeout"),
-          acceptance: { ...acceptance, timeoutMs: 0 },
-        }),
-      ),
-      /valid bounded timeout/,
-    );
-  });
-});
-
-test("pending acceptance survives tracked-entry pruning", async () => {
-  await withControlledManager(async (manager, runtime, controlled) => {
-    let release!: (value: { status: "pass" }) => void;
-    const verdict = new Promise<{ status: "pass" }>((resolve) => {
-      release = resolve;
-    });
-    const gated = await runtime.runPromise(
-      manager.spawn("codex", {
-        ...task("retained-gate"),
-        acceptance: { timeoutMs: 2000, evaluate: () => verdict },
-      }),
-    );
-    const others = await runtime.runPromise(
-      Effect.forEach(
-        Array.from({ length: 64 }, (_, index) => `gate-prune-${index}`),
-        (prompt) => manager.spawn("codex", task(prompt)),
-        { concurrency: "unbounded" },
-      ),
-    );
-    await waitUntil(
-      () => controlled.starts.includes("retained-gate"),
-      "gated child starts",
-    );
-    await controlled.complete("retained-gate");
-    await waitUntil(
-      () => gated.acceptance?.status === "pending",
-      "gate becomes pending",
-    );
-
-    for (let index = 0; index < others.length; index++) {
-      const prompt = `gate-prune-${index}`;
-      await waitUntil(
-        () => controlled.starts.includes(prompt),
-        `${prompt} starts`,
-      );
-      await controlled.complete(prompt);
-    }
-    assert.equal(manager.view.get(gated.id)?.acceptance?.status, "pending");
-    release({ status: "pass" });
-    const settled = await runtime.runPromise(manager.awaitSettlement(gated.id));
-    assert.equal(settled?.acceptance?.status, "pass");
+    await controlled.complete("any-3");
+    const last = await waitAny();
+    assert.ok(last.settledIds.includes(third!.id));
   });
 });

@@ -12,7 +12,18 @@ import {
 } from "./events.ts";
 import { foldWorkflowEvents } from "./reducer.ts";
 export const WORKFLOW_RUNS_NAMESPACE = "runs";
-export const WORKFLOW_RUN_JOURNAL_FILE = "journal.json";
+/** Append-only JSONL journal: one version header line, then one event per line. */
+export const WORKFLOW_RUN_JOURNAL_FILE = "journal.jsonl";
+/** Retired single-document journal; detected only to reject it clearly. */
+export const WORKFLOW_LEGACY_RUN_JOURNAL_FILE = "journal.json";
+export const WORKFLOW_JOURNAL_FORMAT = "pi-workflow-journal";
+export const WORKFLOW_JOURNAL_VERSION = 1;
+const WORKFLOW_JOURNAL_HEADER = JSON.stringify({
+  format: WORKFLOW_JOURNAL_FORMAT,
+  version: WORKFLOW_JOURNAL_VERSION,
+});
+const LEGACY_JOURNAL_MESSAGE =
+  "Workflow journal uses the retired single-document JSON format, which is no longer supported; remove the run directory to discard it.";
 export const WORKFLOW_RUN_DIRECTORY_MODE = 0o700;
 export const WORKFLOW_RUN_FILE_MODE = 0o600;
 export const MAX_WORKFLOW_ARTIFACT_FAILURES = 64;
@@ -77,9 +88,26 @@ export interface WorkflowRunArtifactStore {
   readonly matchesCwd?: (cwd: string) => boolean;
   journalPath(runId: string): string;
   create(runId: string, events: ReadonlyArray<WorkflowEvent>): void;
-  replace(runId: string, events: ReadonlyArray<WorkflowEvent>): void;
+  /** Append one accepted event without rewriting earlier journal bytes. */
+  append(runId: string, event: WorkflowEvent): void;
   load(runId: string): ReadonlyArray<WorkflowEvent>;
   scan(): WorkflowArtifactScan;
+}
+
+/**
+ * Events whose loss after a crash would change recovered state in a way the
+ * operator could notice: approval, controls, and terminal transitions. Queue,
+ * start, and log events are flushed by the next durable event's fsync.
+ */
+export function isDurableWorkflowEvent(event: WorkflowEvent): boolean {
+  switch (event._tag) {
+    case "TaskQueued":
+    case "TaskStarted":
+    case "WorkflowLogAdded":
+      return false;
+    default:
+      return true;
+  }
 }
 
 function isErrno(error: unknown, code: string): boolean {
@@ -395,15 +423,6 @@ function parseEvent(value: unknown, index: number): WorkflowEvent {
         childId: requiredString(record, "childId", label),
         attemptId: optionalString(record, "attemptId", label),
       });
-    case "TaskEvaluationStarted":
-      assertKeys(record, ["_tag", "runId", "at", "taskId", "attemptId"], label);
-      return boundWorkflowEvent({
-        _tag: "TaskEvaluationStarted",
-        runId,
-        at,
-        taskId: requiredString(record, "taskId", label),
-        attemptId: requiredString(record, "attemptId", label),
-      });
     case "TaskStarted":
       assertKeys(record, ["_tag", "runId", "at", "taskId", "attemptId"], label);
       return boundWorkflowEvent({
@@ -416,15 +435,7 @@ function parseEvent(value: unknown, index: number): WorkflowEvent {
     case "TaskCompleted":
       assertKeys(
         record,
-        [
-          "_tag",
-          "runId",
-          "at",
-          "taskId",
-          "resultPreview",
-          "evaluationResult",
-          "attemptId",
-        ],
+        ["_tag", "runId", "at", "taskId", "resultPreview", "attemptId"],
         label,
       );
       return boundWorkflowEvent({
@@ -433,22 +444,12 @@ function parseEvent(value: unknown, index: number): WorkflowEvent {
         at,
         taskId: requiredString(record, "taskId", label),
         resultPreview: optionalString(record, "resultPreview", label),
-        evaluationResult: optionalField(record, "evaluationResult") as never,
         attemptId: optionalString(record, "attemptId", label),
       });
     case "TaskFailed":
       assertKeys(
         record,
-        [
-          "_tag",
-          "runId",
-          "at",
-          "taskId",
-          "error",
-          "failureKind",
-          "evaluationFailureKind",
-          "attemptId",
-        ],
+        ["_tag", "runId", "at", "taskId", "error", "failureKind", "attemptId"],
         label,
       );
       return boundWorkflowEvent({
@@ -459,10 +460,6 @@ function parseEvent(value: unknown, index: number): WorkflowEvent {
         error: requiredString(record, "error", label),
         failureKind: optionalField(record, "failureKind") as
           "provider_stall" | "backend_failure" | undefined,
-        evaluationFailureKind: optionalField(
-          record,
-          "evaluationFailureKind",
-        ) as "gate_rejected" | "evaluator_error" | undefined,
         attemptId: optionalString(record, "attemptId", label),
       });
     case "TaskCancelled":
@@ -623,20 +620,56 @@ export function serializeWorkflowJournal(
       `Workflow journal contains invalid state: ${failureMessage(error)}`,
     );
   }
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(bounded);
-  } catch (error) {
-    throw new WorkflowArtifactBoundsError(
-      `Workflow journal is not JSON serializable: ${failureMessage(error)}`,
-    );
-  }
+  const lines = [WORKFLOW_JOURNAL_HEADER];
+  for (const event of bounded) lines.push(serializeEventLine(event));
+  const serialized = `${lines.join("\n")}\n`;
   if (utf8Bytes(serialized) > maxBytes) {
     throw new WorkflowArtifactBoundsError(
       `Workflow journal exceeds ${maxBytes} UTF-8 bytes.`,
     );
   }
   return serialized;
+}
+
+function serializeEventLine(event: WorkflowEvent): string {
+  try {
+    return JSON.stringify(event);
+  } catch (error) {
+    throw new WorkflowArtifactBoundsError(
+      `Workflow journal is not JSON serializable: ${failureMessage(error)}`,
+    );
+  }
+}
+
+function parseHeader(line: string): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line) as unknown;
+  } catch (error) {
+    throw new WorkflowArtifactBoundsError(
+      `Workflow journal header is not valid JSON: ${failureMessage(error)}`,
+    );
+  }
+  const record = assertRecord(parsed, "Workflow journal header");
+  assertKeys(record, ["format", "version"], "Workflow journal header");
+  if (record.format !== WORKFLOW_JOURNAL_FORMAT) {
+    throw new WorkflowArtifactBoundsError(
+      "Workflow journal header has an unknown format.",
+    );
+  }
+  if (record.version !== WORKFLOW_JOURNAL_VERSION) {
+    throw new WorkflowArtifactBoundsError(
+      `Workflow journal version is unsupported; expected ${WORKFLOW_JOURNAL_VERSION}.`,
+    );
+  }
+}
+
+interface ParsedJournal {
+  readonly events: ReadonlyArray<WorkflowEvent>;
+  /** UTF-8 length of the complete, newline-terminated prefix. */
+  readonly validBytes: number;
+  /** A crash interrupted a non-durable append; the fragment is ignored. */
+  readonly tornTail: boolean;
 }
 
 export interface WorkflowJournalParseOptions {
@@ -649,35 +682,54 @@ export function parseWorkflowJournal(
   serialized: string,
   options: WorkflowJournalParseOptions = {},
 ): ReadonlyArray<WorkflowEvent> {
-  const maxEvents = options.maxEvents ?? MAX_WORKFLOW_EVENTS;
-  const maxBytes = options.maxBytes ?? MAX_WORKFLOW_ARTIFACT_BYTES;
   if (typeof serialized !== "string") {
     throw new WorkflowArtifactBoundsError(
       "Workflow journal must be UTF-8 text.",
     );
   }
+  return parseJournalText(serialized, options).events;
+}
+
+function parseJournalText(
+  serialized: string,
+  options: WorkflowJournalParseOptions,
+): ParsedJournal {
+  const maxEvents = options.maxEvents ?? MAX_WORKFLOW_EVENTS;
+  const maxBytes = options.maxBytes ?? MAX_WORKFLOW_ARTIFACT_BYTES;
   if (utf8Bytes(serialized) > maxBytes) {
     throw new WorkflowArtifactBoundsError(
       `Workflow journal exceeds ${maxBytes} UTF-8 bytes.`,
     );
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(serialized) as unknown;
-  } catch (error) {
+  if (serialized.trimStart().startsWith("[")) {
+    throw new WorkflowArtifactBoundsError(LEGACY_JOURNAL_MESSAGE);
+  }
+  const lastNewline = serialized.lastIndexOf("\n");
+  if (lastNewline < 0) {
     throw new WorkflowArtifactBoundsError(
-      `Workflow journal is not valid JSON: ${failureMessage(error)}`,
+      "Workflow journal is missing a complete header line.",
     );
   }
-  if (!Array.isArray(parsed)) {
-    throw new WorkflowArtifactBoundsError("Workflow journal must be an array.");
-  }
-  if (parsed.length === 0 || parsed.length > maxEvents) {
+  const complete = serialized.slice(0, lastNewline);
+  const tornTail = lastNewline !== serialized.length - 1;
+  const [header, ...lines] = complete.split("\n");
+  parseHeader(header ?? "");
+  if (lines.length === 0 || lines.length > maxEvents) {
     throw new WorkflowArtifactBoundsError(
       `Workflow journal must contain between 1 and ${maxEvents} events.`,
     );
   }
-  const events = parsed.map((value, index) => parseEvent(value, index));
+  const events = lines.map((line, index) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch (error) {
+      throw new WorkflowArtifactBoundsError(
+        `Workflow event ${index + 1} is not valid JSON: ${failureMessage(error)}`,
+      );
+    }
+    return parseEvent(parsed, index);
+  });
   const state = foldWorkflowEvents(events);
   if (options.expectedRunId !== undefined) {
     safeRunId(options.expectedRunId);
@@ -687,7 +739,26 @@ export function parseWorkflowJournal(
       );
     }
   }
-  return Object.freeze(events);
+  return {
+    events: Object.freeze(events),
+    validBytes: utf8Bytes(serialized.slice(0, lastNewline + 1)),
+    tornTail,
+  };
+}
+
+interface JournalTail {
+  readonly events: number;
+  readonly bytes: number;
+  readonly tornTail: boolean;
+}
+
+function hasLegacyJournal(runDir: string): boolean {
+  try {
+    fs.lstatSync(path.join(runDir, WORKFLOW_LEGACY_RUN_JOURNAL_FILE));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function directoryModeIsPrivate(directory: string): boolean {
@@ -751,6 +822,8 @@ export class WorkflowArtifactStore implements WorkflowRunArtifactStore {
   private readonly projectDir: string;
   private readonly createTempId: () => string;
   private readonly maxScanEntries: number;
+  /** Known journal tails, so appends need neither a re-read nor a re-fold. */
+  private readonly tails = new Map<string, JournalTail>();
 
   constructor(options: WorkflowArtifactStoreOptions) {
     const root = options.workflowsDir;
@@ -811,11 +884,105 @@ export class WorkflowArtifactStore implements WorkflowRunArtifactStore {
   }
 
   create(runId: string, events: ReadonlyArray<WorkflowEvent>): void {
-    this.write(runId, events, true);
+    this.write(runId, events);
   }
 
-  replace(runId: string, events: ReadonlyArray<WorkflowEvent>): void {
-    this.write(runId, events, false);
+  append(runId: string, event: WorkflowEvent): void {
+    const file = this.journalPath(runId);
+    const normalized = boundWorkflowEvent(event);
+    if (normalized.runId !== runId) {
+      throw new WorkflowArtifactPathError(
+        "Workflow event does not belong to its artifact run.",
+      );
+    }
+    const line = Buffer.from(`${serializeEventLine(normalized)}\n`, "utf8");
+    const tail = this.tails.get(runId) ?? this.loadTail(runId);
+    if (tail.events + 1 > this.maxEvents) {
+      throw new WorkflowArtifactBoundsError(
+        `Workflow journal is limited to ${this.maxEvents} events.`,
+      );
+    }
+    if (tail.bytes + line.length > this.maxBytes) {
+      throw new WorkflowArtifactBoundsError(
+        `Workflow journal exceeds ${this.maxBytes} UTF-8 bytes.`,
+      );
+    }
+    const runDir = path.dirname(file);
+    checkDirectoryTree(this.workflowsDir, false, "Workflow directory");
+    checkDirectoryTree(this.runsDir, false, "Workflow runs namespace");
+    checkDirectoryTree(this.projectDir, false, "Workflow project namespace");
+    if (!checkDirectoryTree(runDir, false, "Workflow run directory")) {
+      throw new WorkflowArtifactPathError(
+        `Workflow run artifact does not exist: ${runId}`,
+      );
+    }
+
+    let fd: number | undefined;
+    let wrote = false;
+    try {
+      const noFollow =
+        (fs.constants as { readonly O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+      fd = fs.openSync(
+        file,
+        fs.constants.O_WRONLY | fs.constants.O_APPEND | noFollow,
+      );
+      const stat = fs.fstatSync(fd);
+      assertPrivateFile(stat, file);
+      if (stat.size !== tail.bytes) {
+        // Only a fragment recorded by load() as torn may be discarded; any
+        // other size drift means another writer touched the journal.
+        if (!tail.tornTail || stat.size < tail.bytes) {
+          throw new WorkflowArtifactError(
+            `Workflow journal changed outside its store: ${runId}`,
+          );
+        }
+        fs.ftruncateSync(fd, tail.bytes);
+      }
+      wrote = true;
+      let offset = 0;
+      while (offset < line.length) {
+        offset += fs.writeSync(fd, line, offset, line.length - offset);
+      }
+      if (isDurableWorkflowEvent(normalized)) fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = undefined;
+    } catch (error) {
+      if (fd !== undefined) {
+        if (wrote) {
+          try {
+            // Drop a partial line so the journal stays a valid prefix.
+            fs.ftruncateSync(fd, tail.bytes);
+          } catch {
+            // A later load treats an unterminated fragment as torn.
+          }
+        }
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // Preserve the append failure.
+        }
+      }
+      if (error instanceof WorkflowArtifactError) throw error;
+      throw new WorkflowArtifactError(
+        `Could not append workflow run ${runId}: ${failureMessage(error)}`,
+      );
+    }
+    this.tails.set(runId, {
+      events: tail.events + 1,
+      bytes: tail.bytes + line.length,
+      tornTail: false,
+    });
+  }
+
+  private loadTail(runId: string): JournalTail {
+    this.load(runId);
+    const tail = this.tails.get(runId);
+    if (tail === undefined) {
+      throw new WorkflowArtifactError(
+        `Workflow journal tail is unavailable: ${runId}`,
+      );
+    }
+    return tail;
   }
 
   load(runId: string): ReadonlyArray<WorkflowEvent> {
@@ -830,14 +997,28 @@ export class WorkflowArtifactStore implements WorkflowRunArtifactStore {
           `Workflow run artifact does not exist: ${runId}`,
         );
       }
-      const stat = fs.lstatSync(file);
+      let stat: fs.Stats;
+      try {
+        stat = fs.lstatSync(file);
+      } catch (error) {
+        if (isErrno(error, "ENOENT") && hasLegacyJournal(runDir)) {
+          throw new WorkflowArtifactBoundsError(LEGACY_JOURNAL_MESSAGE);
+        }
+        throw error;
+      }
       assertPrivateFile(stat, file);
       const text = readJournalFile(file, this.maxBytes);
-      return parseWorkflowJournal(text, {
+      const parsed = parseJournalText(text, {
         expectedRunId: runId,
         maxEvents: this.maxEvents,
         maxBytes: this.maxBytes,
       });
+      this.tails.set(runId, {
+        events: parsed.events.length,
+        bytes: parsed.validBytes,
+        tornTail: parsed.tornTail,
+      });
+      return parsed.events;
     } catch (error) {
       if (error instanceof WorkflowArtifactError) throw error;
       throw new WorkflowArtifactError(
@@ -916,7 +1097,15 @@ export class WorkflowArtifactStore implements WorkflowRunArtifactStore {
             throw new WorkflowArtifactPathError("run directory is not private");
           }
           const journal = path.join(runPath, WORKFLOW_RUN_JOURNAL_FILE);
-          const journalStat = fs.lstatSync(journal);
+          let journalStat: fs.Stats;
+          try {
+            journalStat = fs.lstatSync(journal);
+          } catch (error) {
+            if (isErrno(error, "ENOENT") && hasLegacyJournal(runPath)) {
+              throw new WorkflowArtifactBoundsError(LEGACY_JOURNAL_MESSAGE);
+            }
+            throw error;
+          }
           assertPrivateFile(journalStat, journal);
           artifacts.push({ runId: entry.name, path: journal });
         } catch (error) {
@@ -941,11 +1130,8 @@ export class WorkflowArtifactStore implements WorkflowRunArtifactStore {
     };
   }
 
-  private write(
-    runId: string,
-    events: ReadonlyArray<WorkflowEvent>,
-    exclusive: boolean,
-  ): void {
+  /** Atomically create a new journal; later events use append(). */
+  private write(runId: string, events: ReadonlyArray<WorkflowEvent>): void {
     const file = this.journalPath(runId);
     const serialized = serializeWorkflowJournal(events, {
       maxEvents: this.maxEvents,
@@ -964,14 +1150,9 @@ export class WorkflowArtifactStore implements WorkflowRunArtifactStore {
     } catch (error) {
       if (!isErrno(error, "ENOENT")) throw error;
     }
-    if (exclusive && existing !== undefined) {
+    if (existing !== undefined) {
       throw new WorkflowArtifactPathError(
         `Workflow run artifact already exists: ${runId}`,
-      );
-    }
-    if (!exclusive && existing === undefined) {
-      throw new WorkflowArtifactPathError(
-        `Workflow run artifact does not exist: ${runId}`,
       );
     }
 
@@ -1001,14 +1182,9 @@ export class WorkflowArtifactStore implements WorkflowRunArtifactStore {
       } catch (error) {
         if (!isErrno(error, "ENOENT")) throw error;
       }
-      if (exclusive && current !== undefined) {
+      if (current !== undefined) {
         throw new WorkflowArtifactPathError(
           `Workflow run artifact already exists: ${runId}`,
-        );
-      }
-      if (!exclusive && current === undefined) {
-        throw new WorkflowArtifactPathError(
-          `Workflow run artifact disappeared: ${runId}`,
         );
       }
       fs.renameSync(temp, file);
@@ -1041,5 +1217,10 @@ export class WorkflowArtifactStore implements WorkflowRunArtifactStore {
         `Could not atomically write workflow run ${runId}: ${failureMessage(error)}`,
       );
     }
+    this.tails.set(runId, {
+      events: events.length,
+      bytes: Buffer.byteLength(serialized, "utf8"),
+      tornTail: false,
+    });
   }
 }

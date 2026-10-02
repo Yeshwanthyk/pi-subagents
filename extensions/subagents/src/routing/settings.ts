@@ -5,13 +5,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   BACKEND_NAMES,
+  MAX_RUNNING_LIMITS,
   REASONING_EFFORTS,
   type BackendName,
   type ReasoningEffort,
 } from "../domain.ts";
 import {
   ROUTING_INTENTS,
-  type JevSettings,
   type RouteKey,
   type RouteTable,
   type RoutingPolicy,
@@ -32,6 +32,7 @@ export const PROJECT_SUBAGENTS_PATH = path.join(".pi", "subagents.json");
 
 export const DEFAULT_SUBAGENT_SETTINGS: SubagentSettings = deepFreeze({
   version: 1,
+  maxRunning: MAX_RUNNING_LIMITS.default,
   routing: {
     enabled: false,
     approval: "ask",
@@ -39,17 +40,11 @@ export const DEFAULT_SUBAGENT_SETTINGS: SubagentSettings = deepFreeze({
     unavailable: "ask",
     routes: {},
   },
-  jev: {
-    apiKeyEnv: "TYPESAFE_API_KEY",
-    model: "jev-1.13.0",
-    timeoutMs: 10_000,
-    maxConcurrent: 2,
-  },
 });
 
 interface ParsedSettings {
+  readonly maxRunning?: number;
   readonly routing?: Partial<RoutingPolicy> & { readonly routes?: RouteTable };
-  readonly jev?: Partial<JevSettings>;
 }
 
 export interface LoadSubagentSettingsOptions {
@@ -95,21 +90,6 @@ function oneOf<T extends string>(
     throw new Error(`${label} is invalid`);
   }
   return value as T;
-}
-
-function positiveInteger(
-  value: unknown,
-  label: string,
-  maximum: number,
-): number {
-  if (
-    !Number.isSafeInteger(value) ||
-    (value as number) < 1 ||
-    (value as number) > maximum
-  ) {
-    throw new Error(`${label} must be an integer from 1 to ${maximum}`);
-  }
-  return value as number;
 }
 
 function nonEmptyString(value: unknown, label: string): string {
@@ -160,11 +140,7 @@ function parseRoutes(value: unknown, label: string): RouteTable {
   return output;
 }
 
-function parseFile(
-  text: string,
-  label: string,
-  project: boolean,
-): ParsedSettings {
+function parseFile(text: string, label: string): ParsedSettings {
   if (Buffer.byteLength(text, "utf8") > MAX_SETTINGS_BYTES)
     throw new Error(`${label} exceeds ${MAX_SETTINGS_BYTES} bytes`);
   let value: unknown;
@@ -176,8 +152,22 @@ function parseFile(
     );
   }
   const input = record(value, label);
-  onlyKeys(input, ["version", "routing", "jev"], label);
+  onlyKeys(input, ["version", "maxRunning", "routing"], label);
   if (input.version !== 1) throw new Error(`${label} has unsupported version`);
+  let maxRunning: number | undefined;
+  if (input.maxRunning !== undefined) {
+    if (
+      typeof input.maxRunning !== "number" ||
+      !Number.isInteger(input.maxRunning) ||
+      input.maxRunning < MAX_RUNNING_LIMITS.min ||
+      input.maxRunning > MAX_RUNNING_LIMITS.max
+    ) {
+      throw new Error(
+        `${label}.maxRunning must be an integer from ${MAX_RUNNING_LIMITS.min} through ${MAX_RUNNING_LIMITS.max}`,
+      );
+    }
+    maxRunning = input.maxRunning;
+  }
 
   let routing: ParsedSettings["routing"];
   if (input.routing !== undefined) {
@@ -224,54 +214,9 @@ function parseFile(
     };
   }
 
-  let jev: ParsedSettings["jev"];
-  if (input.jev !== undefined) {
-    const raw = record(input.jev, `${label}.jev`);
-    if (Object.hasOwn(raw, "enabled")) {
-      throw new Error(
-        `${label}.jev.enabled is obsolete; remove it because credential presence now controls Jev availability`,
-      );
-    }
-    onlyKeys(
-      raw,
-      ["apiKeyEnv", "model", "timeoutMs", "maxConcurrent"],
-      `${label}.jev`,
-    );
-    if (project && raw.apiKeyEnv !== undefined) {
-      throw new Error(`${label}.jev cannot change credentials`);
-    }
-    jev = {
-      ...(raw.apiKeyEnv === undefined
-        ? {}
-        : {
-            apiKeyEnv: nonEmptyString(raw.apiKeyEnv, `${label}.jev.apiKeyEnv`),
-          }),
-      ...(raw.model === undefined
-        ? {}
-        : { model: nonEmptyString(raw.model, `${label}.jev.model`) }),
-      ...(raw.timeoutMs === undefined
-        ? {}
-        : {
-            timeoutMs: positiveInteger(
-              raw.timeoutMs,
-              `${label}.jev.timeoutMs`,
-              120_000,
-            ),
-          }),
-      ...(raw.maxConcurrent === undefined
-        ? {}
-        : {
-            maxConcurrent: positiveInteger(
-              raw.maxConcurrent,
-              `${label}.jev.maxConcurrent`,
-              32,
-            ),
-          }),
-    };
-  }
   return {
+    ...(maxRunning === undefined ? {} : { maxRunning }),
     ...(routing === undefined ? {} : { routing }),
-    ...(jev === undefined ? {} : { jev }),
   };
 }
 
@@ -300,29 +245,24 @@ function apply(
       "Project routing approval may only restrict the global policy",
     );
   }
-  let jev =
-    overlay.jev === undefined ? base.jev : { ...base.jev, ...overlay.jev };
-  if (project && overlay.jev !== undefined) {
-    if (
-      overlay.jev.timeoutMs !== undefined &&
-      overlay.jev.timeoutMs > base.jev.timeoutMs
-    ) {
-      throw new Error("Project Jev timeout may only restrict the global limit");
-    }
-    if (
-      overlay.jev.maxConcurrent !== undefined &&
-      overlay.jev.maxConcurrent > base.jev.maxConcurrent
-    ) {
-      throw new Error(
-        "Project Jev concurrency may only restrict the global limit",
-      );
-    }
-    jev = { ...jev, apiKeyEnv: base.jev.apiKeyEnv };
+  if (
+    project &&
+    overlay.maxRunning !== undefined &&
+    overlay.maxRunning > base.maxRunning
+  ) {
+    throw new Error(
+      `Project maxRunning may only lower the global cap (${base.maxRunning})`,
+    );
   }
-  return { version: 1, routing, jev };
+  return {
+    version: 1,
+    maxRunning: overlay.maxRunning ?? base.maxRunning,
+    routing,
+  };
 }
 
-function readOptional(file: string): string | undefined {
+/** Stat signature: absent files key as "-", present files by identity, mtime, and size. */
+function statSignature(file: string): string {
   try {
     const stat = fs.lstatSync(file);
     if (
@@ -331,6 +271,16 @@ function readOptional(file: string): string | undefined {
       stat.size > MAX_SETTINGS_BYTES
     )
       throw new Error(`${file} is not a bounded regular settings file`);
+    return `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "-";
+    throw error;
+  }
+}
+
+function readOptional(file: string): string | undefined {
+  if (statSignature(file) === "-") return undefined;
+  try {
     return fs.readFileSync(file, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
@@ -338,11 +288,24 @@ function readOptional(file: string): string | undefined {
   }
 }
 
+const SNAPSHOT_CACHE_LIMIT = 16;
+/** Merged snapshots keyed by both files' (path, inode, mtimeMs, size) and trust. */
+const snapshotCache = new Map<string, SettingsSnapshot>();
+
+/** Test hook: drop cached settings snapshots. */
+export function clearSubagentSettingsCache(): void {
+  snapshotCache.clear();
+}
+
 export function settingsDigest(settings: SubagentSettings): string {
   return createHash("sha256").update(JSON.stringify(settings)).digest("hex");
 }
 
-/** Read, strictly validate, and atomically merge global and trusted-project settings. */
+/**
+ * Read, strictly validate, and atomically merge global and trusted-project
+ * settings. Filesystem reads are cached by each file's stat signature, so an
+ * unchanged pair of files costs two lstat calls; any change reloads both.
+ */
 export function loadSubagentSettings(
   options: LoadSubagentSettingsOptions,
 ): SettingsSnapshot {
@@ -350,7 +313,39 @@ export function loadSubagentSettings(
     options.globalPath ?? DEFAULT_GLOBAL_SUBAGENTS_PATH,
   );
   const projectPath = path.resolve(options.cwd, PROJECT_SUBAGENTS_PATH);
-  const read = options.readFile ?? readOptional;
+  if (options.readFile !== undefined) {
+    return buildSnapshot(options, globalPath, projectPath, options.readFile);
+  }
+  const key = [
+    globalPath,
+    statSignature(globalPath),
+    projectPath,
+    statSignature(projectPath),
+    options.projectTrusted ? "trusted" : "untrusted",
+  ].join("\0");
+  const cached = snapshotCache.get(key);
+  if (cached !== undefined) return cached;
+  const snapshot = buildSnapshot(
+    options,
+    globalPath,
+    projectPath,
+    readOptional,
+  );
+  // Only successful loads are cached; invalid files keep failing on each call.
+  if (snapshotCache.size >= SNAPSHOT_CACHE_LIMIT) {
+    const oldest = snapshotCache.keys().next().value;
+    if (oldest !== undefined) snapshotCache.delete(oldest);
+  }
+  snapshotCache.set(key, snapshot);
+  return snapshot;
+}
+
+function buildSnapshot(
+  options: LoadSubagentSettingsOptions,
+  globalPath: string,
+  projectPath: string,
+  read: (file: string) => string | undefined,
+): SettingsSnapshot {
   const notices: string[] = [];
   const globalText = read(globalPath);
   let settings =
@@ -358,7 +353,7 @@ export function loadSubagentSettings(
       ? DEFAULT_SUBAGENT_SETTINGS
       : apply(
           DEFAULT_SUBAGENT_SETTINGS,
-          parseFile(globalText, globalPath, false),
+          parseFile(globalText, globalPath),
           false,
         );
 
@@ -368,11 +363,7 @@ export function loadSubagentSettings(
     if (!options.projectTrusted) {
       notices.push(`Ignored untrusted project settings at ${projectPath}`);
     } else {
-      settings = apply(
-        settings,
-        parseFile(projectText, projectPath, true),
-        true,
-      );
+      settings = apply(settings, parseFile(projectText, projectPath), true);
       projectApplied = true;
     }
   }

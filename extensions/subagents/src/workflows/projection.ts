@@ -72,8 +72,7 @@ export interface WorkflowTaskProjection {
   readonly dependencies: ReadonlyArray<string>;
   readonly owns: ReadonlyArray<string>;
   readonly readOnly: boolean;
-  readonly executor: "agent" | "evaluation";
-  readonly backend?: BackendName;
+  readonly backend: BackendName;
   readonly model?: string;
   readonly effort?: ReasoningEffort;
   readonly childId?: string;
@@ -81,8 +80,6 @@ export interface WorkflowTaskProjection {
   readonly currentTool?: string;
   readonly completedOperations: number;
   readonly turns: number;
-  readonly acceptance?: "pending" | "passed" | "rejected" | "error";
-  readonly evaluationResult?: string;
   readonly error?: string;
   readonly dependenciesOmitted?: number;
   readonly ownsOmitted?: number;
@@ -300,32 +297,6 @@ function taskProjection(
   const effort = child?.meta.reasoningEffort ?? task.definition.effort;
   const operation = currentTool(child);
   const error = taskError(task, child);
-  const executor =
-    task.definition.execution?.type === "evaluation" ? "evaluation" : "agent";
-  const evaluationResult =
-    task.outcome?._tag === "Completed" &&
-    task.outcome.evaluationResult !== undefined
-      ? safeLine(
-          JSON.stringify(task.outcome.evaluationResult),
-          WORKFLOW_PROJECTION_LIMITS.maxErrorBytes,
-        )
-      : undefined;
-  const evaluationFailureKind =
-    task.outcome?._tag === "Failed"
-      ? task.outcome.evaluationFailureKind
-      : undefined;
-  const acceptance =
-    task.definition.gate === undefined
-      ? undefined
-      : task.status === "completed"
-        ? "passed"
-        : evaluationFailureKind === "gate_rejected"
-          ? "rejected"
-          : evaluationFailureKind === "evaluator_error"
-            ? "error"
-            : task.status === "running" && child?.status === "done"
-              ? "pending"
-              : undefined;
   const attempts = task.attempts
     .slice(0, WORKFLOW_PROJECTION_LIMITS.maxAttempts)
     .map(attemptProjection);
@@ -347,10 +318,7 @@ function taskProjection(
     dependencies: Object.freeze(boundedDependencies),
     owns: Object.freeze(boundedOwns),
     readOnly: task.definition.readOnly === true,
-    executor,
-    ...(executor === "agent"
-      ? { backend: child?.backend ?? task.definition.harness ?? "pi" }
-      : {}),
+    backend: child?.backend ?? task.definition.harness ?? "pi",
     lastActivityAt: nonNegativeInteger(
       child?.lastActivityAt ?? task.lastActivityAt,
     ),
@@ -364,8 +332,6 @@ function taskProjection(
     ...(task.childId === undefined ? {} : { childId: safeId(task.childId) }),
     ...(operation === undefined ? {} : { currentTool: operation }),
     ...(error === undefined ? {} : { error }),
-    ...(acceptance === undefined ? {} : { acceptance }),
-    ...(evaluationResult === undefined ? {} : { evaluationResult }),
     ...(dependencies.length > boundedDependencies.length
       ? {
           dependenciesOmitted: dependencies.length - boundedDependencies.length,
@@ -545,10 +511,7 @@ export function formatWorkflowProjection(
   lines.push("Task rows:");
   for (const task of projection.tasks) {
     const dependencies = task.dependencies.join(",") || "-";
-    const metadata =
-      task.executor === "evaluation"
-        ? "evaluation"
-        : `${task.backend}/${task.model ?? "?"} · effort:${task.effort ?? "default"}`;
+    const metadata = `${task.backend}/${task.model ?? "?"} · effort:${task.effort ?? "default"}`;
     const activity = [
       task.childId ? `child:${task.childId}` : undefined,
       task.currentTool ? `tool:${task.currentTool}` : undefined,

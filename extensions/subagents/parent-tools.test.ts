@@ -21,11 +21,19 @@ import {
 } from "./src/integration/routing.ts";
 import { loadSubagentSettings } from "./src/routing/settings.ts";
 import type { ConcreteRuntimeSelection } from "./src/routing/domain.ts";
-import { createAskJevTool } from "./src/integration/jev.ts";
 import { createSubagentsSettingsCommand } from "./src/integration/settings-command.ts";
-import { createStandaloneJevAcceptance } from "./src/integration/standalone-gate.ts";
-import { createWorkflowRoutingPreparer } from "./src/integration/workflow-routing.ts";
-import { staticWorkflowDefinitionPreparer } from "./src/workflows/tools.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import subagentsExtension from "./index.ts";
+import {
+  admitBatch,
+  batchOutcomes,
+  formatBatchSpawnResult,
+  normalizeSpawnRequest,
+} from "./src/integration/spawn-batch.ts";
+import {
+  parseWorkflowControlRequest,
+  parseWorkflowToolRequest,
+} from "./src/integration/workflow-params.ts";
 
 function snapshot(
   id: string,
@@ -302,43 +310,6 @@ test("projection exposes conservative capabilities when metadata is absent", () 
   });
 });
 
-test("inspection reports acceptance independently from process status", async () => {
-  const inspected = snapshot("sa-gated", {
-    status: "done",
-    outcome: { _tag: "Completed", finalText: "process completed" },
-    acceptance: { status: "reject", reason: "required evidence was missing" },
-    finalText: "process completed",
-  });
-  const { tools } = fixture([inspected]);
-  const result = await tools.inspect.execute("inspect-gated", {
-    id: inspected.id,
-  });
-
-  assert.equal(result.details.acceptance?.status, "reject");
-  assert.match(result.content[0]!.text, /Acceptance: reject/);
-  assert.match(result.content[0]!.text, /required evidence was missing/);
-  assert.match(result.content[0]!.text, /process completed/);
-});
-
-test("inspection explicitly retrieves a gated report beyond the routine preview limit", async () => {
-  const report = `report start\n${"evidence line\n".repeat(180)}report end`;
-  assert.ok(Buffer.byteLength(report, "utf8") > 2_048);
-  const inspected = snapshot("sa-gated-report", {
-    status: "done",
-    outcome: { _tag: "Completed", finalText: report },
-    acceptance: { status: "pass" },
-    finalText: report,
-  });
-  const { tools } = fixture([inspected]);
-  const result = await tools.inspect.execute("inspect-gated-report", {
-    id: inspected.id,
-  });
-
-  assert.equal(result.details.latestOutput, report);
-  assert.equal(result.details.latestOutputTruncated, false);
-  assert.match(result.content[0]!.text, /report end/);
-});
-
 for (const override of [false, true]) {
   test(`routed admission requires newer approval and is idempotent (override=${override})`, async () => {
     const settings = loadSubagentSettings({
@@ -452,224 +423,6 @@ for (const override of [false, true]) {
   });
 }
 
-test("ask_jev forwards only explicit state/questions and returns safe unavailable errors", async () => {
-  const seen: unknown[] = [];
-  const tool = createAskJevTool({
-    getEvaluator: () => ({
-      async evaluate(input) {
-        seen.push(input);
-        return {
-          ok: false as const,
-          error: {
-            code: "not_configured" as const,
-            message: "Jev credential is missing",
-          },
-        };
-      },
-    }),
-  });
-  const result = await tool.execute(
-    "ask",
-    {
-      state: "selected evidence",
-      questions: {
-        intent: {
-          type: "choice",
-          question: "Intent?",
-          options: ["scout", "implementation"],
-        },
-      },
-    },
-    undefined,
-    undefined,
-    { cwd: "/workspace", isProjectTrusted: () => true },
-  );
-
-  assert.equal(seen.length, 1);
-  assert.deepEqual(seen[0], {
-    state: "selected evidence",
-    questions: {
-      intent: {
-        type: "choice",
-        question: "Intent?",
-        options: ["scout", "implementation"],
-      },
-    },
-  });
-  assert.equal(result.details.ok, false);
-  assert.match(result.content[0]!.text, /not_configured/);
-});
-
-test("default settings plus a credential prepare an explicitly declared Jev workflow", () => {
-  const settings = loadSubagentSettings({
-    cwd: "/workspace",
-    projectTrusted: true,
-    globalPath: "/missing/global.json",
-    readFile: () => undefined,
-  });
-  const preparer = createWorkflowRoutingPreparer(
-    staticWorkflowDefinitionPreparer,
-    () => ({
-      settings,
-      jevCredentialPresent: true,
-      lookupModel: (requested) => ({ available: true, effective: requested }),
-    }),
-  );
-  const definition = preparer.prepareSpec({
-    tasks: [
-      {
-        id: "evaluate",
-        label: "Evaluate",
-        kind: "review",
-        prompt: "evaluate explicit evidence",
-        readOnly: true,
-        execution: {
-          type: "evaluation",
-          payload: {
-            state: "explicit evidence",
-            questions: {
-              verdict: {
-                type: "choice",
-                question: "Accept?",
-                options: ["yes", "no"],
-              },
-            },
-          },
-        },
-      },
-    ],
-  });
-  assert.equal(definition.evaluationPolicy?.apiKeyEnv, "TYPESAFE_API_KEY");
-  assert.equal(
-    Object.hasOwn(definition.evaluationPolicy ?? {}, "enabled"),
-    false,
-  );
-});
-
-test("standalone gate rejects missing or truncated evidence without evaluating", async () => {
-  let evaluations = 0;
-  const acceptance = createStandaloneJevAcceptance(
-    {
-      evaluator: "jev",
-      questions: {
-        verdict: {
-          type: "choice",
-          question: "Accept?",
-          options: ["yes", "no"],
-        },
-      },
-      predicate: {
-        type: "choice_equals",
-        question_id: "verdict",
-        value: "yes",
-      },
-    },
-    {
-      async evaluate() {
-        evaluations += 1;
-        return {
-          ok: false,
-          error: {
-            code: "transport_error" as const,
-            message: "unexpected call",
-          },
-        };
-      },
-    },
-  );
-  const blank = snapshot("sa-blank", { status: "done", finalText: "  " });
-  const truncated = snapshot("sa-truncated", {
-    status: "done",
-    finalText: "partial",
-    finalTextTruncated: true,
-  });
-  assert.equal(
-    (await acceptance.evaluate(blank, new AbortController().signal)).status,
-    "error",
-  );
-  assert.equal(
-    (await acceptance.evaluate(truncated, new AbortController().signal)).status,
-    "error",
-  );
-  assert.equal(evaluations, 0);
-});
-
-test("standalone gate evidence includes bounded child operations", async () => {
-  let state = "";
-  const acceptance = createStandaloneJevAcceptance(
-    {
-      evaluator: "jev",
-      questions: {
-        verdict: {
-          type: "choice",
-          question: "Accept?",
-          options: ["yes", "no"],
-        },
-      },
-      predicate: {
-        type: "choice_equals",
-        question_id: "verdict",
-        value: "yes",
-      },
-    },
-    {
-      async evaluate(input) {
-        state = input.state;
-        // SAFETY: the gate under test declares exactly one choice question, "verdict", with option "yes".
-        return {
-          ok: true as const,
-          answers: {
-            verdict: { type: "choice" as const, value: "yes" },
-          },
-          metadata: {
-            schemaVersion: 1,
-            requestedModel: "m",
-            actualModel: "m",
-            durationMs: 1,
-            inputDigest: "d",
-          },
-        } as never;
-      },
-    },
-  );
-  const calls = Array.from({ length: 30 }, (_, i) => i);
-  const done = snapshot("sa-ops", {
-    status: "done",
-    finalText: "Tests pass.",
-    transcript: calls.flatMap((i) => [
-      {
-        kind: "assistant" as const,
-        parts: [
-          {
-            type: "toolCall" as const,
-            toolId: `t${i}`,
-            name: "bash",
-            argsPreview: `npm test -- ${i}`,
-          },
-        ],
-      },
-      {
-        kind: "toolResult" as const,
-        toolId: `t${i}`,
-        name: "bash",
-        isError: i === 29,
-        outputPreview: "x".repeat(1000),
-      },
-    ]),
-  });
-  const result = await acceptance.evaluate(done, new AbortController().signal);
-  assert.equal(result.status, "pass");
-  const parsed = JSON.parse(state);
-  assert.equal(parsed.operations.length, 24);
-  assert.equal(parsed.completeness.operationsOmitted, 6);
-  assert.deepEqual(parsed.operations.at(-1), {
-    tool: "bash",
-    args: "npm test -- 29",
-    ok: false,
-    output: `${"x".repeat(400)}…`,
-  });
-});
-
 test("settings command validates and atomically saves only an explicit temp scope", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "subagents-settings-"));
   const globalPath = path.join(root, "agent", "subagents.json");
@@ -677,12 +430,8 @@ test("settings command validates and atomically saves only an explicit temp scop
   let edited = JSON.stringify({
     version: 1,
     routing: { enabled: false },
-    jev: { apiKeyEnv: "TEST_JEV_KEY" },
   });
-  const command = createSubagentsSettingsCommand({
-    globalPath,
-    env: { TEST_JEV_KEY: "secret-not-for-output" },
-  });
+  const command = createSubagentsSettingsCommand({ globalPath });
   const ctx = {
     cwd: root,
     hasUI: true,
@@ -699,8 +448,7 @@ test("settings command validates and atomically saves only an explicit temp scop
 
   await command.handler("global edit", ctx);
   assert.equal(JSON.parse(fs.readFileSync(globalPath, "utf8")).version, 1);
-  assert.match(notifications.at(-1)!.message, /Jev credential: configured/);
-  assert.doesNotMatch(notifications.at(-1)!.message, /secret-not-for-output/);
+  assert.match(notifications.at(-1)!.message, /Routing: disabled/);
 
   const before = fs.readFileSync(globalPath, "utf8");
   edited = JSON.stringify({ version: 2 });
@@ -708,4 +456,249 @@ test("settings command validates and atomically saves only an explicit temp scop
   assert.equal(fs.readFileSync(globalPath, "utf8"), before);
   assert.equal(notifications.at(-1)!.type, "error");
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+/* oxlint-disable anti-slop/no-unsafe-dictionary-type, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening, anti-slop/no-chained-type-assertions, anti-slop/no-runtime-typeof -- This fixture inspects raw registered JSON schemas and drives execute through an untyped stub API. */
+interface CapturedTool {
+  readonly name: string;
+  readonly description: string;
+  readonly parameters: Record<string, unknown>;
+  execute(
+    toolCallId: string,
+    params: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+    onUpdate: undefined,
+    ctx: unknown,
+  ): Promise<unknown>;
+}
+
+/** Load the extension against a no-op API and capture every registered tool. */
+function registeredTools(): Map<string, CapturedTool> {
+  const tools = new Map<string, CapturedTool>();
+  const noop = () => undefined;
+  const base: Record<string, unknown> = {
+    registerTool: (tool: CapturedTool) => tools.set(tool.name, tool),
+    getFlag: noop,
+    getActiveTools: () => [],
+    getAllTools: () => [],
+    getCommands: () => [],
+    getThinkingLevel: () => "high",
+    events: { on: () => noop, emit: noop },
+  };
+  // SAFETY: the proxy answers every other ExtensionAPI method with a no-op,
+  // which is all extension loading needs to register its tools.
+  const pi = new Proxy(base, {
+    get: (target, key: string) => (key in target ? target[key] : noop),
+  }) as unknown as ExtensionAPI;
+  subagentsExtension(pi);
+  return tools;
+}
+
+test("every registered tool exposes a provider-safe root object schema", () => {
+  const tools = registeredTools();
+  for (const name of [
+    "subagent_spawn",
+    "subagent_wait",
+    "subagent_route",
+    "subagent_approve",
+    "workflow",
+    "workflow_control",
+  ]) {
+    assert.ok(tools.has(name), `${name} should be registered`);
+  }
+  for (const tool of tools.values()) {
+    const schema = tool.parameters;
+    assert.equal(schema.type, "object", `${tool.name} root type`);
+    for (const combinator of ["anyOf", "oneOf", "allOf", "not"]) {
+      assert.equal(
+        schema[combinator],
+        undefined,
+        `${tool.name} root must not use ${combinator}`,
+      );
+    }
+    assert.equal(typeof schema.properties, "object", `${tool.name} properties`);
+  }
+});
+
+/* oxlint-enable anti-slop/no-unsafe-dictionary-type, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening, anti-slop/no-chained-type-assertions, anti-slop/no-runtime-typeof */
+
+test("workflow params accept the four prepare/approve shapes and reject ambiguous ones", () => {
+  assert.deepEqual(parseWorkflowToolRequest({ draftId: "d-1" }), {
+    kind: "approve",
+    draftId: "d-1",
+  });
+  // A stray preview on approval was accepted before and stays harmless.
+  assert.deepEqual(parseWorkflowToolRequest({ draftId: "d-1", preview: "p" }), {
+    kind: "approve",
+    draftId: "d-1",
+  });
+  assert.deepEqual(
+    parseWorkflowToolRequest({ preview: "p", source: "flow({tasks:[]})" }),
+    { kind: "prepare", preview: "p", source: "flow({tasks:[]})" },
+  );
+  assert.deepEqual(
+    parseWorkflowToolRequest({
+      preview: "p",
+      savedWorkflow: "review",
+      args: "x",
+      background: false,
+    }),
+    {
+      kind: "prepare",
+      preview: "p",
+      savedWorkflow: "review",
+      args: "x",
+      background: false,
+    },
+  );
+  const spec = { tasks: [] };
+  const prepared = parseWorkflowToolRequest({ preview: "p", spec });
+  assert.ok(prepared.kind === "prepare" && "spec" in prepared);
+  assert.equal(prepared.spec, spec);
+  assert.throws(
+    () => parseWorkflowToolRequest({ draftId: "d-1", source: "s" }),
+    /approval accepts only draftId; remove source/,
+  );
+  assert.throws(
+    () => parseWorkflowToolRequest({ preview: "p", source: "s", spec }),
+    /exactly one of source, spec, or savedWorkflow; received source, spec/,
+  );
+  assert.throws(
+    () => parseWorkflowToolRequest({ preview: "p" }),
+    /requires draftId to approve, or preview plus exactly one/,
+  );
+  assert.throws(
+    () => parseWorkflowToolRequest({ source: "s" }),
+    /requires preview/,
+  );
+});
+
+test("workflow_control params require taskId exactly for task actions", () => {
+  assert.deepEqual(
+    parseWorkflowControlRequest({ action: "pause", runId: "r", reason: "x" }),
+    { action: "pause", runId: "r", reason: "x" },
+  );
+  assert.deepEqual(
+    parseWorkflowControlRequest({ action: "retry", runId: "r", taskId: "t" }),
+    { action: "retry", runId: "r", taskId: "t" },
+  );
+  assert.throws(
+    () => parseWorkflowControlRequest({ action: "skip", runId: "r" }),
+    /skip requires taskId/,
+  );
+  assert.throws(
+    () =>
+      parseWorkflowControlRequest({
+        action: "cancel",
+        runId: "r",
+        taskId: "t",
+      }),
+    /applies to the whole run; remove taskId/,
+  );
+});
+
+test("batch spawn normalization keeps tasks and single fields mutually exclusive", () => {
+  const one = { prompt: "p", name: "n", harness: "pi" as const };
+  assert.deepEqual(normalizeSpawnRequest(one), { batch: false, tasks: [one] });
+  assert.deepEqual(normalizeSpawnRequest({ tasks: [one, one] }), {
+    batch: true,
+    tasks: [one, one],
+  });
+  assert.throws(
+    () => normalizeSpawnRequest({ tasks: [one], harness: "pi" }),
+    /either "tasks" or the single-task fields, not both; remove harness/,
+  );
+  assert.throws(() => normalizeSpawnRequest({ tasks: [] }), /1 to 16 items/);
+  assert.throws(
+    () =>
+      normalizeSpawnRequest({ tasks: Array.from({ length: 17 }, () => one) }),
+    /1 to 16 items/,
+  );
+  assert.throws(
+    () => normalizeSpawnRequest({ name: "n" }),
+    /requires "prompt"/,
+  );
+});
+
+test("batch spawn outcomes report per-task ids and failures in order", () => {
+  const outcomes = batchOutcomes(
+    [{ name: "a" }, { name: "b" }],
+    [
+      {
+        status: "fulfilled",
+        value: { id: "sa-1", title: "a", cwd: "/w", harness: "pi", model: "m" },
+      },
+      { status: "rejected", reason: new Error("backend down") },
+    ],
+  );
+  assert.deepEqual(outcomes, [
+    {
+      index: 0,
+      name: "a",
+      ok: true,
+      id: "sa-1",
+      title: "a",
+      cwd: "/w",
+      harness: "pi",
+      model: "m",
+    },
+    { index: 1, name: "b", ok: false, error: "backend down" },
+  ]);
+  const text = formatBatchSpawnResult(outcomes);
+  assert.match(text, /Spawned 1\/2 subagent\(s\); 1 failed/);
+  assert.match(text, /tasks\[0\] sa-1 "a"/);
+  assert.match(text, /tasks\[1\] "b" failed: backend down/);
+  assert.match(text, /subagent_wait\(ids: \["sa-1"\]\)/);
+});
+
+test("admitBatch admits every task and isolates failures", async () => {
+  const started: string[] = [];
+  const settled = await admitBatch(["a", "b", "c"], async (name, index) => {
+    started.push(name);
+    if (name === "b") throw new Error("nope");
+    return { id: `sa-${index}`, title: name, cwd: "/w", harness: "pi" };
+  });
+  assert.deepEqual(started, ["a", "b", "c"]);
+  assert.deepEqual(
+    settled.map((result) => result.status),
+    ["fulfilled", "rejected", "fulfilled"],
+  );
+});
+
+test("subagent_spawn rejects invalid batch input before starting any child", async () => {
+  const spawn = registeredTools().get("subagent_spawn")!;
+  const ctx = { cwd: process.cwd() };
+  const task = { prompt: "p", name: "n", harness: "pi" };
+  await assert.rejects(
+    spawn.execute(
+      "1",
+      { tasks: [task], prompt: "p" },
+      undefined,
+      undefined,
+      ctx,
+    ),
+    /not both; remove prompt/,
+  );
+  await assert.rejects(
+    spawn.execute(
+      "2",
+      { tasks: [task], wait_mode: "any" },
+      undefined,
+      undefined,
+      ctx,
+    ),
+    /wait_mode applies only with wait: true/,
+  );
+  await assert.rejects(
+    spawn.execute(
+      "3",
+      {
+        tasks: [task, { ...task, name: "bad", working_dir: "missing-dir-xyz" }],
+      },
+      undefined,
+      undefined,
+      ctx,
+    ),
+    /tasks\[1\] "bad": working_dir is not a directory[\s\S]*No child started/,
+  );
 });

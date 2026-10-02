@@ -17,7 +17,11 @@ import {
   PARENT_QUESTION_BATCH_OPTIONS,
   PARENT_RESULT_BATCH_OPTIONS,
 } from "./src/parent-message.ts";
-import { buildSubagentWaitResult } from "./src/result-delivery.ts";
+import {
+  buildSubagentWaitResult,
+  formatWaitRemainder,
+  partitionWaitResult,
+} from "./src/result-delivery.ts";
 
 function ref(overrides: Partial<ParentRef> = {}): ParentRef {
   return {
@@ -190,7 +194,6 @@ test("parent message is one bounded batch with public details and follow-up opti
     JSON.stringify(message),
     /sessionFile|leafId|epoch|cwd|model/,
   );
-
 });
 
 test("parent question message is bounded, actionable, and omits ownership", () => {
@@ -244,111 +247,6 @@ test("workflow aggregate keeps its kind on the existing parent result rail", () 
   assert.match(message.content, /^Workflow wf-1/);
 });
 
-test("automatic parent delivery preserves pass, reject, and error acceptance", () => {
-  const snapshot = (
-    id: string,
-    acceptance: NonNullable<SubagentSnapshot["acceptance"]>,
-  ): SubagentSnapshot => ({
-    id,
-    backend: "pi",
-    owner: "subagents",
-    resultDelivery: "parent",
-    parentRef: ref(),
-    title: id,
-    prompt: "produce evidence",
-    cwd: "/private/project",
-    status: "done",
-    createdAt: 1,
-    settledAt: 2,
-    lastActivityAt: 2,
-    outcome: {
-      _tag: "Completed",
-      finalText: `SECRET FULL REPORT ${id}`,
-    },
-    acceptance,
-    finalText: `SECRET FULL REPORT ${id}`,
-    meta: { backend: "pi" },
-    usage: {},
-    transcript: [],
-    liveTools: [],
-    completedOperations: 0,
-    processTelemetry: "unavailable",
-    queued: [],
-    turns: 0,
-  });
-  const pending = parentResultEnvelope(
-    snapshot("pending", { status: "pending" }),
-  );
-  assert.equal(pending, undefined);
-
-  const envelopes = [
-    parentResultEnvelope(snapshot("passed", { status: "pass" })),
-    parentResultEnvelope(
-      snapshot("rejected", { status: "reject", reason: "proof is incomplete" }),
-    ),
-    parentResultEnvelope(
-      snapshot("errored", {
-        status: "error",
-        reason: "evaluation timed out",
-      }),
-    ),
-  ];
-  assert.ok(envelopes.every((result) => result !== undefined));
-  const batch = buildParentResultBatchMessage(
-    envelopes.filter((result): result is ParentResultEnvelope => !!result),
-  );
-
-  assert.deepEqual(batch.details.results, [
-    {
-      id: "passed",
-      title: "passed",
-      status: "done",
-      acceptance: { status: "pass" },
-    },
-    {
-      id: "rejected",
-      title: "rejected",
-      status: "done",
-      acceptance: { status: "reject", reason: "proof is incomplete" },
-    },
-    {
-      id: "errored",
-      title: "errored",
-      status: "done",
-      acceptance: { status: "error", reason: "evaluation timed out" },
-    },
-  ]);
-  assert.match(batch.content, /passed acceptance/);
-  assert.match(batch.content, /rejected by acceptance/);
-  assert.match(batch.content, /acceptance failed/);
-  assert.match(batch.content, /Acceptance: reject — proof is incomplete/);
-  assert.match(batch.content, /Acceptance: error — evaluation timed out/);
-  assert.doesNotMatch(batch.content, /SECRET FULL REPORT/);
-  assert.doesNotMatch(JSON.stringify(batch.details), /SECRET FULL REPORT/);
-  assert.match(batch.content, /subagent_inspect/);
-
-  const wait = buildSubagentWaitResult(
-    envelopes.map((result) => {
-      assert.ok(result);
-      const acceptance = result.acceptance;
-      assert.ok(acceptance);
-      return {
-        id: result.id,
-        snapshot: snapshot(result.id, acceptance),
-      };
-    }),
-  );
-  assert.match(wait.text, /passed acceptance/);
-  assert.match(wait.text, /rejected by acceptance/);
-  assert.match(wait.text, /acceptance failed/);
-  assert.doesNotMatch(wait.text, /SECRET FULL REPORT/);
-  assert.doesNotMatch(JSON.stringify(wait.details), /SECRET FULL REPORT/);
-  assert.deepEqual(
-    wait.details.results.map((result) => result.acceptance?.status),
-    ["pass", "reject", "error"],
-  );
-});
-
 test("ungated automatic and wait delivery retain report content", () => {
   const ungated = envelope("ungated", ref(), "UNCHANGED FULL REPORT");
   const automatic = buildParentResultBatchMessage([ungated]);
@@ -385,15 +283,42 @@ test("ungated automatic and wait delivery retain report content", () => {
   ]);
 });
 
-test("automatic parent delivery bounds acceptance reasons", () => {
-  const mailbox = createParentMailbox();
-  mailbox.enqueue({
-    ...envelope("bounded-acceptance"),
-    acceptance: { status: "reject", reason: "😀".repeat(3_000) },
+test('wait partition "all" returns every terminal id, including earlier deliveries', () => {
+  const partition = partitionWaitResult({
+    mode: "all",
+    requestedIds: ["sa-1", "sa-2", "sa-3"],
+    settledIds: ["sa-3", "sa-1", "sa-2"],
+    delivered: (id) => id === "sa-1",
   });
-  const reason = mailbox.list()[0]?.acceptance?.reason ?? "";
-  assert.ok(
-    Buffer.byteLength(reason, "utf8") <=
-      PARENT_RESULT_LIMITS.maxAcceptanceReasonBytes,
+  assert.deepEqual(partition, {
+    returned: ["sa-1", "sa-2", "sa-3"],
+    alreadyDelivered: [],
+    pending: [],
+  });
+});
+
+test('wait partition "any" returns only new results and names still-running ids', () => {
+  const partition = partitionWaitResult({
+    mode: "any",
+    requestedIds: ["sa-1", "sa-2", "sa-3"],
+    settledIds: ["sa-1", "sa-2"],
+    delivered: (id) => id === "sa-1",
+  });
+  assert.deepEqual(partition, {
+    returned: ["sa-2"],
+    alreadyDelivered: ["sa-1"],
+    pending: ["sa-3"],
+  });
+  const footer = formatWaitRemainder(partition);
+  assert.match(footer, /Already delivered earlier \(not repeated\): sa-1/);
+  assert.match(footer, /Still running: sa-3/);
+  assert.match(footer, /subagent_wait\(ids: \["sa-3"\], mode: "any"\)/);
+  assert.equal(
+    formatWaitRemainder({
+      returned: ["sa-2"],
+      alreadyDelivered: [],
+      pending: [],
+    }),
+    "",
   );
 });

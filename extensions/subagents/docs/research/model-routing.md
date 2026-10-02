@@ -4,7 +4,7 @@
 
 ## Executive recommendation
 
-Use a **shared lightweight classifier + named-profile + deterministic ordered-candidate resolver**. Do not build a heavyweight agent registry. Existing workflow task kinds and optional inline classification metadata should feed the same resolver used by standalone proposals and dynamically composed workflows; defer Jev-style scoring until the explicit policy and trace contract are stable.
+Use a **shared lightweight classifier + named-profile + deterministic ordered-candidate resolver**. Do not build a heavyweight agent registry. Existing workflow task kinds and optional inline classification metadata should feed the same resolver used by standalone proposals and dynamically composed workflows; defer model-based scoring until the explicit policy and trace contract are stable.
 
 1. A user selects a profile (`private`, `balanced`, or `quality`) globally, per project, or per workflow/task; task classification selects the profile without requiring role registration.
 2. Each profile contains an ordered list of concrete `(harness, model, effort)` candidates plus hard privacy/capability constraints.
@@ -56,7 +56,7 @@ The approval boundary is important:
 - **Graph or runtime change after approval:** not allowed under the immutable contract. A changed task, classification, profile, provider, effort, or fallback chain requires a new draft and approval. A retry keeps the pinned runtime; it does not reclassify silently.
 - **Standalone subagent:** use the same resolver, but its proposal must be explicitly approved before `subagent_spawn` starts. The proposal can contain multiple standalone tasks, but approval should bind the exact set and route traces.
 
-Jev, if added later, may populate classification metadata before resolution. It must not become an agent registry or final execution authority; explicit task overrides, hard capability/privacy constraints, deterministic candidate order, and the ask boundary remain authoritative.
+A model-based classifier, if added later, may populate classification metadata before resolution. It must not become an agent registry or final execution authority; explicit task overrides, hard capability/privacy constraints, deterministic candidate order, and the ask boundary remain authoritative.
 
 ## Confirmed existing facts
 
@@ -90,7 +90,7 @@ Jev, if added later, may populate classification metadata before resolution. It 
 - Preparation snapshots and validates the full graph before persistence; approval requires the exact pending draft, persisted artifact match, newer user input, same session, and same project. [`extensions/subagents/src/workflows/tools.ts:134-180`](../Users/yesh/code/personal/pi-subagents/extensions/subagents/src/workflows/tools.ts:134), [`extensions/subagents/src/workflows/drafts.ts:225-244`](../Users/yesh/code/personal/pi-subagents/extensions/subagents/src/workflows/drafts.ts:225)
 - The execution digest currently hashes the validated definition, source, args, and background flag. A future routing policy digest must be added to the immutable execution inputs if routing can change execution. [`extensions/subagents/src/workflows/provenance.ts:57-68`](../Users/yesh/code/personal/pi-subagents/extensions/subagents/src/workflows/provenance.ts:57)
 - Workflow children use a private workflow result lane; bounded explicit handoffs are retained, while child transcripts remain owned by `SubagentManager`. The prompt also says automatic retry is limited to classified `provider_stall`/`backend_failure`. [`extensions/subagents/src/workflows/prompt.ts:103-115`](../Users/yesh/code/personal/pi-subagents/extensions/subagents/src/workflows/prompt.ts:103), [`extensions/subagents/src/workflows/manager.ts:80-90`](../Users/yesh/code/personal/pi-subagents/extensions/subagents/src/workflows/manager.ts:80)
-- There is no current routing/profile/Jev configuration or routing UI in this repository. The workflow review is the existing relevant UI surface; subagent inspection shows backend/model/effort and capabilities.
+- There is no current routing/profile/classifier configuration or routing UI in this repository. The workflow review is the existing relevant UI surface; subagent inspection shows backend/model/effort and capabilities.
 
 ### Installed Pi facts and local availability snapshot
 
@@ -120,7 +120,7 @@ Observed during this research:
 |---|---|---|---|---|---|---|
 | **1. Explicit named runtime profiles** | High: user sees `private`, `balanced`, `quality` and concrete candidates | High when profiles put a small local model first; no classifier call | High if a profile can enforce `local-only`/`remote-allowed` | Strong: explicit task model wins; profile can say deny or try-next | Strong: filter candidates by context, input type, reasoning, steering, and harness | Strong if the resolved candidate and profile/config digest are snapshotted during draft preparation |
 | **2. Deterministic preference rules** | High for simple ordered rules; can degrade with many overlapping rules | High; rules are cheap and predictable | High if privacy is a hard filter, not a score | Medium-to-high; ordered candidate chains are understandable, but rule precedence must be documented | Strong if rules are hard constraints before ranking | Strong if rules are evaluated at preparation and their result is materialized in the draft |
-| **3. Optional Jev classification/scoring** | Medium/low: “why this score?” is harder than “first eligible candidate” | Potentially better quality/cost fit, but adds a classifier call, tokens, and queue latency | Depends on classifier/model; unsafe for private tasks if it sends prompt content remotely | Can honor explicit overrides, but probabilistic fallback is harder to reason about | Can score capabilities, but must still hard-filter them first | Weak unless classification, candidate scores, model availability, and policy digest are persisted; never re-score an approved workflow silently |
+| **3. Optional model-based classification/scoring** | Medium/low: “why this score?” is harder than “first eligible candidate” | Potentially better quality/cost fit, but adds a classifier call, tokens, and queue latency | Depends on classifier/model; unsafe for private tasks if it sends prompt content remotely | Can honor explicit overrides, but probabilistic fallback is harder to reason about | Can score capabilities, but must still hard-filter them first | Weak unless classification, candidate scores, model availability, and policy digest are persisted; never re-score an approved workflow silently |
 
 ### Shape 1: profiles (recommended foundation)
 
@@ -138,9 +138,9 @@ Rules are useful for task kinds already present (`scout`, `writer`, `proof`, `re
 
 For dynamically composed workflows, classify each generated task in memory, resolve the complete graph during preparation, and present one review. There is no need to register an agent definition for every role.
 
-### Shape 3: Jev (optional later)
+### Shape 3: model-based classifier (optional later)
 
-No Jev implementation or term was found in this repository. If “Jev” means a classifier/scorer, use it only as an advisory classifier that chooses a profile or adds a bounded complexity label. Do not let it override explicit model choices or hard privacy/capability constraints. In `local-only` mode it must run locally or be disabled. A deterministic tie-breaker must remain in charge.
+No model-based classifier exists in this repository. If one is added, use it only as an advisory classifier that chooses a profile or adds a bounded complexity label. Do not let it override explicit model choices or hard privacy/capability constraints. In `local-only` mode it must run locally or be disabled. A deterministic tie-breaker must remain in charge.
 
 ## Proposed small settings schema (design idea)
 
@@ -188,14 +188,14 @@ Illustrative schema:
 }
 ```
 
-Keep the first version intentionally small. Add model labels, cost budgets, endpoint health checks, and Jev weights only after the trace format is proven. Treat privacy tier as explicit user configuration: `localhost` or a proxy name is not proof that data stays local.
+Keep the first version intentionally small. Add model labels, cost budgets, endpoint health checks, and classifier weights only after the trace format is proven. Treat privacy tier as explicit user configuration: `localhost` or a proxy name is not proof that data stays local.
 
 ## Deterministic resolution contract (design idea)
 
 1. **Normalize inputs:** direct spawn fields, workflow task fields, selected profile, rule match, parent/session defaults.
 2. **Honor explicit values:** an explicit user model is exact. An explicit unknown/unavailable model should fail with a clear reason; do not silently replace it. An explicit harness with no model may use that harness's configured default. A bare `gpt-5.6-sol` or `gpt-6-astra` with no provider is intentionally unresolved when the provider is ambiguous; preserve it as `provider: unspecified` and ask rather than guessing.
 3. **Select policy:** task/profile selector from project config, then global config, then built-in default.
-4. **Classify only if enabled:** Jev may add `complexity`/`privacy` labels, but cannot loosen hard constraints or replace explicit fields.
+4. **Classify only if enabled:** a classifier may add `complexity`/`privacy` labels, but cannot loosen hard constraints or replace explicit fields.
 5. **Filter candidates:** privacy tier, required harness capabilities, model existence, auth/catalog availability, context window, input modality, reasoning/effort support, and optional endpoint health.
 6. **Choose first eligible candidate:** deterministic order, no hidden score ties.
 7. **Materialize requested vs effective:** preserve requested effort and record backend-native/effective effort after negotiation. For Codex, model/list or settings notifications remain authoritative.
@@ -230,7 +230,7 @@ Recommended fallback semantics:
     "intent": "validation",
     "complexity": "medium",
     "sensitivity": "normal",
-    "source": "task-kind | inline | Jev"
+    "source": "task-kind | inline | classifier"
   },
   "requested": { "harness": "pi", "provider": null, "model": "gpt-6-astra", "effort": "medium" },
   "requirements": {
@@ -264,7 +264,7 @@ For a direct subagent, show a compact trace in a proposal card before spawning; 
 The current workflow system intentionally separates preparation from approval and hashes exact execution inputs. Routing must follow that boundary:
 
 - Resolve profiles/rules and availability during **preparation**, not after approval.
-- Render the concrete selected runtime, fallback policy, and any Jev classification in the existing draft review row.
+- Render the concrete selected runtime, fallback policy, and any classifier output in the existing draft review row.
 - Add the routing policy/config digest and resolved runtime to the hashed execution inputs. The current digest does not include external config, so merely storing a profile name is insufficient.
 - On approval, execute the pinned runtime from the draft; do not reread mutable routing settings.
 - Keep retry attempts on the same pinned runtime. A cross-model/provider retry should be a new reviewed draft, or an explicitly pre-approved fallback chain whose candidate list was shown and hashed.
@@ -279,7 +279,7 @@ This preserves the current “review this exact graph” guarantee while making 
 - **Proxy-first:** can be fast and convenient, but a localhost proxy may forward to a cloud provider. Require an explicit configured privacy tier.
 - **Remote strong model:** best for complex repair/review work, but increases cost, network dependency, and data exposure. A `local-only` hard constraint must prevent this fallback.
 - **Higher effort:** can improve difficult-task success but raises latency and output/reasoning tokens. Budget effort by task kind, not just model quality. Pi model metadata and `thinkingLevelMap` already expose the data needed for capability filtering.
-- **Jev scorer:** adds at least one extra model call unless classification is local/deterministic. Its token cost and privacy impact can erase the savings from routing small tasks locally. Start with rule labels (`kind`, scope, context estimate, sensitivity) and measure before adding it.
+- **Model-based scorer:** adds at least one extra model call unless classification is local/deterministic. Its token cost and privacy impact can erase the savings from routing small tasks locally. Start with rule labels (`kind`, scope, context estimate, sensitivity) and measure before adding it.
 
 ## Current confirmed preference decisions
 
@@ -297,7 +297,7 @@ This preserves the current “review this exact graph” guarantee while making 
 5. For local models, should the router perform a live health probe, and what timeout/staleness policy is acceptable?
 6. Should workflows allow only pinned runtime choices, or may the user approve a displayed fallback chain for retries?
 7. Which capability constraints matter first: minimum context, text/image input, reasoning level, steering, cost ceiling, or tool compatibility?
-8. What does “Jev” mean operationally: a local classifier, a remote model scorer, or a deterministic feature extractor? Is sending task text to it acceptable?
+8. If a classifier is added, should it be a local classifier, a remote model scorer, or a deterministic feature extractor? Is sending task text to it acceptable?
 9. Should routing preferences live in a dedicated `subagents-routing.json` (safer extension boundary) or be nested in Pi `settings.json` so `/settings` can edit them?
 10. Should the route trace be visible in normal transcript output, only `/subagents`/workflow review, or both?
 

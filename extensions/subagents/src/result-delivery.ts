@@ -26,36 +26,6 @@ export {
 
 const WAIT_OUTPUT_MAX_BYTES = 48 * 1024;
 const WAIT_PER_AGENT_MAX_BYTES = 16 * 1024;
-export const COMPACT_ACCEPTANCE_REASON_MAX_BYTES = 512;
-
-function boundedUtf8(text: string, maxBytes: number): string {
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  const marker = "…";
-  const characters = Array.from(text);
-  while (
-    characters.length > 0 &&
-    Buffer.byteLength(characters.join("") + marker, "utf8") > maxBytes
-  ) {
-    characters.pop();
-  }
-  return characters.join("") + marker;
-}
-
-function singleLine(text: string): string {
-  return text
-    .replace(/[\r\n]+/gu, " ")
-    .replace(/\s+/gu, " ")
-    .trim();
-}
-
-export function compactAcceptanceReason(reason: string): string {
-  return boundedUtf8(singleLine(reason), COMPACT_ACCEPTANCE_REASON_MAX_BYTES);
-}
-
-/** The report remains manager-owned; routine gated delivery carries only the verdict. */
-export function compactGatedReportNotice(id: string): string {
-  return `Full report retained; retrieve it with subagent_inspect({ id: ${JSON.stringify(id)} }).`;
-}
 
 function truncatedOutput(
   snap: SubagentSnapshot,
@@ -73,35 +43,6 @@ function truncatedOutput(
   return text;
 }
 
-function gatedVerdict(snapshot: SubagentSnapshot): string | undefined {
-  switch (snapshot.acceptance?.status) {
-    case "pass":
-      return "passed acceptance";
-    case "reject":
-      return "was rejected by acceptance";
-    case "error":
-      return "acceptance failed";
-    default:
-      return undefined;
-  }
-}
-
-function compactAcceptanceDetails(
-  acceptance: SubagentSnapshot["acceptance"],
-): SubagentSnapshot["acceptance"] {
-  if (
-    acceptance === undefined ||
-    !("reason" in acceptance) ||
-    acceptance.reason === undefined
-  ) {
-    return acceptance;
-  }
-  return {
-    status: acceptance.status,
-    reason: compactAcceptanceReason(acceptance.reason),
-  };
-}
-
 export interface WaitResultInput {
   readonly id: string;
   readonly snapshot?: SubagentSnapshot;
@@ -114,16 +55,11 @@ export interface SubagentWaitResult {
       readonly id: string;
       readonly title?: string;
       readonly status?: SubagentSnapshot["status"];
-      readonly acceptance?: SubagentSnapshot["acceptance"];
     }>;
   };
 }
 
-/**
- * Build settled wait output. Ungated children retain the established report
- * delivery; gated children default to a compact verdict and explicit retrieval
- * pointer so the evaluated report is not duplicated into routine context.
- */
+/** Build settled wait output within the per-child and total byte budgets. */
 export function buildSubagentWaitResult(
   inputs: ReadonlyArray<WaitResultInput>,
 ): SubagentWaitResult {
@@ -136,37 +72,15 @@ export function buildSubagentWaitResult(
       continue;
     }
 
-    const verdict = gatedVerdict(snap);
-    let section: string;
-    if (verdict !== undefined) {
-      section = `## ${snap.id} "${snap.title}" ${verdict}`;
-      if (snap.errorText) {
-        section += `\nError: ${compactAcceptanceReason(snap.errorText)}`;
-      }
-      if (
-        snap.acceptance &&
-        "reason" in snap.acceptance &&
-        snap.acceptance.reason
-      ) {
-        section += `\nAcceptance: ${snap.acceptance.status} — ${compactAcceptanceReason(snap.acceptance.reason)}`;
-      }
-      section += `\n\n${compactGatedReportNotice(snap.id)}`;
-    } else {
-      const verb =
-        snap.status === "error"
-          ? "failed"
-          : snap.acceptance?.status === "pending"
-            ? "finished process; acceptance pending"
-            : "finished";
-      section = `## ${snap.id} "${snap.title}" ${verb}`;
-      if (snap.errorText) section += `\nError: ${snap.errorText}`;
-      const headerBytes = Buffer.byteLength(section, "utf8") + 2;
-      const outputBudget = Math.max(
-        512,
-        Math.min(WAIT_PER_AGENT_MAX_BYTES, remainingBytes - headerBytes),
-      );
-      section += `\n\n${truncatedOutput(snap, outputBudget)}`;
-    }
+    const verb = snap.status === "error" ? "failed" : "finished";
+    let section = `## ${snap.id} "${snap.title}" ${verb}`;
+    if (snap.errorText) section += `\nError: ${snap.errorText}`;
+    const headerBytes = Buffer.byteLength(section, "utf8") + 2;
+    const outputBudget = Math.max(
+      512,
+      Math.min(WAIT_PER_AGENT_MAX_BYTES, remainingBytes - headerBytes),
+    );
+    section += `\n\n${truncatedOutput(snap, outputBudget)}`;
 
     const sectionBytes = Buffer.byteLength(section, "utf8");
     if (sectionBytes > remainingBytes) {
@@ -190,15 +104,64 @@ export function buildSubagentWaitResult(
   return {
     text,
     details: {
-      results: inputs.map(({ id, snapshot }) => {
-        const detail = {
-          id,
-          title: snapshot?.title,
-          status: snapshot?.status,
-        };
-        const acceptance = compactAcceptanceDetails(snapshot?.acceptance);
-        return acceptance === undefined ? detail : { ...detail, acceptance };
-      }),
+      results: inputs.map(({ id, snapshot }) => ({
+        id,
+        title: snapshot?.title,
+        status: snapshot?.status,
+      })),
     },
   };
+}
+
+export type WaitMode = "all" | "any";
+
+export interface WaitPartition {
+  /** Terminal ids whose results this wait call returns and consumes. */
+  readonly returned: ReadonlyArray<string>;
+  /** Terminal ids skipped by an "any" wait because they already reached the parent. */
+  readonly alreadyDelivered: ReadonlyArray<string>;
+  /** Requested ids that are still queued or running. */
+  readonly pending: ReadonlyArray<string>;
+}
+
+/**
+ * Split one wait outcome by delivery state. "all" returns every terminal id,
+ * as an explicit collection always has. "any" returns only results that have
+ * not already reached the parent, so a result is never handed over twice by
+ * successive "any" waits or by automatic delivery.
+ */
+export function partitionWaitResult(input: {
+  readonly mode: WaitMode;
+  readonly requestedIds: ReadonlyArray<string>;
+  readonly settledIds: ReadonlyArray<string>;
+  readonly delivered: (id: string) => boolean;
+}): WaitPartition {
+  const settled = new Set(input.settledIds);
+  const terminal = input.requestedIds.filter((id) => settled.has(id));
+  const pending = input.requestedIds.filter((id) => !settled.has(id));
+  if (input.mode === "all") {
+    return { returned: terminal, alreadyDelivered: [], pending };
+  }
+  return {
+    returned: terminal.filter((id) => !input.delivered(id)),
+    alreadyDelivered: terminal.filter((id) => input.delivered(id)),
+    pending,
+  };
+}
+
+/** Footer naming ids the parent should wait on next, and ids skipped as already delivered. */
+export function formatWaitRemainder(partition: WaitPartition): string {
+  const lines: string[] = [];
+  if (partition.alreadyDelivered.length > 0) {
+    lines.push(
+      `Already delivered earlier (not repeated): ${partition.alreadyDelivered.join(", ")}.`,
+    );
+  }
+  if (partition.pending.length > 0) {
+    const ids = partition.pending.map((id) => `"${id}"`).join(", ");
+    lines.push(
+      `Still running: ${partition.pending.join(", ")}. Call subagent_wait(ids: [${ids}], mode: "any") for the next result.`,
+    );
+  }
+  return lines.join("\n");
 }

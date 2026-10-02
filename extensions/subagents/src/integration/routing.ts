@@ -16,10 +16,6 @@ import {
   type BatchProposal,
 } from "../routing/proposals.ts";
 import { resolveRouting } from "../routing/resolver.ts";
-import {
-  STANDALONE_GATE_PARAMETERS,
-  type StandaloneGateParams,
-} from "./standalone-gate.ts";
 
 export const ROUTING_CLASSIFICATION_PARAMETERS = Type.Object(
   {
@@ -34,7 +30,6 @@ export const ROUTED_SPAWN_TASK_PARAMETERS = Type.Object(
     prompt: Type.String(),
     name: Type.String(),
     classification: ROUTING_CLASSIFICATION_PARAMETERS,
-    gate: Type.Optional(STANDALONE_GATE_PARAMETERS),
     harness: Type.Optional(
       Type.Union([Type.Literal("pi"), Type.Literal("codex")]),
     ),
@@ -61,7 +56,6 @@ export interface BoundRoutedSpawnTask {
   readonly name: string;
   readonly cwd: string;
   readonly classification: RoutingClassification;
-  readonly gate?: StandaloneGateParams;
   readonly harness?: BackendName;
   readonly model?: string;
   readonly reasoningEffort?: ReasoningEffort;
@@ -109,7 +103,9 @@ export class StandaloneRoutingController {
     string,
     {
       readonly expiresAt: number;
-      readonly promise: Promise<ReadonlyArray<RoutedAdmissionResult>>;
+      readonly promise: Promise<
+        ReadonlyArray<PromiseSettledResult<RoutedAdmissionResult>>
+      >;
     }
   >();
 
@@ -123,20 +119,13 @@ export class StandaloneRoutingController {
   ): BatchProposal {
     const items = tasks.map((task) => {
       const explicit = explicitRuntime(task);
-      const resolved = resolveRouting({
+      const runtime = resolveRouting({
         classification: task.classification,
         classificationSource: "explicit",
         explicit,
         settings: context.settings,
         lookupModel: context.lookupModel,
       });
-      // A gate adds a remote evaluation; "auto" is the user's standing consent for it.
-      const runtime =
-        resolved.status === "resolved" &&
-        task.gate &&
-        context.settings.settings.routing.approval !== "auto"
-          ? { ...resolved, requiresApproval: true }
-          : resolved;
       if (runtime.status !== "resolved") {
         const reason =
           runtime.status === "unresolved"
@@ -157,10 +146,35 @@ export class StandaloneRoutingController {
     });
   }
 
+  /** Approve and admit; throws when any item fails (repeat calls never duplicate). */
   approveAndAdmit(
     context: RoutingApprovalContext,
     admit: AdmitRoutedSpawn,
   ): Promise<ReadonlyArray<RoutedAdmissionResult>> {
+    return this.approveAndAdmitSettled(context, admit).then((settled) => {
+      const admitted = settled.flatMap((result) =>
+        result.status === "fulfilled" ? [result.value] : [],
+      );
+      const failed = settled.length - admitted.length;
+      if (failed > 0) {
+        const admittedIds = admitted.map((result) => result.id).join(", ");
+        throw new Error(
+          `Routed batch admission partially failed (${failed}/${settled.length});` +
+            ` admitted ids: ${admittedIds || "none"}. Repeating approval will not spawn duplicates.`,
+        );
+      }
+      return admitted;
+    });
+  }
+
+  /**
+   * Approve and admit every item together, reporting per-item outcomes in
+   * proposal order. Repeating the same approval returns the same outcomes.
+   */
+  approveAndAdmitSettled(
+    context: RoutingApprovalContext,
+    admit: AdmitRoutedSpawn,
+  ): Promise<ReadonlyArray<PromiseSettledResult<RoutedAdmissionResult>>> {
     const now = Date.now();
     for (const [id, entry] of this.#admissions) {
       if (entry.expiresAt <= now) this.#admissions.delete(id);
@@ -213,20 +227,7 @@ export class StandaloneRoutingController {
         };
         return admit(bound.task, item.runtime.effective);
       }),
-    ).then((settled) => {
-      const admitted = settled.flatMap((result) =>
-        result.status === "fulfilled" ? [result.value] : [],
-      );
-      const failed = settled.length - admitted.length;
-      if (failed > 0) {
-        const admittedIds = admitted.map((result) => result.id).join(", ");
-        throw new Error(
-          `Routed batch admission partially failed (${failed}/${settled.length});` +
-            ` admitted ids: ${admittedIds || "none"}. Repeating approval will not spawn duplicates.`,
-        );
-      }
-      return admitted;
-    });
+    );
     this.#admissions.set(context.proposalId, {
       expiresAt: exact.expiresAt,
       promise: admission,

@@ -3,30 +3,17 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import {
-  CURSOR_MARKER,
-  Input,
-  type Focusable,
-  truncateToWidth,
-} from "@earendil-works/pi-tui";
-import {
+  clearSubagentSettingsCache,
   DEFAULT_SUBAGENT_SETTINGS,
   loadSubagentSettings,
 } from "../routing/settings.ts";
-import {
-  DEFAULT_JEV_CREDENTIALS_PATH,
-  hasJevCredential,
-  saveJevApiKey,
-} from "../jev/credentials.ts";
 
 export interface SettingsCommandContext {
   readonly cwd: string;
   readonly hasUI: boolean;
-  readonly mode?: "tui" | "rpc" | "json" | "print";
   isProjectTrusted(): boolean;
   readonly ui: {
-    custom?: ExtensionUIContext["custom"];
     editor?(title: string, prefill?: string): Promise<string | undefined>;
     notify(message: string, type?: "info" | "warning" | "error"): void;
   };
@@ -36,53 +23,6 @@ type SettingsScope = "global" | "project";
 
 export interface SubagentsSettingsCommandOptions {
   readonly globalPath?: string;
-  readonly credentialsPath?: string;
-  readonly env?: Readonly<Record<string, string | undefined>>;
-}
-
-class MaskedSecretInput implements Focusable {
-  readonly #input = new Input();
-  readonly #done: (value: string | undefined) => void;
-  #focused = false;
-
-  constructor(done: (value: string | undefined) => void) {
-    this.#done = done;
-    this.#input.onSubmit = (value) => this.#done(value);
-    this.#input.onEscape = () => this.#done(undefined);
-  }
-
-  get focused(): boolean {
-    return this.#focused;
-  }
-
-  set focused(value: boolean) {
-    this.#focused = value;
-    this.#input.focused = value;
-  }
-
-  handleInput(data: string): void {
-    const previous = this.#input.getValue();
-    this.#input.handleInput(data);
-    if (Buffer.byteLength(this.#input.getValue(), "utf8") > 8 * 1024) {
-      this.#input.setValue(previous);
-    }
-  }
-
-  render(width: number): string[] {
-    const available = Math.max(0, width - 2);
-    const count = Array.from(this.#input.getValue()).length;
-    const visible = "•".repeat(Math.min(count, Math.max(0, available - 1)));
-    const marker = this.#focused ? CURSOR_MARKER : "";
-    return [
-      truncateToWidth("Set Jev API key", width),
-      truncateToWidth(`> ${visible}${marker}\x1b[7m \x1b[27m`, width, ""),
-      truncateToWidth("enter save • esc cancel", width),
-    ];
-  }
-
-  invalidate(): void {
-    this.#input.invalidate();
-  }
 }
 
 function readOptional(file: string): string | undefined {
@@ -132,14 +72,13 @@ function inspectSettings(
     projectTrusted: ctx.isProjectTrusted(),
     globalPath: options.globalPath,
   });
-  const { routing, jev } = snapshot.settings;
+  const { routing, maxRunning } = snapshot.settings;
   const routes = Object.entries(routing.routes);
   return [
+    `Max running: ${maxRunning} (applies to new sessions)`,
     `Routing: ${routing.enabled ? "enabled" : "disabled"}`,
     `Approval: ${routing.approval}; ambiguous: ${routing.ambiguous}; unavailable: ${routing.unavailable}`,
     `Routes: ${routes.length === 0 ? "none" : routes.map(([key, value]) => `${key}=${value.harness ?? "?"}/${value.model ?? "?"}${value.effort ? `:${value.effort}` : ""}`).join(", ")}`,
-    `Jev: model=${jev.model}; timeout=${jev.timeoutMs}ms; maxConcurrent=${jev.maxConcurrent}`,
-    `Jev credential: ${hasJevCredential({ apiKeyEnv: jev.apiKeyEnv, env: options.env, credentialsPath: options.credentialsPath ?? DEFAULT_JEV_CREDENTIALS_PATH }) ? "configured" : "missing"}`,
     `Global: ${snapshot.globalPath}`,
     `Project: ${snapshot.projectPath} (${snapshot.projectApplied ? "applied" : ctx.isProjectTrusted() ? "not present" : "untrusted/ignored"})`,
     ...snapshot.notices.map((notice) => `Notice: ${notice}`),
@@ -149,58 +88,19 @@ function inspectSettings(
 function parseArgs(raw: string): {
   scope?: SettingsScope;
   edit: boolean;
-  setJevKey: boolean;
 } {
   const parts = raw.trim().split(/\s+/u).filter(Boolean);
   const edit = parts.includes("edit");
-  const setJevKey = parts.includes("set-jev-key");
   const scope = parts.find(
     (part): part is SettingsScope => part === "global" || part === "project",
   );
-  const unknown = parts.filter(
-    (part) => part !== "edit" && part !== "set-jev-key" && part !== scope,
-  );
+  const unknown = parts.filter((part) => part !== "edit" && part !== scope);
   if (unknown.length > 0) {
-    throw new Error(
-      "Usage: /subagents-settings [global|project] [edit] | set-jev-key",
-    );
+    throw new Error("Usage: /subagents-settings [global|project] [edit]");
   }
-  if (setJevKey && parts.length !== 1)
-    throw new Error("set-jev-key cannot be combined with other arguments");
   if (edit && !scope)
     throw new Error("Editing requires an explicit global or project scope");
-  return { scope, edit, setJevKey };
-}
-
-async function setJevKey(
-  ctx: SettingsCommandContext,
-  options: SubagentsSettingsCommandOptions,
-): Promise<void> {
-  if (!ctx.hasUI || ctx.mode !== "tui" || !ctx.ui.custom) {
-    throw new Error("Setting a Jev API key requires the interactive TUI");
-  }
-  const key = await ctx.ui.custom<string | undefined>(
-    (tui, _theme, _kb, done) => {
-      const input = new MaskedSecretInput(done);
-      return {
-        get focused() {
-          return input.focused;
-        },
-        set focused(value: boolean) {
-          input.focused = value;
-        },
-        render: (width) => input.render(width),
-        invalidate: () => input.invalidate(),
-        handleInput: (data) => {
-          input.handleInput(data);
-          tui.requestRender();
-        },
-      };
-    },
-  );
-  if (key === undefined) return;
-  saveJevApiKey(key, options.credentialsPath ?? DEFAULT_JEV_CREDENTIALS_PATH);
-  ctx.ui.notify("Saved Jev API key. It is available immediately.", "info");
+  return { scope, edit };
 }
 
 async function editSettings(
@@ -244,6 +144,8 @@ async function editSettings(
     },
   });
   atomicWrite(target, edited);
+  // A same-size rewrite within the stat resolution must not serve stale settings.
+  clearSubagentSettingsCache();
   ctx.ui.notify(
     `Saved validated ${scope} subagent settings to ${target}. Reload or start a new session to apply them.`,
     "info",
@@ -264,12 +166,10 @@ export function createSubagentsSettingsCommand(
   options: SubagentsSettingsCommandOptions = {},
 ) {
   return {
-    description:
-      "Inspect/edit subagent settings or securely set the global Jev API key",
+    description: "Inspect or edit subagent settings",
     handler: async (rawArgs: string, ctx: SettingsCommandContext) => {
       try {
         const args = parseArgs(rawArgs);
-        if (args.setJevKey) await setJevKey(ctx, options);
         if (args.edit && args.scope)
           await editSettings(args.scope, ctx, options);
         ctx.ui.notify(inspectSettings(ctx, options), "info");

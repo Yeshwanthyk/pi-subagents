@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ParentQuestion, ParentRef, SubagentSnapshot } from "./src/domain.ts";
+import type {
+  ParentQuestion,
+  ParentRef,
+  SubagentSnapshot,
+} from "./src/domain.ts";
 import {
   captureParentRef,
   type ParentSessionManager,
@@ -366,4 +370,37 @@ test("question notification failure retains only the question and shutdown clear
   coordinator.onQuestion(question);
   coordinator.close();
   assert.equal(coordinator.questionMailbox.size(), 0);
+});
+
+test("wasDelivered tracks wait consumption and idle delivery so an any-wait never repeats a result", () => {
+  const seam = sessionManager();
+  const context = { sessionManager: seam.manager, isIdle: () => true };
+  const sent: string[] = [];
+  const coordinator = createParentResultCoordinator({
+    sendBatch: (batch) => {
+      for (const envelope of batch) sent.push(envelope.id);
+    },
+  });
+  coordinator.startSession(context, 4);
+  const waited = snapshot({ id: "sa-waited" });
+  const automatic = snapshot({ id: "sa-auto" });
+  assert.equal(coordinator.wasDelivered(waited.id, ref()), false);
+
+  // A wait that returns sa-waited consumes it before idle delivery can send it.
+  coordinator.onSettled(waited, false);
+  coordinator.consume([waited]);
+  assert.equal(coordinator.wasDelivered(waited.id, ref()), true);
+
+  // An unawaited result is delivered automatically exactly once.
+  coordinator.onSettled(automatic, false);
+  assert.equal(coordinator.wasDelivered(automatic.id, ref()), false);
+  assert.equal(coordinator.flush(context), true);
+  assert.deepEqual(sent, [automatic.id]);
+  assert.equal(coordinator.wasDelivered(automatic.id, ref()), true);
+  assert.equal(coordinator.flush(context), false);
+  assert.deepEqual(sent, [automatic.id]);
+
+  // A restarted child settles with a new result that is not yet delivered.
+  coordinator.onSettled(automatic, false);
+  assert.equal(coordinator.wasDelivered(automatic.id, ref()), false);
 });

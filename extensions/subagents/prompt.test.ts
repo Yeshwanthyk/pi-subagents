@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  ASK_JEV_PROMPT_GUIDELINES,
-  ASK_JEV_TOOL_DESCRIPTION,
   buildSubagentSpawnResult,
   SUBAGENT_SPAWN_PROMPT_GUIDELINES,
   SUBAGENT_SPAWN_PROMPT_SNIPPET,
   SUBAGENT_SPAWN_TOOL_DESCRIPTION,
   SUBAGENT_WAIT_TOOL_DESCRIPTION,
+  subagentSpawnToolDescription,
 } from "./src/prompt.ts";
 
 test("spawn metadata describes scoped delegation and coordination", () => {
@@ -53,9 +52,8 @@ test("wait description identifies dependent parent work", () => {
   );
 });
 
-test("routing and Jev guidance preserve authority and disclosure boundaries", () => {
+test("routing guidance preserves authority and disclosure boundaries", () => {
   const spawnGuidance = SUBAGENT_SPAWN_PROMPT_GUIDELINES.join(" ");
-  const jevGuidance = ASK_JEV_PROMPT_GUIDELINES.join(" ");
 
   assert.match(
     SUBAGENT_SPAWN_TOOL_DESCRIPTION,
@@ -71,41 +69,12 @@ test("routing and Jev guidance preserve authority and disclosure boundaries", ()
     /saved preference, requested overrides, and effective runtime/,
   );
   assert.match(spawnGuidance, /newer user approval/);
-  assert.match(
-    ASK_JEV_TOOL_DESCRIPTION,
-    /sends the state and questions to a remote service/,
-  );
-  assert.match(ASK_JEV_TOOL_DESCRIPTION, /not an agent or proof/);
-  assert.match(jevGuidance, /never as permission/);
-  assert.match(jevGuidance, /minimum explicitly selected evidence/);
-  assert.match(jevGuidance, /never reads files or uploads context on its own/);
 });
 
-test("Jev guidance makes bounded judgment deliberate and economical", () => {
-  const guidance = ASK_JEV_PROMPT_GUIDELINES.join(" ");
-
-  assert.match(guidance, /On each request/);
-  assert.match(guidance, /planning or delegating/);
-  assert.match(guidance, /replace a larger model call/);
-  assert.match(guidance, /avoid reading a long report/);
-  assert.match(
-    guidance,
-    /bounded classification, scoring, and report judgments/,
-  );
-  assert.match(guidance, /rather than automatically/);
-  assert.match(guidance, /Batch related questions/);
-});
-
-test("Jev guidance plans gates without replacing code proof", () => {
-  const jevGuidance = ASK_JEV_PROMPT_GUIDELINES.join(" ");
-  const spawnGuidance = SUBAGENT_SPAWN_PROMPT_GUIDELINES.join(" ");
-
-  assert.match(jevGuidance, /continuation depends on judging a child's result/);
-  assert.match(jevGuidance, /Show planned gates before any required approval/);
-  assert.match(jevGuidance, /exact code checks and tests/);
-  assert.match(jevGuidance, /never as permission.*proof.*authority/);
-  assert.match(spawnGuidance, /compact acceptance by default/);
-  assert.match(spawnGuidance, /request the full report explicitly/);
-  assert.match(spawnGuidance, /retain its content/);
-  assert.match(spawnGuidance, /never strip dependency evidence/);
+test("spawn description reports the effective running cap and batch form", () => {
+  assert.match(subagentSpawnToolDescription(3), /Max 3 subagents run at once/);
+  assert.match(SUBAGENT_SPAWN_TOOL_DESCRIPTION, /Max 6 subagents run at once/);
+  assert.doesNotMatch(SUBAGENT_SPAWN_TOOL_DESCRIPTION, /Max 4/);
+  assert.match(SUBAGENT_SPAWN_TOOL_DESCRIPTION, /"tasks" array of 1 to 16/);
+  assert.match(SUBAGENT_WAIT_TOOL_DESCRIPTION, /mode "any"/);
 });

@@ -278,12 +278,9 @@ export function renderWorkflowTaskRows(
         ? `needs:${task.dependencies.join(",")}`
         : undefined,
       scopeLabel(task),
-      task.executor === "evaluation"
-        ? "evaluation"
-        : [task.backend, task.model, task.effort]
-            .filter((value) => value !== undefined)
-            .join("/"),
-      task.acceptance ? `gate:${task.acceptance}` : undefined,
+      [task.backend, task.model, task.effort]
+        .filter((value) => value !== undefined)
+        .join("/"),
       task.attemptNumber > 1 ? `try ${task.attemptNumber}` : undefined,
       task.currentTool ? `tool:${task.currentTool}` : undefined,
       task.displayStatus === "blocked"
@@ -369,12 +366,9 @@ function taskDetail(
   projection: WorkflowProjection,
   theme: Theme,
 ): string[] {
-  const runtime =
-    task.executor === "evaluation"
-      ? "evaluation"
-      : [task.backend, task.model, task.effort]
-          .filter((value) => value !== undefined)
-          .join("/");
+  const runtime = [task.backend, task.model, task.effort]
+    .filter((value) => value !== undefined)
+    .join("/");
   const scope = scopeLabel(task);
   const attempt =
     task.attemptNumber > 0 ? `attempt ${task.attemptNumber}` : "not started";
@@ -407,21 +401,6 @@ function taskDetail(
   ].filter((value): value is string => value !== undefined);
   if (activity.length > 0) lines.push(theme.fg("dim", activity.join(" · ")));
   if (task.error) lines.push(theme.fg("error", task.error));
-  if (task.acceptance) {
-    lines.push(
-      theme.fg(
-        task.acceptance === "passed"
-          ? "success"
-          : task.acceptance === "pending"
-            ? "warning"
-            : "error",
-        `gate: ${task.acceptance}`,
-      ),
-    );
-  }
-  if (task.evaluationResult) {
-    lines.push(theme.fg("muted", `result: ${task.evaluationResult}`));
-  }
   return lines;
 }
 

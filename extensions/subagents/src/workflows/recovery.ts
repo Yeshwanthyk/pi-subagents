@@ -195,6 +195,7 @@ export function recoverWorkflowArtifacts(
     }
 
     let candidateEvents = events;
+    let recoveryEvent: WorkflowEvent | undefined;
     if (!isWorkflowTerminal(state.status)) {
       const maxEvents = options.maxEvents ?? store.maxEvents;
       if (events.length >= maxEvents) {
@@ -210,16 +211,14 @@ export function recoverWorkflowArtifacts(
         );
         continue;
       }
-      candidateEvents = [
-        ...events,
-        boundWorkflowEvent({
-          _tag: "WorkflowFailed",
-          runId: artifact.runId,
-          at: recoveryTime(state, options.now ?? Date.now),
-          error: WORKFLOW_ORPHANED_REASON,
-          recovery: "orphaned",
-        }),
-      ];
+      recoveryEvent = boundWorkflowEvent({
+        _tag: "WorkflowFailed",
+        runId: artifact.runId,
+        at: recoveryTime(state, options.now ?? Date.now),
+        error: WORKFLOW_ORPHANED_REASON,
+        recovery: "orphaned",
+      });
+      candidateEvents = [...events, recoveryEvent];
     }
     let candidateBytes: number;
     try {
@@ -241,7 +240,12 @@ export function recoverWorkflowArtifacts(
     }
 
     try {
-      store.replace(artifact.runId, candidateEvents);
+      if (recoveryEvent === undefined) {
+        throw new WorkflowArtifactError(
+          "Recovery terminal event was not prepared.",
+        );
+      }
+      store.append(artifact.runId, recoveryEvent);
       const recovered = foldWorkflowEvents(candidateEvents);
       if (!isWorkflowTerminal(recovered.status)) {
         throw new WorkflowArtifactError(

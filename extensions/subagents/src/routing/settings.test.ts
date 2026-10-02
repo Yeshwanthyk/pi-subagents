@@ -1,8 +1,14 @@
 /* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion -- Test fixtures intentionally exercise unknown JSON input. */
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { DEFAULT_SUBAGENT_SETTINGS, loadSubagentSettings } from "./settings.ts";
+import {
+  clearSubagentSettingsCache,
+  DEFAULT_SUBAGENT_SETTINGS,
+  loadSubagentSettings,
+} from "./settings.ts";
 
 function loader(global: unknown, project?: unknown, trusted = true) {
   const globalPath = path.resolve("/tmp/global-subagents.json");
@@ -21,7 +27,7 @@ function loader(global: unknown, project?: unknown, trusted = true) {
   });
 }
 
-test("no files preserves disabled routing and default Jev configuration", () => {
+test("no files preserves disabled routing defaults", () => {
   const snapshot = loadSubagentSettings({
     cwd: "/workspace",
     projectTrusted: true,
@@ -30,7 +36,6 @@ test("no files preserves disabled routing and default Jev configuration", () => 
   });
   assert.deepEqual(snapshot.settings, DEFAULT_SUBAGENT_SETTINGS);
   assert.equal(snapshot.settings.routing.enabled, false);
-  assert.equal(snapshot.settings.jev.apiKeyEnv, "TYPESAFE_API_KEY");
 });
 
 test("trusted routes merge by key and each route entry is replaced atomically", () => {
@@ -122,62 +127,6 @@ test("untrusted project settings are ignored without parsing", () => {
   assert.match(snapshot.notices[0]!, /Ignored untrusted project settings/);
 });
 
-test("legacy Jev enabled settings require migration", () => {
-  for (const enabled of [false, true]) {
-    assert.throws(
-      () => loader({ version: 1, jev: { enabled } }),
-      /jev\.enabled.*obsolete/,
-    );
-    assert.throws(
-      () => loader({ version: 1 }, { version: 1, jev: { enabled } }),
-      /jev\.enabled.*obsolete/,
-    );
-  }
-});
-
-test("project Jev settings cannot change credential selection", () => {
-  assert.throws(
-    () => loader({ version: 1 }, { version: 1, jev: { apiKeyEnv: "OTHER" } }),
-    /cannot change credentials/,
-  );
-  assert.throws(
-    () =>
-      loader(
-        { version: 1 },
-        { version: 1, jev: { endpoint: "https://example.test" } },
-      ),
-    /unsupported field "endpoint"/,
-  );
-});
-
-test("project Jev settings may only restrict global limits", () => {
-  const snapshot = loader(
-    {
-      version: 1,
-      jev: {
-        apiKeyEnv: "PRIVATE_KEY_NAME",
-        timeoutMs: 20_000,
-        maxConcurrent: 4,
-      },
-    },
-    {
-      version: 1,
-      jev: { timeoutMs: 5_000, maxConcurrent: 1 },
-    },
-  );
-  assert.equal(snapshot.settings.jev.apiKeyEnv, "PRIVATE_KEY_NAME");
-  assert.equal(snapshot.settings.jev.timeoutMs, 5_000);
-  assert.equal(snapshot.settings.jev.maxConcurrent, 1);
-  assert.throws(
-    () =>
-      loader(
-        { version: 1, jev: { timeoutMs: 5_000 } },
-        { version: 1, jev: { timeoutMs: 5_001 } },
-      ),
-    /may only restrict/,
-  );
-});
-
 test("project routing approval may restrict but never loosen the global policy", () => {
   assert.equal(
     loader({ version: 1, routing: { approval: "auto" } }).settings.routing
@@ -199,4 +148,77 @@ test("project routing approval may restrict but never loosen the global policy",
     () => loader({ version: 1, routing: { approval: "always" } }),
     /approval/,
   );
+});
+
+test("maxRunning defaults to six and the project overlay may only lower it", () => {
+  assert.equal(loader({ version: 1 }).settings.maxRunning, 6);
+  assert.equal(loader({ version: 1, maxRunning: 10 }).settings.maxRunning, 10);
+  assert.equal(
+    loader({ version: 1, maxRunning: 10 }, { version: 1, maxRunning: 3 })
+      .settings.maxRunning,
+    3,
+  );
+  assert.equal(
+    loader({ version: 1 }, { version: 1, maxRunning: 6 }).settings.maxRunning,
+    6,
+  );
+  assert.throws(
+    () => loader({ version: 1 }, { version: 1, maxRunning: 7 }),
+    /may only lower the global cap \(6\)/,
+  );
+  assert.throws(
+    () => loader({ version: 1, maxRunning: 2 }, { version: 1, maxRunning: 4 }),
+    /may only lower/,
+  );
+  // Untrusted overlays are ignored rather than rejected.
+  assert.equal(
+    loader({ version: 1 }, { version: 1, maxRunning: 32 }, false).settings
+      .maxRunning,
+    6,
+  );
+  for (const invalid of [0, 33, 2.5, "4"]) {
+    assert.throws(
+      () => loader({ version: 1, maxRunning: invalid }),
+      /maxRunning must be an integer from 1 through 32/,
+    );
+  }
+});
+
+test("filesystem settings are cached by stat signature and reload on change", () => {
+  clearSubagentSettingsCache();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-settings-"));
+  try {
+    const globalPath = path.join(root, "global.json");
+    const cwd = path.join(root, "project");
+    fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+    fs.writeFileSync(globalPath, JSON.stringify({ version: 1, maxRunning: 5 }));
+    const load = () =>
+      loadSubagentSettings({ cwd, projectTrusted: true, globalPath });
+    const first = load();
+    assert.equal(first.settings.maxRunning, 5);
+    assert.equal(load(), first, "unchanged files reuse the cached snapshot");
+
+    const projectPath = path.join(cwd, ".pi", "subagents.json");
+    fs.writeFileSync(
+      projectPath,
+      JSON.stringify({ version: 1, maxRunning: 2 }),
+    );
+    const second = load();
+    assert.notEqual(second, first);
+    assert.equal(second.settings.maxRunning, 2);
+    assert.equal(second.projectApplied, true);
+
+    fs.writeFileSync(
+      globalPath,
+      JSON.stringify({ version: 1, maxRunning: 12, routing: {} }),
+    );
+    const future = new Date(Date.now() + 5_000);
+    fs.utimesSync(globalPath, future, future);
+    assert.equal(load().settings.maxRunning, 2);
+    fs.rmSync(projectPath);
+    assert.equal(load().settings.maxRunning, 12);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    clearSubagentSettingsCache();
+  }
 });

@@ -34,6 +34,12 @@ function created(runId = "wf-artifact"): WorkflowEvent[] {
   ];
 }
 
+const HEADER = JSON.stringify({ format: "pi-workflow-journal", version: 1 });
+
+function jsonl(events: ReadonlyArray<unknown>): string {
+  return `${[HEADER, ...events.map((event) => JSON.stringify(event))].join("\n")}\n`;
+}
+
 function tempProject() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-workflow-artifacts-"));
   const project = path.join(root, "project");
@@ -109,7 +115,7 @@ test("journal parsing and paths fail closed at bounds and hostile fields", () =>
   assert.throws(
     () =>
       parseWorkflowJournal(
-        JSON.stringify([
+        jsonl([
           {
             _tag: "WorkflowCreated",
             runId: "wf-artifact",
@@ -120,30 +126,6 @@ test("journal parsing and paths fail closed at bounds and hostile fields", () =>
         ]),
       ),
     WorkflowArtifactBoundsError,
-  );
-  assert.throws(
-    () =>
-      parseWorkflowJournal(
-        JSON.stringify([
-          {
-            _tag: "WorkflowCreated",
-            runId: "wf-artifact",
-            at: 1,
-            definition: {
-              evaluationPolicy: {
-                provider: "jev",
-                enabled: false,
-                apiKeyEnv: "TYPESAFE_API_KEY",
-                model: "jev-1.13.0",
-                timeoutMs: 10_000,
-                maxConcurrent: 2,
-              },
-              tasks: [],
-            },
-          },
-        ]),
-      ),
-    /evaluationPolicy\.enabled.*obsolete/,
   );
   assert.throws(
     () =>
@@ -198,7 +180,7 @@ test("accepted manager events persist before publication and failed replacement 
       matchesCwd: (cwd) => real.matchesCwd(cwd),
       journalPath: (runId) => real.journalPath(runId),
       create: (runId, events) => real.create(runId, events),
-      replace: (_runId, _events) => {
+      append: (_runId, _event) => {
         replacements++;
         throw new Error("simulated post-write failure");
       },
@@ -247,10 +229,10 @@ test("terminal cancellation remains journal-bound when persistence fails", async
       matchesCwd: (cwd) => real.matchesCwd(cwd),
       journalPath: (runId) => real.journalPath(runId),
       create: (runId, events) => real.create(runId, events),
-      replace: (runId, events) => {
+      append: (runId, event) => {
         if (failReplace)
           throw new Error("simulated terminal persistence failure");
-        real.replace(runId, events);
+        real.append(runId, event);
       },
       load: (runId) => real.load(runId),
       scan: () => real.scan(),
@@ -340,7 +322,7 @@ test("persisted log levels are validated instead of trusted by a cast", () => {
   assert.throws(
     () =>
       parseWorkflowJournal(
-        JSON.stringify([
+        jsonl([
           {
             _tag: "WorkflowCreated",
             runId: "wf-log-level",
@@ -378,6 +360,178 @@ test("artifact scanning stops at its entry bound before recovery parsing", () =>
     const scan = bounded.scan();
     assert.equal(scan.artifacts.length, 2);
     assert.match(scan.failures.at(-1)?.message ?? "", /limited to 2 entries/u);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("appending events preserves earlier journal bytes and grows monotonically", () => {
+  const { root, project } = tempProject();
+  try {
+    const store = new WorkflowArtifactStore({
+      workflowsDir: path.join(root, "workflows"),
+      cwd: project,
+    });
+    const runId = "wf-append";
+    const events = created(runId);
+    store.create(runId, events);
+    const journal = store.journalPath(runId);
+    let previous = fs.readFileSync(journal);
+    assert.equal(previous.toString("utf8").split("\n")[0], HEADER);
+    for (let index = 0; index < 20; index++) {
+      const event: WorkflowEvent = {
+        _tag: "WorkflowLogAdded",
+        runId,
+        at: 3 + index,
+        level: "info",
+        message: `log ${index}`,
+      };
+      store.append(runId, event);
+      events.push(event);
+      const next = fs.readFileSync(journal);
+      assert.ok(next.length > previous.length, "journal must grow");
+      assert.ok(
+        next.subarray(0, previous.length).equals(previous),
+        "earlier bytes must be preserved",
+      );
+      previous = next;
+    }
+    assert.equal(privateMode(journal), 0o600);
+    assert.deepEqual(store.load(runId), events);
+
+    // A fresh store resumes appending from the loaded tail.
+    const reopened = new WorkflowArtifactStore({
+      workflowsDir: path.join(root, "workflows"),
+      cwd: project,
+    });
+    const final: WorkflowEvent = {
+      _tag: "WorkflowCompleted",
+      runId,
+      at: 99,
+      summary: undefined,
+    };
+    reopened.append(runId, final);
+    assert.deepEqual(reopened.load(runId), [...events, final]);
+    assert.ok(fs.readFileSync(journal).subarray(0, previous.length).equals(previous));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("append enforces event and byte bounds and refuses symlinked journals", () => {
+  const { root, project } = tempProject();
+  try {
+    const store = new WorkflowArtifactStore({
+      workflowsDir: path.join(root, "workflows"),
+      cwd: project,
+      maxEvents: 3,
+    });
+    store.create("wf-bounded", created("wf-bounded"));
+    const log = (at: number): WorkflowEvent => ({
+      _tag: "WorkflowLogAdded",
+      runId: "wf-bounded",
+      at,
+      level: "info",
+      message: "x",
+    });
+    store.append("wf-bounded", log(3));
+    assert.throws(
+      () => store.append("wf-bounded", log(4)),
+      WorkflowArtifactBoundsError,
+    );
+    assert.equal(store.load("wf-bounded").length, 3);
+
+    const tiny = new WorkflowArtifactStore({
+      workflowsDir: path.join(root, "workflows-tiny"),
+      cwd: project,
+      maxBytes: 512,
+    });
+    tiny.create("wf-bytes", created("wf-bytes"));
+    assert.throws(
+      () =>
+        tiny.append("wf-bytes", {
+          _tag: "WorkflowLogAdded",
+          runId: "wf-bytes",
+          at: 3,
+          level: "info",
+          message: "y".repeat(1024),
+        }),
+      WorkflowArtifactBoundsError,
+    );
+
+    store.create("wf-link", created("wf-link"));
+    const journal = store.journalPath("wf-link");
+    const target = path.join(root, "target.jsonl");
+    fs.writeFileSync(target, fs.readFileSync(journal), { mode: 0o600 });
+    fs.unlinkSync(journal);
+    fs.symlinkSync(target, journal);
+    assert.throws(() => store.append("wf-link", log(3)));
+    assert.equal(
+      fs.readFileSync(target, "utf8").split("\n").filter(Boolean).length,
+      3,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy single-document journals are rejected with a clear error", () => {
+  assert.throws(
+    () => parseWorkflowJournal(JSON.stringify(created())),
+    /retired single-document JSON format/u,
+  );
+  const { root, project } = tempProject();
+  try {
+    const store = new WorkflowArtifactStore({
+      workflowsDir: path.join(root, "workflows"),
+      cwd: project,
+    });
+    store.create("wf-legacy", created("wf-legacy"));
+    const journal = store.journalPath("wf-legacy");
+    const legacy = path.join(path.dirname(journal), "journal.json");
+    fs.writeFileSync(legacy, JSON.stringify(created("wf-legacy")), {
+      mode: 0o600,
+    });
+    fs.unlinkSync(journal);
+    assert.throws(
+      () => store.load("wf-legacy"),
+      /retired single-document JSON format/u,
+    );
+    const scan = store.scan();
+    assert.equal(scan.artifacts.length, 0);
+    assert.match(
+      scan.failures[0]?.message ?? "",
+      /retired single-document JSON format/u,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a torn non-durable tail is ignored on load and replaced by the next append", () => {
+  const { root, project } = tempProject();
+  try {
+    const store = new WorkflowArtifactStore({
+      workflowsDir: path.join(root, "workflows"),
+      cwd: project,
+    });
+    const events = created("wf-torn");
+    store.create("wf-torn", events);
+    const journal = store.journalPath("wf-torn");
+    fs.appendFileSync(journal, '{"_tag":"TaskQue');
+    const reopened = new WorkflowArtifactStore({
+      workflowsDir: path.join(root, "workflows"),
+      cwd: project,
+    });
+    assert.deepEqual(reopened.load("wf-torn"), events);
+    const final: WorkflowEvent = {
+      _tag: "WorkflowCompleted",
+      runId: "wf-torn",
+      at: 5,
+      summary: undefined,
+    };
+    reopened.append("wf-torn", final);
+    assert.deepEqual(reopened.load("wf-torn"), [...events, final]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

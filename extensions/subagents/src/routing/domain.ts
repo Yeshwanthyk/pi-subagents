@@ -17,7 +17,7 @@ export interface RoutingClassification {
   readonly complexity?: RoutingComplexity;
 }
 
-export type ClassificationSource = "explicit" | "workflow_kind" | "jev";
+export type ClassificationSource = "explicit" | "workflow_kind";
 
 export interface RuntimeSelection {
   readonly harness?: BackendName;
@@ -42,18 +42,11 @@ export interface RoutingPolicy {
   readonly routes: RouteTable;
 }
 
-export interface JevSettings {
-  readonly apiKeyEnv: string;
-  readonly model: string;
-  readonly timeoutMs: number;
-  readonly maxConcurrent: number;
-}
-
 export interface SubagentSettings {
   readonly version: 1;
+  /** Global cap on concurrently running children. Applied at manager creation (reload to change). */
+  readonly maxRunning: number;
   readonly routing: RoutingPolicy;
-  /** Configuration only. The routing package does not provide Jev transport. */
-  readonly jev: JevSettings;
 }
 
 export interface SettingsSnapshot {

@@ -5,7 +5,6 @@ import {
   buildSubagentResultBatchMessage,
   type SubagentResultCard,
 } from "./prompt.ts";
-import { compactGatedReportNotice } from "./result-delivery.ts";
 
 export interface ParentResultBatchDetails {
   readonly results: ReadonlyArray<{
@@ -13,7 +12,6 @@ export interface ParentResultBatchDetails {
     readonly id: string;
     readonly title: string;
     readonly status: TerminalSubagentStatus;
-    readonly acceptance?: ParentResultEnvelope["acceptance"];
   }>;
 }
 
@@ -35,11 +33,7 @@ function resultCard(result: ParentResultEnvelope): SubagentResultCard {
     title: result.title,
     status: result.status,
     error: result.error,
-    output:
-      result.acceptance === undefined
-        ? result.output
-        : compactGatedReportNotice(result.id),
-    acceptance: result.acceptance,
+    output: result.output,
   };
   if (result.kind === undefined) return card;
   return { ...card, kind: result.kind };
@@ -53,17 +47,8 @@ function resultDetail(
     title: result.title,
     status: result.status,
   };
-  if (result.kind === undefined && result.acceptance === undefined)
-    return detail;
-  if (result.kind === undefined) {
-    return { ...detail, acceptance: result.acceptance };
-  }
-  if (result.acceptance === undefined) return { ...detail, kind: result.kind };
-  return {
-    ...detail,
-    kind: result.kind,
-    acceptance: result.acceptance,
-  };
+  if (result.kind === undefined) return detail;
+  return { ...detail, kind: result.kind };
 }
 
 /** Build the public parent message without carrying runtime ParentRef data. */

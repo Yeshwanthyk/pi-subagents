@@ -1,7 +1,6 @@
 import type {
   ParentRef,
   SubagentSnapshot,
-  SubagentAcceptanceResult,
   TerminalSubagentStatus,
   ParentQuestion,
 } from "./domain.ts";
@@ -15,7 +14,6 @@ export interface ParentResultEnvelope {
   readonly status: TerminalSubagentStatus;
   readonly error?: string;
   readonly output: string;
-  readonly acceptance?: SubagentAcceptanceResult;
   readonly parentRef: ParentRef;
   /** Present only for the single aggregate workflow completion record. */
   readonly kind?: ParentResultKind;
@@ -53,7 +51,6 @@ export const PARENT_RESULT_LIMITS = {
   maxTitleLength: 160,
   maxErrorBytes: 4 * 1024,
   maxOutputBytes: 24 * 1024,
-  maxAcceptanceReasonBytes: 512,
 } as const;
 
 interface MailboxEntry {
@@ -117,7 +114,6 @@ function terminalBytes(envelope: ParentResultEnvelope): number {
       status: envelope.status,
       error: envelope.error,
       output: envelope.output,
-      acceptance: envelope.acceptance,
       kind: envelope.kind,
     }),
     "utf8",
@@ -131,18 +127,6 @@ function normalizeEnvelope(
     envelope.error === undefined
       ? undefined
       : boundedUtf8(envelope.error, PARENT_RESULT_LIMITS.maxErrorBytes);
-  const acceptance =
-    envelope.acceptance === undefined
-      ? undefined
-      : envelope.acceptance.reason === undefined
-        ? { status: envelope.acceptance.status }
-        : {
-            status: envelope.acceptance.status,
-            reason: boundedUtf8(
-              envelope.acceptance.reason,
-              PARENT_RESULT_LIMITS.maxAcceptanceReasonBytes,
-            ),
-          };
   const normalized = {
     id: boundedUtf8(singleLine(envelope.id), PARENT_RESULT_LIMITS.maxIdLength),
     title: boundedTitle(envelope.title),
@@ -152,7 +136,6 @@ function normalizeEnvelope(
       envelope.output || "(no output)",
       PARENT_RESULT_LIMITS.maxOutputBytes,
     ),
-    acceptance,
     parentRef: { ...envelope.parentRef },
   };
   if (envelope.kind === undefined) return normalized;
@@ -171,8 +154,7 @@ export function parentResultEnvelope(
     (snapshot.status !== "done" && snapshot.status !== "error") ||
     snapshot.parentRef === undefined ||
     snapshot.client !== undefined ||
-    snapshot.resultDelivery !== "parent" ||
-    snapshot.acceptance?.status === "pending"
+    snapshot.resultDelivery !== "parent"
   )
     return undefined;
   const error = snapshot.errorText
@@ -192,7 +174,6 @@ export function parentResultEnvelope(
     status: snapshot.status,
     error,
     output,
-    acceptance: snapshot.acceptance,
     parentRef: { ...snapshot.parentRef },
   });
 }

@@ -47,34 +47,11 @@ function toolLine(tool: LiveToolState, theme: Theme, now: number) {
   )}`;
 }
 
-function isAcceptancePending(snapshot: SubagentSnapshot) {
-  return snapshot.acceptance?.status === "pending";
-}
-
-function isAcceptanceFailure(snapshot: SubagentSnapshot) {
-  return (
-    snapshot.acceptance?.status === "reject" ||
-    snapshot.acceptance?.status === "error"
-  );
-}
-
 function statusPresentation(
   snapshot: SubagentSnapshot,
   theme: Theme,
   now: number,
 ) {
-  if (isAcceptancePending(snapshot)) {
-    return {
-      square: theme.fg("warning", "■"),
-      word: theme.fg("warning", "GATE"),
-    };
-  }
-  if (isAcceptanceFailure(snapshot)) {
-    return {
-      square: theme.fg("error", "■"),
-      word: theme.fg("error", "REJECTED"),
-    };
-  }
   if (snapshot.status === "done") {
     return {
       square: theme.fg("success", "■"),
@@ -131,14 +108,6 @@ export function renderSubagentActivity(
     )}`;
   }
 
-  if (snapshot.acceptance?.status === "pending") {
-    text += `\n  ${theme.fg("warning", "coding complete · acceptance pending")}`;
-  } else if (snapshot.acceptance?.status === "pass") {
-    text += `\n  ${theme.fg("success", "acceptance passed")}`;
-  } else if (snapshot.acceptance) {
-    text += `\n  ${theme.fg("error", `acceptance ${snapshot.acceptance.status}${snapshot.acceptance.reason ? ` · ${bounded(snapshot.acceptance.reason, 180)}` : ""}`)}`;
-  }
-
   const operationCount = `${snapshot.completedOperations} operation${snapshot.completedOperations === 1 ? "" : "s"} complete`;
   text += `\n  ${theme.fg("dim", operationCount)}`;
 
@@ -182,23 +151,17 @@ export function renderSubagentWaitSummary(
   now = Date.now(),
 ) {
   const pending = snapshots.filter(
-    (snapshot) =>
-      snapshot.status === "queued" ||
-      snapshot.status === "running" ||
-      isAcceptancePending(snapshot),
+    (snapshot) => snapshot.status === "queued" || snapshot.status === "running",
   );
   const complete = snapshots.length - pending.length;
   const lines = [
     `Waiting for ${pending.length} subagent${pending.length === 1 ? "" : "s"}${complete ? ` · ${complete} complete` : ""}`,
   ];
   const done = snapshots.filter(
-    (snapshot) =>
-      snapshot.status === "done" &&
-      !isAcceptancePending(snapshot) &&
-      !isAcceptanceFailure(snapshot),
+    (snapshot) => snapshot.status === "done",
   ).length;
   const failed = snapshots.filter(
-    (snapshot) => snapshot.status === "error" || isAcceptanceFailure(snapshot),
+    (snapshot) => snapshot.status === "error",
   ).length;
   if (done + failed > 0) {
     lines.push(
@@ -219,11 +182,9 @@ export function renderSubagentWaitSummary(
           `${current.name}${current.argsPreview ? ` ${current.argsPreview}` : ""}`,
           120,
         )
-      : isAcceptancePending(snapshot)
-        ? "acceptance pending"
-        : now - snapshot.lastActivityAt >= 30_000
-          ? "quiet · no recent events"
-          : "model working";
+      : now - snapshot.lastActivityAt >= 30_000
+        ? "quiet · no recent events"
+        : "model working";
     lines.push(
       `${snapshot.id} · ${operation} · activity ${formatActivityAge(snapshot.lastActivityAt, now)}`,
     );
