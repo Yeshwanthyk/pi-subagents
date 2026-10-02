@@ -36,6 +36,7 @@ import type {
   ExtensionUIContext,
   Theme,
 } from "@earendil-works/pi-coding-agent";
+import { waitForWorkflowTerminal } from "./src/workflows/wait.ts";
 import {
   getAgentDir,
   getMarkdownTheme,
@@ -1017,12 +1018,36 @@ export default function (pi: ExtensionAPI) {
       runId: Type.String({
         description: WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS.runId,
       }),
+      wait: Type.Optional(
+        Type.Boolean({
+          description: WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS.wait,
+        }),
+      ),
+      timeout_s: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 3600,
+          description: WORKFLOW_CHECK_PARAMETER_DESCRIPTIONS.timeoutS,
+        }),
+      ),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
       const manager = await getManager();
+      let timedOut = false;
+      if (params.wait === true) {
+        timedOut = !(await waitForWorkflowTerminal(
+          workflowManager,
+          params.runId,
+          (params.timeout_s ?? 600) * 1000,
+          signal,
+        ));
+      }
       const inspected = inspectWorkflow(manager, params.runId);
+      const note = timedOut
+        ? "\n\nWait timed out before the run reached a terminal state; call workflow_check with wait: true again to keep waiting."
+        : "";
       return {
-        content: [{ type: "text", text: inspected.text }],
+        content: [{ type: "text", text: `${inspected.text}${note}` }],
         details: inspected.projection,
       };
     },

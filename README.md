@@ -14,7 +14,7 @@ Reload an existing Pi session with `/reload`.
 
 Tools:
 
-- `subagent_spawn` — one task, or a `tasks` array of 1–16 independent tasks (mutually exclusive with the single-task fields) admitted together with per-task ids and failures; pass `wait: true` (with optional `wait_mode`) to return results in the same call
+- `subagent_spawn` — one task, or a `tasks` array of 1–16 independent tasks admitted together with per-task ids and failures; with `tasks`, top-level `harness`/`model`/`reasoning_effort`/`working_dir`/`classification` are shared defaults (a task's own value wins); pass `wait: true` (with optional `wait_mode`) to return results in the same call
 - `subagent_route` and `subagent_approve` — prepare and approve exact preference-routed batches
 - `subagent_wait` — `mode: "all"` (default) waits for every id; `mode: "any"` returns once at least one child has a new result (or asks a question), with that result and the still-running ids. `any` never returns a result already delivered by an earlier wait or automatic delivery
 - `subagent_cancel`
@@ -44,7 +44,7 @@ Tools:
 
 - `workflow` — prepare an immutable draft or execute its exact ID after a later user approval
 - `workflow_list` — list current and recovered runs
-- `workflow_check` — inspect and consume one terminal aggregate
+- `workflow_check` — inspect and consume one terminal aggregate; `wait: true` (optional `timeout_s`) blocks until the run is terminal instead of polling
 - `workflow_control` — pause, resume, cancel, retry, or skip through workflow authority
 
 Interactive TUI:

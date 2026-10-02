@@ -52,7 +52,7 @@ export interface NormalizedSpawnRequest {
   readonly tasks: ReadonlyArray<SpawnTaskInput>;
 }
 
-/** Validate the mutually exclusive single/batch forms and return one task list. */
+/** Validate the single/batch forms and return one task list; with "tasks", top-level runtime fields are per-task defaults. */
 export function normalizeSpawnRequest(
   params: SpawnRequestParams,
 ): NormalizedSpawnRequest {
@@ -60,9 +60,12 @@ export function normalizeSpawnRequest(
     (field) => params[field] !== undefined,
   );
   if (params.tasks !== undefined) {
-    if (singleFields.length > 0) {
+    const perTaskOnly = singleFields.filter(
+      (field) => field === "prompt" || field === "name",
+    );
+    if (perTaskOnly.length > 0) {
       throw new Error(
-        `subagent_spawn accepts either "tasks" or the single-task fields, not both; remove ${singleFields.join(", ")} or move them into each task. No child started.`,
+        `subagent_spawn with "tasks" takes prompt and name inside each task; remove top-level ${perTaskOnly.join(", ")}. No child started.`,
       );
     }
     if (params.tasks.length < 1 || params.tasks.length > MAX_SPAWN_BATCH) {
@@ -70,7 +73,12 @@ export function normalizeSpawnRequest(
         `"tasks" must contain 1 to ${MAX_SPAWN_BATCH} items. No child started.`,
       );
     }
-    return { batch: true, tasks: params.tasks };
+    // Top-level runtime fields are shared defaults; a task's own value wins.
+    const defaults = sharedTaskDefaults(params);
+    return {
+      batch: true,
+      tasks: params.tasks.map((task) => ({ ...defaults, ...task })),
+    };
   }
   if (params.prompt === undefined || params.name === undefined) {
     throw new Error(
@@ -93,6 +101,24 @@ export function normalizeSpawnRequest(
       : { reasoning_effort: params.reasoning_effort }),
   };
   return { batch: false, tasks: [task] };
+}
+
+function sharedTaskDefaults(
+  params: SpawnRequestParams,
+): Partial<SpawnTaskInput> {
+  return {
+    ...(params.classification === undefined
+      ? {}
+      : { classification: params.classification }),
+    ...(params.harness === undefined ? {} : { harness: params.harness }),
+    ...(params.working_dir === undefined
+      ? {}
+      : { working_dir: params.working_dir }),
+    ...(params.model === undefined ? {} : { model: params.model }),
+    ...(params.reasoning_effort === undefined
+      ? {}
+      : { reasoning_effort: params.reasoning_effort }),
+  };
 }
 
 /** Resolve and validate one working_dir against the parent cwd. */

@@ -4,7 +4,7 @@ import { MAX_RUNNING_LIMITS } from "./domain.ts";
 
 /** Describes subagent_spawn, including harnesses, batching, and the effective concurrency cap. */
 export function subagentSpawnToolDescription(maxRunning: number): string {
-  return `Spawn background subagents when routing is disabled, or prepare an approval-bound runtime proposal when preference routing is enabled. Pass either the single-task fields or a "tasks" array of 1 to 16 independent tasks (never both); a batch is admitted together and reports per-task ids and failures. Enabled routing requires classification even with runtime overrides. Classification describes the actual deliverable, never the agent name or permissions. Runtime fields request overrides; they are not user authorization. The child is autonomous with its own context window and cannot orchestrate agents/workflows, ask the user, or see this conversation. Max ${maxRunning} subagents run at once; excess work queues FIFO per owner, and owners (this parent and each workflow run) take turns for free slots.`;
+  return `Spawn background subagents when routing is disabled, or prepare an approval-bound runtime proposal when preference routing is enabled. Pass either the single-task fields or a "tasks" array of 1 to 16 independent tasks; with "tasks", put shared harness, model, reasoning_effort, working_dir, and classification once at top level instead of repeating them in each task. A batch is admitted together and reports per-task ids and failures. Enabled routing requires classification even with runtime overrides. Classification describes the actual deliverable, never the agent name or permissions. Runtime fields request overrides; they are not user authorization. The child is autonomous with its own context window and cannot orchestrate agents/workflows, ask the user, or see this conversation. Max ${maxRunning} subagents run at once; excess work queues FIFO per owner, and owners (this parent and each workflow run) take turns for free slots.`;
 }
 
 /** Spawn description at the default cap; sessions re-register with their effective cap. */
@@ -39,7 +39,7 @@ export const SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS = {
   waitMode:
     'With wait: true, "all" (default) returns when every spawned child is terminal; "any" returns as soon as one finishes, with its result and the still-running ids.',
   tasks:
-    "Batch of 1 to 16 independent tasks, each with its own prompt, name, and optional harness, model, reasoning_effort, working_dir, and classification. Mutually exclusive with the single-task fields.",
+    "Batch of 1 to 16 independent tasks, each with its own prompt, name, and optional harness, model, reasoning_effort, working_dir, and classification. Top-level values of those fields apply to every task as defaults; a task's own value wins. Top-level prompt and name are not allowed with tasks.",
   workingDir: "Working directory (default: current working directory)",
   model:
     'Model hint, interpreted by the chosen harness (pi: "provider/model-id" or model id; codex: model slug). Omit for the harness default (pi inherits the current model).',

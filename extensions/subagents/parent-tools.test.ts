@@ -597,16 +597,40 @@ test("workflow_control params require taskId exactly for task actions", () => {
   );
 });
 
-test("batch spawn normalization keeps tasks and single fields mutually exclusive", () => {
+test("batch spawn normalization applies top-level runtime defaults and rejects top-level prompt/name", () => {
   const one = { prompt: "p", name: "n", harness: "pi" as const };
   assert.deepEqual(normalizeSpawnRequest(one), { batch: false, tasks: [one] });
   assert.deepEqual(normalizeSpawnRequest({ tasks: [one, one] }), {
     batch: true,
     tasks: [one, one],
   });
+  const bare = { prompt: "p", name: "a" };
+  assert.deepEqual(
+    normalizeSpawnRequest({
+      tasks: [bare, { ...bare, name: "b", model: "own/model" }],
+      harness: "pi",
+      model: "shared/model",
+      reasoning_effort: "low",
+    }).tasks,
+    [
+      {
+        harness: "pi",
+        model: "shared/model",
+        reasoning_effort: "low",
+        ...bare,
+      },
+      {
+        harness: "pi",
+        model: "own/model",
+        reasoning_effort: "low",
+        prompt: "p",
+        name: "b",
+      },
+    ],
+  );
   assert.throws(
-    () => normalizeSpawnRequest({ tasks: [one], harness: "pi" }),
-    /either "tasks" or the single-task fields, not both; remove harness/,
+    () => normalizeSpawnRequest({ tasks: [one], prompt: "x", name: "y" }),
+    /remove top-level prompt, name/,
   );
   assert.throws(() => normalizeSpawnRequest({ tasks: [] }), /1 to 16 items/);
   assert.throws(
@@ -677,7 +701,7 @@ test("subagent_spawn rejects invalid batch input before starting any child", asy
       undefined,
       ctx,
     ),
-    /not both; remove prompt/,
+    /remove top-level prompt/,
   );
   await assert.rejects(
     spawn.execute(
